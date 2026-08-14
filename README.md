@@ -49,6 +49,35 @@ To remove:
 sh uninstall.sh
 ```
 
+## Updates
+
+`csf -c` checks the published version. `csf -u` upgrades.
+
+An upgrade installs and runs code as root, so it will not proceed unless the
+downloaded package carries a valid GPG signature from the release key pinned in
+`ConfigServer/Release.pm`. Missing gpg, missing signature, wrong key, or a
+package altered after signing — any of these stop the upgrade rather than
+proceed on trust.
+
+`AUTO_UPDATES` ships as `"0"`. Turn it on once you have decided you trust this
+repository's releases.
+
+Every release can be checked by hand, and rebuilt from scratch:
+
+```bash
+gpg --import ConfigServer/release-key.asc
+gpg --verify csf.tgz.asc csf.tgz
+sha256sum -c csf.tgz.sha256
+
+# rebuild the tarball yourself and compare — it is byte-for-byte reproducible
+git archive --format=tar --prefix=csf/ v<version> | gzip -n -9 | sha256sum
+```
+
+> The original update path fetched a tarball over the network and ran
+> `sh install.sh` from it as root with **no integrity check at all**, falling
+> back to plain `http://` on servers without `IO::Socket::SSL`. That is fixed
+> here; see [CHANGES.md](CHANGES.md).
+
 ## Documentation
 
 The upstream manual ships with the source and is still accurate:

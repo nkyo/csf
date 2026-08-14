@@ -32,6 +32,7 @@ use ConfigServer::Slurp qw(slurp);
 use ConfigServer::CheckIP qw(checkip cccheckip);
 use ConfigServer::Ports;
 use ConfigServer::URLGet;
+use ConfigServer::Release;
 use ConfigServer::Sanity qw(sanity);
 use ConfigServer::ServerCheck;
 use ConfigServer::ServerStats;
@@ -3758,58 +3759,102 @@ END
 ###############################################################################
 # start doupdate
 sub doupdate {
-	my $force = 0;
-	my $actv = "";
-	if ($input{command} eq "-uf") {
-		$force = 1;
-	} else {
-		my $url = "https://$config{DOWNLOADSERVER}/csf/version.txt";
-		if ($config{URLGET} == 1) {$url = "http://$config{DOWNLOADSERVER}/csf/version.txt";}
-		my ($status, $text) = $urlget->urlget($url);
-		if ($status) {print "Oops: $text\n"; exit 1}
-		$actv = $text;
-	}
+	my $force = ($input{command} eq "-uf") ? 1 : 0;
+	local $| = 1;
 
-	if ((($actv ne "") and ($actv =~ /^[\d\.]*$/)) or $force) {
-		if (($actv > $version) or $force) {
-			local $| = 1;
+	# The published version is needed even with -uf: it names which release to
+	# fetch. Forcing skips the "is it newer" test, not the lookup.
+	my ($status, $text) = $urlget->urlget(ConfigServer::Release::version_url());
+	if ($status) {print "Oops: $text\n"; exit 1}
+	my $actv = defined $text ? $text : "";
+	$actv =~ s/\s+//g;
 
-			unless ($force) {print "Upgrading csf from v$version to $actv...\n"}
-			if (-e "/usr/src/csf.tgz") {unlink ("/usr/src/csf.tgz") or die $!}
-			print "Retrieving new csf package...\n";
-
-			my $url = "https://$config{DOWNLOADSERVER}/csf.tgz";
-			if ($config{URLGET} == 1) {$url = "http://$config{DOWNLOADSERVER}/csf.tgz";}
-			my ($status, $text) = $urlget->urlget($url,"/usr/src/csf.tgz");
-
-			if (! -z "/usr/src/csf/csf.tgz") {
-				print "\nUnpacking new csf package...\n";
-				system ("cd /usr/src ; tar -xzf csf.tgz ; cd csf ; sh install.sh");
-				print "\nTidying up...\n";
-				system ("rm -Rfv /usr/src/csf*");
-				print "\nRestarting csf and lfd...\n";
-				system ("/usr/sbin/csf -r");
-				ConfigServer::Service::restartlfd();
-				print "\n...All done.\n\nChangelog: https://$config{DOWNLOADSERVER}/csf/changelog.txt\n";
-			}
-		} else {
-			if (-t STDOUT) {print "csf is already at the latest version: v$version\n"} ##no critic
-		}
-	} else {
+	unless ($actv =~ /^[\d\.]+$/) {
 		print "Unable to verify the latest version of csf at this time\n";
+		return;
 	}
+	unless (($actv > $version) or $force) {
+		if (-t STDOUT) {print "csf is already at the latest version: v$version\n"} ##no critic
+		return;
+	}
+
+	# Upgrading installs and runs code as root. Without a signature that can be
+	# checked there is nothing separating an upgrade from an intrusion, so stop
+	# here rather than fetch something unverifiable.
+	unless (ConfigServer::Release::configured()) {
+		print "\n*Error* Release signing is not configured on this installation, so a\n";
+		print "downloaded package could not be verified. Refusing to upgrade.\n";
+		return;
+	}
+	if ($config{URLGET} == 1) {
+		eval {local $SIG{__DIE__} = undef; require IO::Socket::SSL};
+		if ($@) {
+			print "\n*Error* URLGET is set to HTTP::Tiny but IO::Socket::SSL is missing, so\n";
+			print "this server cannot open an https connection. Refusing to upgrade over plain\n";
+			print "http. Install IO::Socket::SSL, or set URLGET to 2, then try again.\n";
+			return;
+		}
+	}
+
+	unless ($force) {print "Upgrading csf from v$version to v$actv...\n"}
+
+	foreach my $stale ("/usr/src/csf.tgz", "/usr/src/csf.tgz.asc") {
+		if (-e $stale) {unlink($stale) or die $!}
+	}
+	if (-d "/usr/src/csf") {system("rm", "-rf", "/usr/src/csf")}
+
+	print "Retrieving new csf package...\n";
+	($status, $text) = $urlget->urlget(ConfigServer::Release::tarball_url($actv), "/usr/src/csf.tgz");
+	if ($status or ! -s "/usr/src/csf.tgz") {
+		print "\n*Error* Could not download the package: ".(defined $text ? $text : "empty download")."\n";
+		print "csf has NOT been upgraded.\n";
+		unlink("/usr/src/csf.tgz");
+		return;
+	}
+
+	print "Retrieving signature...\n";
+	($status, $text) = $urlget->urlget(ConfigServer::Release::signature_url($actv), "/usr/src/csf.tgz.asc");
+	if ($status or ! -s "/usr/src/csf.tgz.asc") {
+		print "\n*Error* Could not download the signature: ".(defined $text ? $text : "empty download")."\n";
+		print "csf has NOT been upgraded.\n";
+		unlink("/usr/src/csf.tgz", "/usr/src/csf.tgz.asc");
+		return;
+	}
+
+	print "Verifying signature...\n";
+	my ($verified, $why) = ConfigServer::Release::verify("/usr/src/csf.tgz", "/usr/src/csf.tgz.asc");
+	unless ($verified) {
+		print "\n*Error* SIGNATURE CHECK FAILED: $why\n";
+		print "The package has been discarded and csf has NOT been upgraded.\n";
+		unlink("/usr/src/csf.tgz", "/usr/src/csf.tgz.asc");
+		return;
+	}
+	print "Signature verified against the pinned release key.\n";
+
+	print "\nUnpacking new csf package...\n";
+	unless (system("cd /usr/src ; tar -xzf csf.tgz") == 0 and -e "/usr/src/csf/install.sh") {
+		print "\n*Error* The package did not unpack correctly. csf has NOT been upgraded.\n";
+		system("rm", "-rf", "/usr/src/csf", "/usr/src/csf.tgz", "/usr/src/csf.tgz.asc");
+		return;
+	}
+	system ("cd /usr/src/csf ; sh install.sh");
+	print "\nTidying up...\n";
+	system ("rm -Rfv /usr/src/csf /usr/src/csf.tgz /usr/src/csf.tgz.asc");
+	print "\nRestarting csf and lfd...\n";
+	system ("/usr/sbin/csf -r");
+	ConfigServer::Service::restartlfd();
+	print "\n...All done.\n\nChangelog: ".ConfigServer::Release::changelog_url()."\n";
 	return;
 }
 # end doupdate
 ###############################################################################
 # start docheck
 sub docheck {
-	my $url = "https://$config{DOWNLOADSERVER}/csf/version.txt";
-	if ($config{URLGET} == 1) {$url = "http://$config{DOWNLOADSERVER}/csf/version.txt";}
-	my ($status, $text) = $urlget->urlget($url);
+	my ($status, $text) = $urlget->urlget(ConfigServer::Release::version_url());
 	if ($status) {print "Oops: $text\n"; exit 1}
 
-	my $actv = $text;
+	my $actv = defined $text ? $text : "";
+	$actv =~ s/\s+//g;
 	my $up = 0;
 
 	if (($actv ne "") and ($actv =~ /^[\d\.]*$/)) {

@@ -31,6 +31,7 @@ use ConfigServer::Config;
 use ConfigServer::CheckIP qw(checkip);
 use ConfigServer::Ports;
 use ConfigServer::URLGet;
+use ConfigServer::Release;
 use ConfigServer::Sanity qw(sanity);;
 use ConfigServer::ServerCheck;
 use ConfigServer::ServerStats;
@@ -117,7 +118,7 @@ sub main {
 		print "<div><p>Checking version...</p>\n\n";
 		my ($upgrade, $actv) = &manualversion($myv);
 		if ($upgrade) {
-			print "<form action='$script' method='post'><button name='action' value='upgrade' type='submit' class='btn btn-default'>Upgrade csf</button> A new version of csf (v$actv) is available. Upgrading will retain your settings. <a href='https://$config{DOWNLOADSERVER}/csf/changelog.txt' target='_blank'>View ChangeLog</a></form>\n";
+			print "<form action='$script' method='post'><button name='action' value='upgrade' type='submit' class='btn btn-default'>Upgrade csf</button> A new version of csf (v$actv) is available. Upgrading will retain your settings. <a href='https://github.com/nkyo/csf/blob/main/CHANGES.md' target='_blank'>View ChangeLog</a></form>\n";
 		} else {
 			if ($actv ne "") {
 				print "<div class='bs-callout bs-callout-danger'>$actv</div>\n";
@@ -1985,10 +1986,8 @@ EOD
 #!/usr/bin/bash
 bash /etc/csf/uninstall.sh
 cd /usr/src
-mv -fv csf.tgz csf.tgz.$time
 mv -fv csf csf.$time
-wget https://$config{DOWNLOADSERVER}/csf.tgz
-tar -xzf csf.tgz
+git clone https://github.com/nkyo/csf.git
 cd csf
 sh install.sh
 EOF
@@ -2137,7 +2136,7 @@ EOF
 		print "<thead><tr><th colspan='2'>Upgrade</th></tr></thead>";
 		my ($upgrade, $actv) = &csgetversion("csf",$myv);
 		if ($upgrade) {
-			print "<tr><td><button name='action' value='upgrade' type='submit' class='btn btn-default'>Upgrade csf</button></td><td style='width:100%'><b>A new version of csf (v$actv) is available. Upgrading will retain your settings<br><a href='https://$config{DOWNLOADSERVER}/csf/changelog.txt' target='_blank'>View ChangeLog</a></b></td></tr>\n";
+			print "<tr><td><button name='action' value='upgrade' type='submit' class='btn btn-default'>Upgrade csf</button></td><td style='width:100%'><b>A new version of csf (v$actv) is available. Upgrading will retain your settings<br><a href='https://github.com/nkyo/csf/blob/main/CHANGES.md' target='_blank'>View ChangeLog</a></b></td></tr>\n";
 		} else {
 			print "<tr><td><button name='action' value='manualcheck' type='submit' class='btn btn-default'>Manual Check</button></td><td>";
 			if ($actv ne "") {
@@ -2942,9 +2941,7 @@ sub csgetversion {
 sub manualversion {
 	my $current = shift;
 	my $upgrade = 0;
-	my $url = "https://$config{DOWNLOADSERVER}/csf/version.txt";
-	if ($config{URLGET} == 1) {$url = "http://$config{DOWNLOADSERVER}/csf/version.txt";}
-	my ($status, $newversion) = $urlget->urlget($url);
+	my ($status, $newversion) = $urlget->urlget(ConfigServer::Release::version_url());
 	if (!$status and $newversion ne "" and $newversion =~ /^[\d\.]*$/ and $newversion > $current) {$upgrade = 1} else {$newversion = ""}
 	return ($upgrade, $newversion);
 }

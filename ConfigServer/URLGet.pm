@@ -251,8 +251,12 @@ sub binget {
 
 	my $cmd;
 	if (-e $config{CURL}) {
-		$cmd = $config{CURL}." -skLf -m 120";
-		if ($file) {$cmd = $config{CURL}." -kLf -m 120 -o";}
+		# -k (--insecure) removed 2026-08-14: it told curl to accept any
+		# certificate, which turned every https:// fetch csf makes — blocklists,
+		# RBL data, upgrades — into something anyone on the path could rewrite.
+		# See CHANGES.md.
+		$cmd = $config{CURL}." -sLf -m 120";
+		if ($file) {$cmd = $config{CURL}." -Lf -m 120 -o";}
 	}
 	elsif (-e $config{WGET}) {
 		$cmd = $config{WGET}." -qT 120 -O-";
