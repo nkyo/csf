@@ -23,11 +23,17 @@ Installation
 Installation is quite straightforward:
 
 cd /usr/src
-rm -fv csf.tgz
-wget https://download.configserver.com/csf.tgz
-tar -xzf csf.tgz
+rm -rf csf
+git clone https://github.com/nkyo/csf.git
 cd csf
 sh install.sh
+
+NOTE (2026-08-14, this fork): the original instructions here fetched
+https://download.configserver.com/csf.tgz. That host shut down together with
+the original project on 2025-08-31 and no longer resolves, so the documented
+install could not work. Other references to configserver.com remain elsewhere
+in this source tree — including the update mechanism — and are also dead.
+See CHANGES.md.
 
 Next, test whether you have the required iptables modules:
 

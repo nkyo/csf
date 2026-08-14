@@ -37,7 +37,22 @@ line is added below the original notice; the original stays intact.
 
 ### Unreleased
 
+- **2026-08-14** — `install.txt`: replaced the documented install command. It
+  fetched `https://download.configserver.com/csf.tgz`, a host that shut down with
+  the original project on 2025-08-31, so the documented install could not work.
+  Now clones this repository instead.
 - **2026-08-14** — Added `README.md` and this file. No functional change.
+
+## Known issues inherited from v15.00
+
+- **Dead `configserver.com` endpoints throughout the tree.** 19 files still point
+  at hosts that no longer resolve — including `csget.pl` (the downloader),
+  `csf.conf` defaults, `ConfigServer/Config.pm`, `ConfigServer/ServerCheck.pm`
+  and `ConfigServer/DisplayUI.pm`. This affects the update check, the RBL/server
+  security check and parts of the UI. Only `install.txt` has been corrected so
+  far; the rest needs deciding on a replacement update channel before it is
+  touched, since it changes behaviour in a firewall.
+  Meanwhile, keep `AUTO_UPDATES = "0"` in `csf.conf`.
 
 <!--
 Format for entries:
