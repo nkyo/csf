@@ -28,6 +28,7 @@ use IPC::Open3;
 use ConfigServer::Slurp qw(slurp);
 use ConfigServer::Sanity qw(sanity);;
 use ConfigServer::Config;
+use ConfigServer::Release;
 use ConfigServer::GetIPs qw(getips);
 use ConfigServer::CheckIP qw(checkip);
 use ConfigServer::Service;
@@ -258,8 +259,13 @@ sub firewallcheck {
 	&addline($status,"RESTRICT_SYSLOG option check","Due to issues with syslog/rsyslog you should consider enabling this option. See the Firewall Configuration (/etc/csf/csf.conf) for more information");
 
 	$status = 0;
-	unless ($config{AUTO_UPDATES}) {$status = 1}
-	&addline($status,"AUTO_UPDATES option check","To keep csf up to date and secure you should enable AUTO_UPDATES. You should also monitor our <a href='http://blog.configserver.com' target='_blank'>blog</a>");
+	if (ConfigServer::Release::configured()) {
+		unless ($config{AUTO_UPDATES}) {$status = 1}
+		&addline($status,"AUTO_UPDATES option check","Staying current matters for a firewall, so you should enable AUTO_UPDATES. Upgrades will only install a package carrying a valid signature from the pinned release key. Releases: <a href='https://github.com/".ConfigServer::Release::repo()."/releases' target='_blank'>".ConfigServer::Release::repo()."</a>");
+	} else {
+		$status = 1;
+		&addline($status,"AUTO_UPDATES option check","Release signing is not configured on this installation, so csf cannot verify an upgrade and will refuse to install one. Enabling AUTO_UPDATES would have no effect until that is set up. See CHANGES.md in <a href='https://github.com/".ConfigServer::Release::repo()."' target='_blank'>".ConfigServer::Release::repo()."</a>");
+	}
 
 	$status = 0;
 	unless ($config{LF_DAEMON}) {$status = 1}
@@ -485,18 +491,10 @@ sub servercheck {
 	}
 	&addline($status,"Check SUPERUSER accounts","You have accounts other than root set up with UID 0. This is a considerable security risk. You should use <b>su</b>, or best of all <b>sudo</b> for such access");
 
-	if (-e "/usr/local/cpanel/version" or $config{DIRECTADMIN}) {
-		$status = 0;
-		unless (-e "/etc/cxs/cxs.pl") {
-			$status = 1;
-		}
-		&addline($status,"Check for cxs","You should consider using <b><u><a href='http://www.configserver.com/cp/cxs.html' target='_blank'>cxs</a></u></b> to scan web script uploads and user accounts for exploits uploaded to the server");
-		$status = 0;
-		unless (-e "/etc/osm/osmd.pl") {
-			$status = 1;
-		}
-		&addline($status,"Check for osm","You should consider using <b><u><a href='http://www.configserver.com/cp/osm.html' target='_blank'>osm</a></u></b> to provide protection from spammers exploiting the server");
-	}
+	# Removed 2026-08-14: two checks recommended buying cxs and osm from
+	# configserver.com. Both products were discontinued with the company on
+	# 2025-08-31 and the pages they linked to no longer exist, so the advice
+	# sent administrators to dead links to buy software they cannot get.
 
 	unless ($config{IPV6}) {
 		$status = 0;

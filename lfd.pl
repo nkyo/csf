@@ -347,7 +347,14 @@ if ($cxsreputation and -e "/etc/cxs/cxs.blocklists") {
 		$line =~ s/$cleanreg//g;
 		if ($line =~ /^(\s|\#|$)/) {next}
 		my ($name,$interval,$max,$url) = split(/\|/,$line);
-		$url =~ s/download\.configserver\.com/$config{DOWNLOADSERVER}/g;
+		# Only rewrite when a mirror is actually configured. DOWNLOADSERVER comes
+		# from /etc/csf/downloadservers, whose entries ConfigServer had already
+		# commented out in v15.00, so it is normally empty — and substituting an
+		# empty host turned a URL into "https:///path", which fails in a way that
+		# looks like a network problem rather than a configuration one.
+		if (defined $config{DOWNLOADSERVER} and $config{DOWNLOADSERVER} ne "") {
+			$url =~ s/download\.configserver\.com/$config{DOWNLOADSERVER}/g;
+		}
 		if ($all and $name ne "CXS_ALL") {next}
 		if ($name =~ /^\w+$/) {
 			$name = substr(uc $name, 0, 25);

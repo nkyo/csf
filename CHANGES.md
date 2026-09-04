@@ -92,6 +92,31 @@ this repository and to refuse anything it cannot verify.
   the tarball is **reproducible**: anyone can rebuild it from the tag and get a
   byte-identical file, then check that against the published signature.
 
+#### Dead links and advice for software that no longer exists
+
+- **2026-08-14** — `ConfigServer/DisplayUI.pm`: removed three promotional panels
+  offering cxs, osm and msfe. All three were discontinued with the company on
+  2025-08-31 and the pages they linked to are gone, so the UI was advertising
+  software nobody can obtain.
+
+- **2026-08-14** — `ConfigServer/ServerCheck.pm`: removed the two server-check
+  rows recommending the purchase of cxs and osm, for the same reason. Reworked
+  the `AUTO_UPDATES` advice: it linked to a blog that no longer resolves, and it
+  told administrators to enable a setting that does nothing on an installation
+  where release signing is not configured — `csf -u` refuses to install an
+  unverifiable package. The check now reports that state instead.
+
+- **2026-08-14** — `lfd.pl`: only rewrite blocklist URLs when a mirror is
+  actually configured. `DOWNLOADSERVER` comes from `/etc/csf/downloadservers`,
+  whose entries ConfigServer had already commented out in v15.00, so it is
+  normally empty — and substituting an empty host turned a URL into
+  `https:///path`, failing in a way that looks like a network fault rather than
+  a configuration one.
+
+> Copyright notices that link to `configserver.com` are **left exactly as they
+> are**, dead link and all. They are attribution, not advertising, and GPLv3
+> §5(c) requires keeping them.
+
 #### Documentation
 
 - **2026-08-14** — `install.txt`: replaced the documented install command, which
@@ -100,13 +125,12 @@ this repository and to refuse anything it cannot verify.
 
 ## Known issues inherited from v15.00
 
-- **Remaining dead `configserver.com` endpoints.** The update path is fixed, but
-  other references remain — `ConfigServer/Config.pm` (`getdownloadserver`, whose
-  `downloadservers` file ConfigServer had already commented out before release,
-  so it resolves to nothing), `ConfigServer/ServerCheck.pm`, and `lfd.pl:350`
-  which rewrites URLs in `cxs.blocklists` for cxs, a separate discontinued
-  product. These degrade to "feature does nothing" rather than to a security
-  problem, and are left until each is looked at on its own.
+- **`ConfigServer::Config::getdownloadserver` returns nothing.** It reads
+  `/etc/csf/downloadservers`, whose two entries ConfigServer commented out before
+  release, so `DOWNLOADSERVER` is undefined. Nothing depends on it any more —
+  its last consumer, the blocklist rewrite in `lfd.pl`, now checks before using
+  it — so it is left in place rather than removed, in case anyone points it at a
+  mirror of their own.
 
 <!--
 Format for entries:
