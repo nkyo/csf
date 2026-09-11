@@ -37,6 +37,131 @@ line is added below the original notice; the original stays intact.
 
 ### Unreleased
 
+#### Task 5 fix round 1 — the TLS handshake had no deadline, the accept loop could spin, and three fixes had code but no test proving any of it
+
+This round finishes work a previous session started and could not complete:
+`f3fb785` left `HTTP.pm`/`Server.pm` already carrying code for R31, R32 and
+R34 below, but the test count was unchanged, so none of it was proven. Each
+inherited change was verified against `task-5-review.md`'s own description
+before being trusted, by disabling it and confirming a specific test goes
+red, then restoring it — the same requirement this round's own new guards
+are held to.
+
+- **2026-09-11** — Fixed `Server.pm` running the TLS handshake on a
+  blocking socket with no deadline of its own (`task-5-review.md` Critical
+  C1/R31). `HTTP.pm`'s two 15s read deadlines sit *after* `start_SSL()`
+  returns, so a peer that completes the TCP handshake and then sends
+  nothing — or dribbles one handshake byte a minute — parked the forked
+  child inside `SSL_accept` forever; 32 such connections, no more, denied
+  the admin UI with zero attacker bytes ever reaching `HTTP.pm`'s own
+  defences. `_serve_accepted()` now installs a `Time::HiRes::alarm()`
+  watchdog, sized to the handshake *plus* the header, body and write
+  budgets combined, immediately after fork and before `tls_wrap` runs;
+  `$SIG{ALRM}` is injectable (`watchdog_exit`, default `POSIX::_exit(1)`)
+  so a test can observe it firing instead of being killed by it.
+  `Time::HiRes::alarm()`, not the builtin, because the builtin truncates to
+  whole seconds and would round a test's short injected budget down to
+  "cancel the alarm" rather than "fire almost at once". Verified by
+  disabling the alarm call and confirming a `tls_wrap` that never returns
+  hangs the full 10s a test staged for it, rather than being cut off inside
+  the configured budget — this is inherited code; this round supplied the
+  test and the confirmation, not the fix itself.
+
+- **2026-09-11** — Fixed `tls_wrap` (and `listener`) being un-gated
+  constructor-injection seams that could run the whole request pipeline —
+  parse, dispatch, response — over a raw, unencrypted socket, past every
+  preflight refusal including the `IO::Socket::SSL` one (`task-5-review.md`
+  Important I3/R32). `_serve_accepted()` now asserts
+  `UNIVERSAL::isa($tls_socket, 'IO::Socket::SSL')` before handing the
+  socket to `HTTP.pm`, and closes both handles without a byte served
+  otherwise. `UNIVERSAL::isa`'s function form, not a method call, because a
+  failed handshake can hand back something that is not a blessed reference
+  at all, and a method call on that would die instead of simply failing the
+  check. Verified the same way: disabling the `isa()` check and confirming
+  a plaintext pass-through `tls_wrap` gets a real request answered over the
+  unverified socket — again inherited code, newly proven here.
+
+- **2026-09-11** — Fixed `run()`'s `accept()`-failure handling treating
+  every error identically to `EINTR` (`task-5-review.md` Important I2): on
+  a persistent condition — `EMFILE`/`ENFILE` from descriptor exhaustion,
+  which the stuck-handshake bug above made directly reachable —
+  `accept()` returned immediately and forever, spinning the loop as fast
+  as the CPU allowed with no log line anywhere to say why the admin UI had
+  gone unresponsive. The policy is now `_accept_backoff($self, $is_eintr,
+  $errno_text)`, extracted out of `run()`'s loop specifically so it is
+  testable without a real listening socket or fork — `run()` itself sits
+  behind `preflight()`, which always refuses in this workspace because
+  `IO::Socket::SSL` is not installed, so nothing inside `run()`'s own loop
+  can be driven from a test at all. `EINTR` returns at once, with nothing
+  written and no delay; anything else logs one line to `STDERR` naming the
+  errno and backs off (`select(undef,undef,undef,$self->{accept_backoff})`,
+  configurable, default 0.1s, a new constructor option). Verified in three
+  directions: `EINTR` alone produces no log line and near-zero elapsed
+  time; a non-`EINTR` error alone produces the log line and the backoff;
+  and collapsing the two branches back into one (always backing off, or
+  never) turns each of those assertions red in turn.
+
+- **2026-09-11** — Added the actual regression test for the bug fixed
+  during Task 5's own verification pass and described in
+  `task-5-report.md` (`task-5-review.md` Minor M5/R34): `_await_first_byte()`'s
+  first read is sized from `$max - length($$bufref)` rather than a flat
+  `8192`, which was already correct in the inherited tree but was, as the
+  review notes, "inert only because that cap happened to equal 8192
+  today" — nothing in the suite lowered `$MAX_REQUEST_LINE` to make the two
+  numbers diverge, so nothing proved the fix does anything. The existing
+  "oversize request line" case in `t/41-http-hostile.t` cannot be that
+  test either: at `$MAX_REQUEST_LINE + 100` bytes against the real
+  8192-byte cap, it is too large to ever arrive in a single `sysread()` and
+  never touches `_await_first_byte()`'s own read size at all. The new case
+  lowers `$MAX_REQUEST_LINE` to 20 and sends a line short enough (about 100
+  bytes) to arrive whole, terminator included, in one read from a
+  `File::Temp`-backed handle — exactly the shape that let an over-cap line
+  slip past the length check before this task's original build fixed it.
+  Verified by reverting the read size to a flat `8192` and confirming the
+  new case goes red — the line is accepted whole, with no fault at all,
+  once the first read is no longer bounded to the (lowered) cap.
+
+- **2026-09-11** — Closed the two parts of R33 (Important, entirely
+  untouched by the previous session), both in `t/41-http-hostile.t`:
+
+  First, the percent-escape hex-validity guard (`HTTP.pm:486`) was not
+  isolated by any test. `%zz` and `%0` both still return `400` with that
+  guard deleted, but not because of it — Perl's `hex()` stops at the first
+  non-hex character rather than failing, so `hex('zz')` and `hex('')` are
+  both `0`, and both inputs decode to a NUL byte and are caught by the
+  *next* guard down instead. `%4z` is the one input that tells the two
+  guards apart, verified by hand in the previous round and never turned
+  into a test: `'4z'` still fails the two-hex-digit check (refused, guard
+  present), but `hex('4z')` is `4`, not `0`, so with only the hex-validity
+  guard gone it decodes to byte `0x04` and passes with **no fault at all**.
+  Added for both the path and a query value, confirmed by disabling the
+  hex-validity guard and watching `%zz`/`%0` stay green (400, wrong
+  message) while `%4z` goes red (no fault raised, not merely the wrong
+  one).
+
+  Second, the general form: no case in this file asserted *which* guard
+  refused an input, only that some 4xx did, leaving thirteen distinct `400`
+  guards (and, found during this pass, the two distinct `431` guards —
+  header count versus a single header line too long) mutually
+  indistinguishable — any one is deletable and another guard, or luck,
+  catches the input with the suite still green. Every `400`-status case in
+  the file, plus the `431` pair, now also asserts the specific fault
+  message the guard that is supposed to fire actually produces. This is
+  not decorative: verified by disabling the request-line/header-line
+  bare-`\n` guard (`_clean_line`'s `\r\n\z` check) and confirming the
+  *header-line* case goes red with no fault at all (the guard this row
+  actually isolates, matching `task-5-report.md`'s own note), while the
+  *request-line* case's message assertion goes red for a **different**
+  reason — it is still refused, just via the version-allowlist guard
+  further down, with a different message — proving that row was never a
+  clean isolation of the CRLF guard and would not have caught its removal
+  before this change. Also verified by disabling the header-count guard
+  alone and confirming only the "200 headers" case goes red, leaving the
+  unrelated "oversize header line" case (a different guard, same `431`)
+  untouched.
+  (`ui-src/lib/ConfigServer/UI/HTTP.pm`, `ui-src/lib/ConfigServer/UI/Server.pm`;
+  `t/40-http-parse.t`, `t/41-http-hostile.t`)
+
 #### Task 5 — the minimal HTTP/TLS core that faces the network (Mode B)
 
 - **2026-09-11** — Added `ui-src/lib/ConfigServer/UI/HTTP.pm`: the only HTTP

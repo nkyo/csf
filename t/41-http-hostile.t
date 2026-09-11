@@ -53,7 +53,7 @@ use lib "$FindBin::Bin/..", "$FindBin::Bin/../ui-src/lib";
 use File::Temp ();
 use Socket ();
 use Time::HiRes ();
-use Test::More tests => 273;
+use Test::More tests => 320;
 
 require_ok('ConfigServer::UI::HTTP');
 require_ok('ConfigServer::UI::Server');
@@ -137,10 +137,34 @@ for my $method (qw(PUT DELETE HEAD OPTIONS PATCH CONNECT TRACE get)) {
 # Oversize request line
 ###############################################################################
 {
-	no warnings 'once'; # the only reference to this package variable in this file
+	no warnings 'once'; # one of two references to this package variable in this file
 	my $fh = _handle('GET /' . ('a' x ($ConfigServer::UI::HTTP::MAX_REQUEST_LINE + 100)) . " HTTP/1.1\r\n\r\n");
 	my $err = _hostile('oversize request line', $fh);
 	is($err->{status}, 414, 'oversize request line: specifically 414');
+}
+
+###############################################################################
+# R34 (task-5-review.md M5): the regression test the brief's own comment
+# (HTTP.pm:80-82) invites - lower $MAX_REQUEST_LINE and prove the cap still
+# bites. This is deliberately NOT the same shape as "oversize request line"
+# above: that case is 8192+100 bytes against the real 8192-byte cap, so it
+# is too big to ever arrive in a single sysread() and never exercises
+# _await_first_byte()'s own read size at all (task-5-review.md notes this
+# gap by name). Here the cap is lowered well below the line's actual
+# length, but the whole line - terminator included - is still small enough
+# to arrive in ONE read (it comes from a temp file, which is always
+# "entirely available" the moment it is opened). Before this bug was
+# fixed, _await_first_byte()'s first read was a flat 8192 regardless of the
+# cap, so the terminator would already be sitting in the buffer by the
+# time _read_line() got its first chance to check the buffer's length -
+# and a line found complete is returned complete, cap or no cap.
+###############################################################################
+{
+	no warnings 'once'; # the other reference to this package variable in this file
+	local $ConfigServer::UI::HTTP::MAX_REQUEST_LINE = 20;
+	my $fh = _handle('GET /' . ('a' x 80) . " HTTP/1.1\r\n\r\n"); # ~100 bytes, one whole read
+	my $err = _hostile('R34: a request line over a (lowered) cap, arriving whole in a single read', $fh);
+	is($err->{status}, 414, 'R34: still refused as too-long - the first read must itself respect the cap');
 }
 
 ###############################################################################
@@ -153,6 +177,7 @@ for my $method (qw(PUT DELETE HEAD OPTIONS PATCH CONNECT TRACE get)) {
 	my $fh = _handle($data);
 	my $err = _hostile('200 headers', $fh);
 	is($err->{status}, 431, '200 headers: specifically 431');
+	like($err->{message}, qr/more than \d+ headers were sent/, '200 headers: the header-count guard, distinct from the header-line-length guard below');
 }
 
 ###############################################################################
@@ -162,6 +187,7 @@ for my $method (qw(PUT DELETE HEAD OPTIONS PATCH CONNECT TRACE get)) {
 	my $fh = _handle("GET / HTTP/1.1\r\nThisHasNoColon\r\n\r\n");
 	my $err = _hostile('header with no colon', $fh);
 	is($err->{status}, 400, 'header with no colon: specifically 400');
+	like($err->{message}, qr/no colon/, 'header with no colon: the no-colon guard specifically, not some other 400');
 }
 
 ###############################################################################
@@ -172,11 +198,13 @@ for my $method (qw(PUT DELETE HEAD OPTIONS PATCH CONNECT TRACE get)) {
 	my $fh = _handle("POST / HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\nabcde");
 	my $err = _hostile('duplicate Content-Length', $fh);
 	is($err->{status}, 400, 'duplicate Content-Length: specifically 400');
+	like($err->{message}, qr/duplicate content-length header/, 'duplicate Content-Length: the duplicate-header guard specifically');
 }
 {
 	my $fh = _handle("GET / HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n");
 	my $err = _hostile('duplicate Host', $fh);
 	is($err->{status}, 400, 'duplicate Host: specifically 400');
+	like($err->{message}, qr/duplicate host header/, 'duplicate Host: the duplicate-header guard specifically');
 }
 
 ###############################################################################
@@ -186,11 +214,13 @@ for my $method (qw(PUT DELETE HEAD OPTIONS PATCH CONNECT TRACE get)) {
 	my $fh = _handle("POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\nContent-Length: 0\r\n\r\n");
 	my $err = _hostile('Transfer-Encoding: chunked', $fh);
 	is($err->{status}, 400, 'Transfer-Encoding: chunked: specifically 400');
+	like($err->{message}, qr/Transfer-Encoding is not supported/, 'Transfer-Encoding: chunked: the Transfer-Encoding guard specifically');
 }
 {
 	my $fh = _handle("POST / HTTP/1.1\r\nTransfer-Encoding: identity\r\nContent-Length: 0\r\n\r\n");
 	my $err = _hostile('Transfer-Encoding: identity (any value, not only "chunked")', $fh);
 	is($err->{status}, 400, 'Transfer-Encoding: identity: specifically 400');
+	like($err->{message}, qr/Transfer-Encoding is not supported/, 'Transfer-Encoding: identity: the same presence guard, not a value check');
 }
 
 ###############################################################################
@@ -200,6 +230,7 @@ for my $method (qw(PUT DELETE HEAD OPTIONS PATCH CONNECT TRACE get)) {
 	my $fh = _handle("POST / HTTP/1.1\r\nContent-Length: 100\r\n\r\nabc");
 	my $err = _hostile('Content-Length larger than the body (EOF)', $fh);
 	is($err->{status}, 400, 'Content-Length > body, closed early: 400');
+	like($err->{message}, qr/closed before the declared request body/, 'Content-Length > body (EOF): the body-EOF guard specifically');
 }
 {
 	my ($near, $far) = _pair();
@@ -222,21 +253,25 @@ for my $method (qw(PUT DELETE HEAD OPTIONS PATCH CONNECT TRACE get)) {
 	my $fh = _handle("GET /api/list?x=%zz HTTP/1.1\r\n\r\n");
 	my $err = _hostile('%zz in a query value', $fh);
 	is($err->{status}, 400, '%zz: specifically 400');
+	like($err->{message}, qr/percent sign not followed by two hex digits/, '%zz in a query value: the hex-validity guard, by way of the query-parameter wrapper');
 }
 {
 	my $fh = _handle("GET /%zzpath HTTP/1.1\r\n\r\n");
 	my $err = _hostile('%zz in the path', $fh);
 	is($err->{status}, 400, '%zz in the path: specifically 400');
+	like($err->{message}, qr/percent sign not followed by two hex digits/, '%zz in the path: the hex-validity guard, by way of the path wrapper');
 }
 {
 	my $fh = _handle("GET /api/list?x=%0 HTTP/1.1\r\n\r\n");
 	my $err = _hostile('%0 (an incomplete escape) in a query value', $fh);
 	is($err->{status}, 400, '%0: specifically 400');
+	like($err->{message}, qr/percent sign not followed by two hex digits/, '%0 in a query value: still the hex-validity guard (too short to be two digits)');
 }
 {
 	my $fh = _handle("GET /a%0 HTTP/1.1\r\n\r\n");
 	my $err = _hostile('%0 in the path', $fh);
 	is($err->{status}, 400, '%0 in the path: specifically 400');
+	like($err->{message}, qr/percent sign not followed by two hex digits/, '%0 in the path: still the hex-validity guard');
 }
 
 ###############################################################################
@@ -247,16 +282,48 @@ for my $method (qw(PUT DELETE HEAD OPTIONS PATCH CONNECT TRACE get)) {
 	my $fh = _handle("GET /api/%00list HTTP/1.1\r\n\r\n");
 	my $err = _hostile('%00 in the path', $fh);
 	is($err->{status}, 400, '%00 in the path: specifically 400');
+	like($err->{message}, qr/decodes to a NUL byte/, '%00 in the path: the decoded-NUL guard, distinct from the hex-validity guard above');
 }
 {
 	my $fh = _handle("GET /api/list?x=%00 HTTP/1.1\r\n\r\n");
 	my $err = _hostile('%00 in a query value', $fh);
 	is($err->{status}, 400, '%00 in a query value: specifically 400');
+	like($err->{message}, qr/decodes to a NUL byte/, '%00 in a query value: the decoded-NUL guard');
 }
 {
 	my $fh = _handle("GET /api/list?%00=x HTTP/1.1\r\n\r\n");
 	my $err = _hostile('%00 in a query key', $fh);
 	is($err->{status}, 400, '%00 in a query key: specifically 400');
+	like($err->{message}, qr/decodes to a NUL byte/, '%00 in a query key: the decoded-NUL guard, applied to keys too');
+}
+
+###############################################################################
+# %4z - task-5-review.md I4: %zz and %0 are both refused, but NOT because of
+# the hex-validity guard as the two blocks above imply. hex('zz') and
+# hex('') both evaluate to 0 in Perl (hex() stops at the first non-hex
+# character rather than failing), so with the hex-validity guard alone
+# deleted, both %zz and %0 still decode to chr(0) and are caught by the
+# NUL-byte guard instead - a different guard entirely. %4z is the one input
+# that tells the two guards apart: '4z' still fails the two-hex-digit
+# regex (so it is refused here, with the guard present), but if the
+# hex-validity guard were the one missing, hex('4z') is 4 - not 0 - so it
+# would decode to byte 0x04 and pass with NO fault at all. The previous
+# implementer verified this by hand (task-5-report.md) and never added it;
+# added here as the actual regression test for the hex-validity guard.
+###############################################################################
+{
+	my $fh = _handle("GET /api/list?x=%4z HTTP/1.1\r\n\r\n");
+	my $err = _hostile('%4z in a query value (isolates the hex-validity guard from the NUL guard)', $fh);
+	is($err->{status}, 400, '%4z: specifically 400');
+	like($err->{message}, qr/percent sign not followed by two hex digits/,
+		'%4z: the hex-validity guard by name - %zz/%0 above cannot prove this, only that SOME guard fired');
+}
+{
+	my $fh = _handle("GET /a%4zpath HTTP/1.1\r\n\r\n");
+	my $err = _hostile('%4z in the path (isolates the hex-validity guard from the NUL guard)', $fh);
+	is($err->{status}, 400, '%4z in the path: specifically 400');
+	like($err->{message}, qr/percent sign not followed by two hex digits/,
+		'%4z in the path: the hex-validity guard by name');
 }
 
 ###############################################################################
@@ -266,16 +333,19 @@ for my $method (qw(PUT DELETE HEAD OPTIONS PATCH CONNECT TRACE get)) {
 	my $fh = _handle("GET / HTTP/2.0\r\n\r\n");
 	my $err = _hostile('HTTP/2.0', $fh);
 	is($err->{status}, 400, 'HTTP/2.0: specifically 400');
+	like($err->{message}, qr/unsupported HTTP version/, 'HTTP/2.0: the version-allowlist guard specifically');
 }
 {
 	my $fh = _handle("GET / HTTP/0.9\r\n\r\n");
 	my $err = _hostile('HTTP/0.9', $fh);
 	is($err->{status}, 400, 'HTTP/0.9: specifically 400');
+	like($err->{message}, qr/unsupported HTTP version/, 'HTTP/0.9: the version-allowlist guard specifically');
 }
 {
 	my $fh = _handle("GET / GARBAGE\r\n\r\n");
 	my $err = _hostile('a version field that is not HTTP/x.y at all', $fh);
 	is($err->{status}, 400, 'garbage version: specifically 400');
+	like($err->{message}, qr/unsupported HTTP version/, 'garbage version: the version-allowlist guard, not a request-line-shape failure');
 }
 
 ###############################################################################
@@ -288,6 +358,7 @@ for my $method (qw(PUT DELETE HEAD OPTIONS PATCH CONNECT TRACE get)) {
 		. ('v' x ($ConfigServer::UI::HTTP::MAX_HEADER_BYTES + 100)) . "\r\n\r\n");
 	my $err = _hostile('one header line over the per-line cap', $fh);
 	is($err->{status}, 431, 'oversize header line: specifically 431, the same status as too many headers');
+	like($err->{message}, qr/header line is longer than this server accepts/, 'oversize header line: the header-line-length guard specifically, not the count guard above');
 }
 
 ###############################################################################
@@ -297,16 +368,19 @@ for my $method (qw(PUT DELETE HEAD OPTIONS PATCH CONNECT TRACE get)) {
 	my $fh = _handle("POST / HTTP/1.1\r\nContent-Length: abc\r\n\r\n");
 	my $err = _hostile('Content-Length: abc', $fh);
 	is($err->{status}, 400, 'non-numeric Content-Length: specifically 400');
+	like($err->{message}, qr/Content-Length must be a whole number/, 'Content-Length: abc: the numeric-format guard specifically');
 }
 {
 	my $fh = _handle("POST / HTTP/1.1\r\nContent-Length: -5\r\n\r\n");
 	my $err = _hostile('Content-Length: -5', $fh);
 	is($err->{status}, 400, 'negative Content-Length: specifically 400');
+	like($err->{message}, qr/Content-Length must be a whole number/, 'Content-Length: -5: the same numeric-format guard, not a range check');
 }
 {
 	my $fh = _handle("POST / HTTP/1.1\r\nContent-Length: 5 6\r\n\r\n");
 	my $err = _hostile('Content-Length: "5 6" (whitespace inside the number)', $fh);
 	is($err->{status}, 400, 'Content-Length with embedded whitespace: specifically 400');
+	like($err->{message}, qr/Content-Length must be a whole number/, 'Content-Length: "5 6": the same numeric-format guard catches embedded whitespace too');
 }
 
 ###############################################################################
@@ -316,11 +390,13 @@ for my $method (qw(PUT DELETE HEAD OPTIONS PATCH CONNECT TRACE get)) {
 	my $fh = _handle("GET /a\0b HTTP/1.1\r\n\r\n");
 	my $err = _hostile('a raw NUL byte in the request line', $fh);
 	is($err->{status}, 400, 'raw NUL in the request line: specifically 400');
+	like($err->{message}, qr/NUL byte/, 'raw NUL in the request line: the NUL-byte line guard specifically');
 }
 {
 	my $fh = _handle("GET / HTTP/1.1\r\nX-Thing: a\0b\r\n\r\n");
 	my $err = _hostile('a raw NUL byte in a header value', $fh);
 	is($err->{status}, 400, 'raw NUL in a header: specifically 400');
+	like($err->{message}, qr/NUL byte/, 'raw NUL in a header: the same NUL-byte line guard, applied to a header line');
 }
 
 ###############################################################################
@@ -330,11 +406,13 @@ for my $method (qw(PUT DELETE HEAD OPTIONS PATCH CONNECT TRACE get)) {
 	my $fh = _handle("GET / HTTP/1.1\r\nX-Thing: a\rb\r\n\r\n");
 	my $err = _hostile('CR without LF, embedded in a header value', $fh);
 	is($err->{status}, 400, 'embedded CR: specifically 400');
+	like($err->{message}, qr/carriage return that is not part of a CRLF/, 'embedded CR in a header value: the embedded-CR guard specifically');
 }
 {
 	my $fh = _handle("GET /a\rb HTTP/1.1\r\n\r\n");
 	my $err = _hostile('CR without LF, embedded in the request line', $fh);
 	is($err->{status}, 400, 'embedded CR in the request line: specifically 400');
+	like($err->{message}, qr/carriage return that is not part of a CRLF/, 'embedded CR in the request line: the same embedded-CR guard');
 }
 
 ###############################################################################
@@ -344,11 +422,13 @@ for my $method (qw(PUT DELETE HEAD OPTIONS PATCH CONNECT TRACE get)) {
 	my $fh = _handle("GET / HTTP/1.1\n\n");
 	my $err = _hostile('LF without CR ending the request line', $fh);
 	is($err->{status}, 400, 'bare-LF request line: specifically 400');
+	like($err->{message}, qr/bare LF, not CRLF/, 'bare-LF request line: the CRLF-terminator guard - though the downstream request-line regex would also refuse it (task-5-review.md notes this one is not fully isolated)');
 }
 {
 	my $fh = _handle("GET / HTTP/1.1\r\nX-Thing: v\n\r\n");
 	my $err = _hostile('LF without CR ending a header line', $fh);
 	is($err->{status}, 400, 'bare-LF header line: specifically 400');
+	like($err->{message}, qr/bare LF, not CRLF/, 'bare-LF header line: the CRLF-terminator guard - the row that actually isolates it (task-5-review.md)');
 }
 
 ###############################################################################
@@ -358,16 +438,19 @@ for my $method (qw(PUT DELETE HEAD OPTIONS PATCH CONNECT TRACE get)) {
 	my $fh = _handle("GET http://evil.example/x HTTP/1.1\r\n\r\n");
 	my $err = _hostile('absolute-form URI', $fh);
 	is($err->{status}, 400, 'absolute-form URI: specifically 400');
+	like($err->{message}, qr/origin-form request target/, 'absolute-form URI: the origin-form-only guard specifically');
 }
 {
 	my $fh = _handle("GET example.com:80 HTTP/1.1\r\n\r\n");
 	my $err = _hostile('authority-form target', $fh);
 	is($err->{status}, 400, 'authority-form target: specifically 400');
+	like($err->{message}, qr/origin-form request target/, 'authority-form target: the same origin-form-only guard');
 }
 {
 	my $fh = _handle("POST * HTTP/1.1\r\nContent-Length: 0\r\n\r\n");
 	my $err = _hostile('asterisk-form target', $fh);
 	is($err->{status}, 400, 'asterisk-form target: specifically 400');
+	like($err->{message}, qr/origin-form request target/, 'asterisk-form target: the same origin-form-only guard');
 }
 
 ###############################################################################

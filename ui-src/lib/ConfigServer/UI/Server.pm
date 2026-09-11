@@ -52,15 +52,20 @@
 #     request per connection, always, because this tier implements no
 #     keep-alive at all.
 #
-# Untested by design, the same way ui-src/bin/csf-ui-helper's own main() is
-# not unit-tested by t/11-helper-validate.t: the accept/fork loop itself
-# (run()) needs a real listening socket, a real fork, and - in production -
-# a real TLS library this workspace does not have installed. Everything up
-# to and including one connection's handling (preflight(), read_ui_conf(),
-# peer_allowed(), handle_connection()) is a plain function or takes its
-# socket as an argument, so t/40 and t/41 exercise all of it directly,
-# using socketpair()s in place of accept()ed connections and a fake `app`
-# in place of ConfigServer::UI::App.
+# run() itself - the loop's own control flow, wired to a real accept() -
+# is untested by design, the same way ui-src/bin/csf-ui-helper's own main()
+# is not unit-tested by t/11-helper-validate.t: it needs a real listening
+# socket, a real fork, and, in production, a real TLS library this
+# workspace does not have installed, and it sits behind preflight(), which
+# always refuses here for exactly that last reason. Everything the loop
+# actually DOES with one connection is factored out into plain functions or
+# functions that take their socket as an argument instead, precisely so
+# each piece is testable without any of that: preflight(), read_ui_conf(),
+# peer_allowed(), handle_connection(), _serve_accepted() (the per-connection
+# TLS-wrap-then-serve step, watchdog included - task-5-review.md R31/R32)
+# and _accept_backoff() (the accept()-failure policy - I2). t/40 and t/41
+# exercise all of them directly, using socketpair()s in place of accept()ed
+# connections and a fake `app` in place of ConfigServer::UI::App.
 ###############################################################################
 package ConfigServer::UI::Server;
 
@@ -88,6 +93,7 @@ our $DEFAULT_UI_CONF_PATH = '/etc/csf-ui/ui.conf';
 # 32 refuses the 33rd.
 our $DEFAULT_MAX_CHILDREN = 32;
 our $DEFAULT_LISTEN_BACKLOG = 64;
+our $DEFAULT_ACCEPT_BACKOFF = 0.1;
 
 ###############################################################################
 # ui.conf (docs/WEBUI-RPC.md section 10)
@@ -396,6 +402,7 @@ sub new {
 		listener       => $opt{listener},
 		max_children   => defined $opt{max_children} ? $opt{max_children} : $DEFAULT_MAX_CHILDREN,
 		backlog        => defined $opt{backlog} ? $opt{backlog} : $DEFAULT_LISTEN_BACKLOG,
+		accept_backoff => defined $opt{accept_backoff} ? $opt{accept_backoff} : $DEFAULT_ACCEPT_BACKOFF,
 		header_timeout => defined $opt{header_timeout} ? $opt{header_timeout} : $ConfigServer::UI::HTTP::HEADER_TIMEOUT,
 		body_timeout   => defined $opt{body_timeout}   ? $opt{body_timeout}   : $ConfigServer::UI::HTTP::BODY_TIMEOUT,
 		write_timeout  => defined $opt{write_timeout}  ? $opt{write_timeout}  : $ConfigServer::UI::HTTP::WRITE_TIMEOUT,
@@ -577,6 +584,34 @@ sub _serve_accepted {
 	return;
 }
 
+###############################################################################
+# _accept_backoff($self, $is_eintr, $errno_text)
+#
+# The whole of run()'s accept()-failure policy, extracted so it is directly
+# testable (task-5-review.md I2) the same way _serve_accepted() was
+# extracted for R31/R32: run()'s own while loop cannot be driven from a
+# test at all (it sits behind preflight(), which always refuses in this
+# workspace because IO::Socket::SSL is not installed - G1), so the policy
+# itself has to be reachable without going through accept() or preflight().
+#
+# EINTR means "a signal arrived, nothing is actually wrong", and the right
+# answer is to return immediately so run() calls accept() again at once.
+# Everything else - EMFILE/ENFILE from descriptor exhaustion (which a
+# pile-up of children stuck in an unbounded TLS handshake, R31's other
+# half, makes reachable), ECONNABORTED, or anything this loop has not seen
+# before - is a real condition that will not clear itself between one
+# accept() and the next, so retrying instantly would spin this loop as
+# fast as the CPU allows, forever, with no line anywhere to say why the
+# admin UI went unresponsive. Back off briefly and log once per occurrence.
+###############################################################################
+sub _accept_backoff {
+	my ($self, $is_eintr, $errno_text) = @_;
+	return if $is_eintr;
+	print STDERR "csf-ui (Server.pm): accept() failed: $errno_text\n";
+	select(undef, undef, undef, $self->{accept_backoff});
+	return;
+}
+
 sub run {
 	my ($self) = @_;
 
@@ -607,20 +642,9 @@ sub run {
 
 		my $paddr = accept(my $connection, $listener);
 		unless ($paddr) {
-			# task-5-review.md I2/R31: EINTR means "a signal arrived,
-			# nothing is actually wrong" and the right answer is to call
-			# accept() again immediately. Everything else - EMFILE/ENFILE
-			# from descriptor exhaustion (which a pile-up of children
-			# stuck in an unbounded TLS handshake, R31's other half, makes
-			# reachable), ECONNABORTED, or anything this loop has not seen
-			# before - is a real condition that will not clear itself
-			# between one accept() and the next, so retrying instantly
-			# would spin this loop as fast as the CPU allows, forever,
-			# with no line anywhere to say why the admin UI went
-			# unresponsive. Back off briefly and log once per occurrence.
-			if ($!{EINTR}) { next }
-			print STDERR "csf-ui (Server.pm): accept() failed: $!\n";
-			select(undef, undef, undef, 0.1);
+			# See _accept_backoff() above for the reasoning; kept as a
+			# named, unit-testable policy rather than inline logic.
+			$self->_accept_backoff($!{EINTR} ? 1 : 0, "$!");
 			next;
 		}
 

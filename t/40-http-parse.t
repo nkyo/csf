@@ -39,7 +39,8 @@ use lib "$FindBin::Bin/..", "$FindBin::Bin/../ui-src/lib";
 
 use File::Temp qw(tempdir);
 use Socket ();
-use Test::More tests => 115;
+use Time::HiRes ();
+use Test::More tests => 125;
 
 require_ok('ConfigServer::UI::HTTP');
 require_ok('ConfigServer::UI::Server');
@@ -587,6 +588,105 @@ sub _conf {
 	my $out = <$far>;
 	close $far;
 	like($out, qr{\AHTTP/1\.1 500}, 'a dispatch() that dies outright also becomes a 500');
+}
+
+###############################################################################
+# ConfigServer::UI::Server->_serve_accepted() - task-5-review.md R31
+# (Critical C1): a peer that completes the TCP handshake and then sends
+# nothing must not be able to park a forked child forever. tls_wrap is
+# injected to simulate exactly that - a "handshake" that never returns -
+# and watchdog_exit is overridden so the test can observe the watchdog
+# firing rather than being killed by it (the real default is
+# POSIX::_exit(1), which would end this test process too).
+###############################################################################
+{
+	my ($near, $far) = _pair();
+	my $app = FakeApp->new;
+	my $server = $S->new(
+		app            => $app,
+		header_timeout => 0.1,
+		body_timeout   => 0.1,
+		write_timeout  => 0.1,
+		tls_wrap       => sub { select(undef, undef, undef, 10); return $_[0] },
+		watchdog_exit  => sub { die "R31 watchdog fired\n" },
+	);
+
+	my $t0 = Time::HiRes::time();
+	my $died = eval { $server->_serve_accepted($near, '203.0.113.9'); 1 } ? '' : $@;
+	my $elapsed = Time::HiRes::time() - $t0;
+	close $far;
+
+	like($died, qr/R31 watchdog fired/,
+		'R31: a tls_wrap that never returns is killed by the watchdog, not left to hang the child forever');
+	cmp_ok($elapsed, '<', 2,
+		"R31: and it is killed within the configured budget ($elapsed s), not the 10s the stuck handshake simulated");
+	is(scalar(@{ $app->{calls} }), 0, 'R31: dispatch() is never reached by a connection stuck in the handshake');
+}
+
+###############################################################################
+# ConfigServer::UI::Server->_serve_accepted() - task-5-review.md R32/I3: a
+# tls_wrap that returns a socket which is not really IO::Socket::SSL (the
+# shape of the un-gated constructor-injection seam the review flagged) must
+# be refused, not handed to HTTP.pm and served in the clear. A well-formed
+# request is written by "the peer" first, so a version of this code that
+# forgot the isa() check would answer it - proving this is a live refusal,
+# not merely "nothing happened to be sent".
+###############################################################################
+{
+	my ($near, $far) = _pair();
+	syswrite($far, "GET /api/status HTTP/1.1\r\nHost: x\r\n\r\n");
+	my $app = FakeApp->new;
+	my $server = $S->new(
+		app            => $app,
+		header_timeout => 1, body_timeout => 1, write_timeout => 1,
+		tls_wrap       => sub { return $_[0] }, # a plaintext pass-through, never real TLS
+	);
+
+	$server->_serve_accepted($near, '203.0.113.9');
+	local $/;
+	my $out = <$far>;
+	close $far;
+
+	is(scalar(@{ $app->{calls} }), 0,
+		'R32: a socket tls_wrap did not actually wrap in TLS never reaches dispatch()');
+	ok(!defined($out) || $out eq '',
+		'R32: and nothing is written back over it either - refused outright, not served in the clear');
+}
+
+###############################################################################
+# ConfigServer::UI::Server::_accept_backoff() - task-5-review.md I2: the
+# accept()-failure policy run()'s loop delegates to. EINTR must retry at
+# once (no log line, no delay); anything else must log once and back off,
+# so a persistent error (EMFILE/ENFILE, which R31's fix makes reachable by
+# closing off the escape valve stuck children used to provide) cannot spin
+# the loop as fast as the CPU allows.
+###############################################################################
+{
+	my $server = $S->new(app => FakeApp->new);
+	my $stderr = '';
+	my $t0 = Time::HiRes::time();
+	{
+		local *STDERR;
+		open(STDERR, '>', \$stderr) or die;
+		$server->_accept_backoff(1, 'Interrupted system call');
+	}
+	my $elapsed = Time::HiRes::time() - $t0;
+	is($stderr, '', 'I2: an EINTR accept() failure logs nothing');
+	cmp_ok($elapsed, '<', 0.05, 'I2: and retries at once rather than backing off');
+}
+{
+	my $server = $S->new(app => FakeApp->new, accept_backoff => 0.15);
+	my $stderr = '';
+	my $t0 = Time::HiRes::time();
+	{
+		local *STDERR;
+		open(STDERR, '>', \$stderr) or die;
+		$server->_accept_backoff(0, 'Too many open files');
+	}
+	my $elapsed = Time::HiRes::time() - $t0;
+	like($stderr, qr/accept\(\) failed/, 'I2: a non-EINTR accept() failure is logged, not silent');
+	like($stderr, qr/Too many open files/, 'I2: naming the actual errno text, not merely "something failed"');
+	cmp_ok($elapsed, '>=', 0.1, 'I2: and the loop backs off rather than spinning unthrottled');
 }
 
 print "# KEEP: " . scalar(@KEEP) . " temp files held open for the duration of this run\n";
