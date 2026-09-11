@@ -4,8 +4,10 @@
 plan: `docs/superpowers/plans/webui-implementation.md`.
 
 This document is the interface between the unprivileged web tier (`csf-ui`, user
-`csfui`) and the privileged helper (`csf-ui-helper`, root). Every later task
-implements against it; none of them may extend it.
+`csfui`) and the privileged helper (`csf-ui-helper`, root) — and, since §14,
+also the interface between `csf-ui` and whatever produces its input: Task 5's
+`Server.pm` in mode B, or a front web server's adapter in mode A. Every later
+task implements against it; none of them may extend it.
 
 **What "frozen" means here.** The operation list, the argument grammars, the
 error codes and the `ui.conf` key names do not change to suit a screen. Adding an
@@ -29,6 +31,7 @@ becomes a wide one.
 | know where this contract departs from the plan | §11 |
 | know what a later task owes this document | §12 |
 | know why the UI does not live under /etc/csf | §13 |
+| implement the request Task 5 must hand `csf-ui`, or read it in `csf-ui` | §14 |
 
 ---
 
@@ -1616,6 +1619,110 @@ silent:
    managed tree;
 2. `/etc/csf`, `/var/lib/csf` and `/usr/local/csf` are still `0600` — the UI's
    install must not have weakened csf's own hardening anywhere.
+
+---
+
+## 14. The normalised request and response — `csf-ui` ⇄ Task 5
+
+Everything above this section is the socket between `csf-ui` and the helper.
+This section is the **other** boundary this contract also settles: the one
+between `csf-ui` and whatever hands it a request — Task 5's `Server.pm` in
+mode B, or a front web server's CGI/FastCGI/reverse-proxy adapter in mode A.
+`ConfigServer::UI::App::dispatch()` (`ui-src/bin/csf-ui`) is the only function
+on the `csf-ui` side; this is its complete argument and return contract.
+
+It was added here, after the fact, for the same reason §11.9 records three
+amendments found while Task 2 implemented §§1–13: an interface two tasks
+build against on either side is a contract, whether or not it started out
+written down, and letting each side's implementer guess the same fifteen
+details independently is how they end up guessing differently. Review of
+Task 4 found the shape was implementable but not guess-free — `peer` was
+described but never required, no size was ever stated for anything, and the
+byte-versus-character question below was answered nowhere. Nailed down here
+instead of being rediscovered as a Task 5 defect nothing in either task's
+review would have caught.
+
+### 14.1 The request
+
+`dispatch()` takes exactly one argument: a hashref with exactly these keys.
+Unknown keys are ignored (this is not a wire message and has no `E_ARG` of
+its own); a value violating any rule below either produces `WEB_BAD_REQUEST`
+where `csf-ui` itself checks it (marked **checked** below) or is `csf-ui`'s
+problem to have specified better, not the producer's problem to guess at
+(marked **unchecked** — a defect in the request if wrong, not something
+`csf-ui` can detect).
+
+| Key | Type | Mandatory | Rule |
+|---|---|---|---|
+| `method` | string | yes | Matched case-insensitively against each route's own method; supply uppercase (`GET`, `POST`). **Unchecked** for shape — an absent or unrecognised value simply matches no route and is `WEB_NOT_FOUND`/`WEB_METHOD_NOT_ALLOWED`, which is not a distinct failure mode worth a separate check. |
+| `path` | string | yes | The decoded path **only** — no query string, no fragment. Always starts with `/`. Routing is **exact string match**, method then path (`ui-src/bin/csf-ui`'s `_route`), so a trailing slash, a doubled slash, a different case, a control byte, `%2F`, or `..` all simply match no registered route and fall out as `WEB_NOT_FOUND` — this is a property of the route table, not a normalisation rule this tier applies, and Task 5 is not required to reject or canonicalise any of those before constructing the structure. |
+| `query` | hashref or absent | no | The query string, already **parsed and URL-decoded** by the producer. `{}`, `undef`, and "absent" are equivalent. A repeated key: last value wins — the producer's choice how to fold one, this tier only ever sees the result. Percent-decoded **into raw bytes** — see §14.2, do not set Perl's internal UTF-8 flag on the result. Each value **≤ 65536 bytes** (unchecked by `csf-ui`, which receives these already parsed — a longer value simply fails whichever §4 grammar eventually sees it, at the cost of having parsed something oversized first; bounding it earlier is cheaper and is the producer's job). |
+| `headers` | hashref | yes (may be `{}`) | Header **names lowercased**, one string value per name. `csf-ui` reads exactly three: `cookie`, `content-type`, `x-csrf-token`. A repeated header's folding (comma-joined, last-wins, first-wins) is the producer's choice — **unspecified** by this contract, and today only `x-csrf-token` would ever be affected by it; a producer that folds it any consistent way is compliant. |
+| `body` | string or absent | no | Raw bytes, **not** URL- or JSON-decoded — `csf-ui` decodes it itself, keyed on `content-type` (§14.2). `undef` or `''` for a bodyless request (typically any `GET`). **Checked**: a body over **65536 bytes** (the same figure as §3.1's wire line cap, chosen for consistency rather than derived from it — there is no wire request this large, but the number is easy to remember and already meaningful in this document) is refused by `csf-ui` itself with `WEB_BAD_REQUEST` before any parsing is attempted, so a producer that forgets its own limit is still protected, one layer in. Task 5 should still impose its own bound before ever reading this much into memory — `csf-ui`'s check happens after the bytes already exist as a Perl string. |
+| `peer` | string | **yes, and must be non-empty** | The connecting address, text form (IPv4 or IPv6), **no port, no brackets**. **Checked**: `csf-ui` refuses any request with a missing or empty `peer` outright, `WEB_BAD_REQUEST`, before routing, session lookup, or anything else runs (review Important 3) — an absent value used to silently disable `RateLimit.pm`'s per-address cap rather than fail visibly, which is exactly the failure mode this whole tier exists to not have. Two rules bind whoever fills this in: (1) it must be **per-connecting-client**, never a constant — a mode-A adapter that fills it with the front server's own fixed address collapses the per-address cap into one global bucket, where a handful of failed logins from any one visitor locks out every visitor; (2) it must **never** come from a client-supplied header (`X-Forwarded-For` or similar) that this tier, or the producer, treats as trusted for access control — §10 already says this for `UI_ALLOW`, and it applies here for exactly the same reason: a header the connecting peer wrote is not evidence of who the connecting peer is. |
+
+### 14.2 Body decoding — what `csf-ui` does with it, and the encoding rule
+
+`_parse_body()` (`ui-src/bin/csf-ui`) branches on `content-type`:
+
+- `application/json` (prefix match, parameters after `;` ignored): the whole
+  body is handed to `JSON::Tiny::decode_json`. **Measured**: `JSON::Tiny`
+  decodes a raw-byte body containing UTF-8 text into proper UTF-8-flagged
+  Perl character strings for every JSON string value — so a JSON body's
+  string values arrive at `csf-ui`'s validators (§4, via `Proto::as_chars`)
+  already as characters.
+- anything else, including no `content-type` at all (the shape a plain HTML
+  `<form>` without `enctype=""` POSTs as): treated as
+  `application/x-www-form-urlencoded` — split on `&` and `=`, then `+` → space
+  and `%XX` → the single byte it encodes. **Measured**: this produces a raw
+  **byte** string (no UTF-8 flag), even when the decoded bytes are a valid
+  multi-byte UTF-8 sequence.
+
+**This asymmetry is deliberate and is not a bug to fix on either side.**
+`Proto::as_chars` (§4's own machinery) already handles both shapes
+correctly: a value with the UTF-8 flag set is used as-is, and a value without
+it is decoded from UTF-8 bytes (`Encode::decode('UTF-8', …, FB_CROAK)`) —
+failing that decode, the same way an invalid sequence fails it from any other
+source, is `E_ARG` ("is not valid UTF-8") from the relevant validator. So the
+rule Task 5 must follow for anything **it** URL-decodes — the `query` hash,
+per §14.1 — is exactly what `_url_decode()` already does for the body: turn
+`%XX` into the single raw byte it names, and stop there. Do **not** additionally
+interpret the result as characters, do **not** set the UTF-8 flag, and do
+**not** re-encode it. A query value produced this way and a form-body value
+produced this way are decoded through the identical path once they reach a
+validator; a query-string decoder that instead produces already-flagged
+characters is *also* fine, by the same `as_chars` logic — what is **not**
+fine is a decoder that sometimes does one and sometimes the other for what
+should be the same kind of value, which is the one way this asymmetry
+actually causes two paths to disagree.
+
+### 14.3 The response
+
+`dispatch()` always returns a hashref with exactly these keys — never dies,
+never returns anything else:
+
+| Key | Type | Rule |
+|---|---|---|
+| `status` | integer | An HTTP status code. |
+| `headers` | array of `[name, value]` pairs | **Ordered**, not a hash — `Set-Cookie` can appear more than once in one response (not exercised today, but the shape does not rule it out). Render in this order; do not deduplicate or reorder by name. |
+| `body` | string | Raw bytes to send verbatim — `csf-ui` has already serialised it (JSON today); Task 5 does not re-encode it. |
+
+### 14.4 What is deliberately not specified here
+
+- **TLS, HTTP framing, chunked transfer, keep-alive** — none of it. Those are
+  entirely Task 5's problem in mode B and entirely the front server's problem
+  in mode A; this structure exists precisely so `csf-ui` never has to know
+  which one produced it.
+- **A maximum on `headers`** (count or total size) — `csf-ui` reads three
+  names and ignores the rest, so an oversized or excessive header set costs
+  this tier nothing beyond the hash Task 5 already built; bounding it, if
+  wanted, is a Task 5 concern for Task 5's own resource use, not a `csf-ui`
+  one.
+- **Cookie folding beyond the one cookie `csf-ui` reads.** `headers->{cookie}`
+  is parsed by `Session::id_from_cookie_header` (semicolon-separated
+  `name=value` pairs); any cookie this tier does not name
+  (`$ConfigServer::UI::Session::COOKIE_NAME`) is ignored, whatever else the
+  header contains.
 
 ---
 

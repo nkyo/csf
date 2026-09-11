@@ -32,15 +32,23 @@
 # THE REQUEST STRUCTURE - what Task 5 (or the front web server glue) MUST
 # produce, and the only thing this module ever reads from the network side.
 # Exactly these keys; ConfigServer::UI::App::dispatch() is the sole entry
-# point and takes one of these as its only argument:
+# point and takes one of these as its only argument.
+#
+# docs/WEBUI-RPC.md S14 is the FROZEN, authoritative version of this
+# structure - every rule, size limit and byte-vs-character detail, reviewed
+# and amended there rather than only here. This comment is a summary for a
+# reader of this file; where the two could ever read differently, S14 wins,
+# the same way the contract wins over this task's own brief.
 #
 #   {
 #     method  => 'GET' | 'POST',        # matched case-insensitively; supply uppercase
 #     path    => '/api/deny',           # decoded path only - NO query string, always
 #                                        # starts with '/'
 #     query   => { key => 'value', ... },   # the query string, already parsed and
-#                                            # URL-decoded; {} or undef when there is
-#                                            # none. Last value wins on a repeated key.
+#                                            # URL-decoded INTO RAW BYTES (S14.2 - do
+#                                            # not set the utf8 flag); {} or undef when
+#                                            # there is none. Last value wins on a
+#                                            # repeated key.
 #     headers => { 'cookie' => '...', 'content-type' => '...', ... },
 #                                        # header NAMES LOWERCASED, values as received,
 #                                        # one string per name (a repeated header is
@@ -48,24 +56,35 @@
 #                                        # module only ever reads 'cookie',
 #                                        # 'content-type' and 'x-csrf-token')
 #     body    => '...',                 # raw request body bytes, undef/'' for a
-#                                        # bodyless request. Decoded as JSON when
-#                                        # content-type is application/json, otherwise
-#                                        # as application/x-www-form-urlencoded - the
-#                                        # shape a plain HTML <form> POSTs as, which is
-#                                        # what Task 7's screens will use.
-#     peer    => '203.0.113.7',         # the connecting address, text form (v4 or
-#                                        # v6, no port, no brackets). Used only for
-#                                        # the web tier's own login rate limiter
-#                                        # (RateLimit.pm) and the access log - NEVER
-#                                        # forwarded to the helper, which does not
-#                                        # accept an address argument at all
-#                                        # (docs/WEBUI-RPC.md S9). In mode A this is
-#                                        # the front web server's own idea of the
-#                                        # client address (however IT is configured
-#                                        # to determine one), never a value taken from
-#                                        # an X-Forwarded-For header this module
-#                                        # trusts - docs/WEBUI-RPC.md S10 is explicit
-#                                        # that header is untrusted for access control.
+#                                        # bodyless request. MUST be <= $MAX_BODY_BYTES
+#                                        # (65536, S14.1) - checked here (WEB_BAD_REQUEST
+#                                        # if not), but Task 5 should bound it earlier,
+#                                        # before reading this much into memory at all.
+#                                        # Decoded as JSON when content-type is
+#                                        # application/json, otherwise as
+#                                        # application/x-www-form-urlencoded - the shape
+#                                        # a plain HTML <form> POSTs as, which is what
+#                                        # Task 7's screens will use.
+#     peer    => '203.0.113.7',         # the connecting address, text form (v4 or v6,
+#                                        # no port, no brackets). MANDATORY and MUST be
+#                                        # non-empty (S14.1, review Important 3) - a
+#                                        # missing or empty value used to silently
+#                                        # disable RateLimit.pm's per-address cap rather
+#                                        # than fail visibly, so this is now checked
+#                                        # here too (WEB_BAD_REQUEST if absent). MUST be
+#                                        # per-connecting-client, never a constant - a
+#                                        # fixed value collapses the per-address cap
+#                                        # into one global bucket. Used only for the web
+#                                        # tier's own login rate limiter (RateLimit.pm)
+#                                        # and the access log - NEVER forwarded to the
+#                                        # helper, which does not accept an address
+#                                        # argument at all (docs/WEBUI-RPC.md S9). In
+#                                        # mode A this is the front web server's own
+#                                        # idea of the client address, never a value
+#                                        # taken from an X-Forwarded-For header this
+#                                        # module trusts - docs/WEBUI-RPC.md S10 is
+#                                        # explicit that header is untrusted for access
+#                                        # control.
 #   }
 #
 # THE RESPONSE STRUCTURE - what dispatch() always returns, and the only
@@ -104,6 +123,11 @@ our $VERSION = '1.00';
 our $DEFAULT_UI_CONF    = '/etc/csf-ui/ui.conf';
 our $DEFAULT_ACCESS_LOG = '/var/log/csf-ui-access.log';
 
+# docs/WEBUI-RPC.md S14.1 - the same figure as the wire line cap (S3.1), for
+# consistency rather than derivation. A defensive backstop only: Task 5
+# should never let a body this large be read into memory to begin with.
+our $MAX_BODY_BYTES = 65536;
+
 ###############################################################################
 # The route table. A plain package array, not a lexical, on purpose: Task 7
 # ("handlers in ui-src/csf-ui" per docs/superpowers/plans/webui-implementation.md)
@@ -112,33 +136,52 @@ our $DEFAULT_ACCESS_LOG = '/var/log/csf-ui-access.log';
 # fourteen RPC operations; screens are meant to be purely additive to this
 # table.
 #
+# PROTECTION IS OPT-OUT, NEVER OPT-IN. Every row - `op` or `handler` alike -
+# is routed through the SAME session/role/CSRF gate (_gate(), below) unless
+# it declares `anonymous => 1` itself, visibly, in the table. There is no
+# way to add a row that silently skips a check by omission: a `handler` row
+# that forgets to think about CSRF still gets it, because _gate() runs
+# before the handler is ever called, not inside it. This replaced an
+# earlier shape where `handler` rows ran with none of the three checks
+# unless the coderef re-implemented them by hand - found in review before
+# Task 7 had written a single screen against it (Important 5 in
+# .superpowers/sdd/webui-implementation/task-4-review.md).
+#
 # Each row is one of two shapes:
 #
-#   { method, path, op, mutates?, support? }
-#       The generic case: forward to the helper operation named by `op` with
-#       args built from the query string (GET) or the body (POST), after
-#       session, role and (if mutates is true) CSRF checks. `support => 1`
-#       opens the route to the support role as well as admin - every other
-#       route is admin-only, matching docs/WEBUI-RPC.md S5's role mapping
-#       exactly: "support may call grep and list only. Every other
-#       operation is admin."
+#   { method, path, op, mutates?, support?, any_role? }
+#       The generic case: forward to the helper operation named by `op`,
+#       with args built from the query string (GET) or the body (POST).
 #
-#   { method, path, handler, anonymous? }
-#       A custom handler coderef, called as
-#       $handler->($self, $request, $session) and returning the same
-#       4-element list _handle_op returns: ($response, $user, $role, $id).
-#       `anonymous => 1` skips the session lookup before calling it (only
-#       /api/login uses this - authenticate is documented as "pre-session"
-#       in docs/WEBUI-RPC.md S5.14, so it is the one route reachable with no
-#       cookie at all).
+#   { method, path, handler, mutates?, support?, any_role?, anonymous? }
+#       A custom handler coderef. Once _gate() has passed, it is called as
+#       $handler->($self, $request, $session, $args) - receiving the
+#       ALREADY-AUTHORISED session (with its csrf field: THIS is how a
+#       server-rendered template obtains the nonce to put in a hidden form
+#       field - Task 6/7 read $session->{csrf} from this argument, nowhere
+#       else) and the already-parsed, already-CSRF-stripped args - and is
+#       responsible for producing a body, nothing else.
 #
-# CSRF is required on exactly the operations docs/WEBUI-RPC.md S5's "Mutates"
-# column marks yes: deny, undeny, allow, unallow, tempdeny, temprm,
-# reconcile_fix, restart. `authenticate` is documented as mutating no
-# firewall state (S5.14), so /api/login carries no CSRF requirement - a
-# forged login POST cannot do anything a legitimate one could not already do
-# on its own account, and it cannot succeed against a victim's account
-# without already knowing the victim's password.
+# Flags, all optional and all default to the MOST RESTRICTIVE reading:
+#
+#   mutates   default 0. 1 requires a matching CSRF token (_csrf_token()),
+#             compared in constant time against the session's own.
+#   support   default 0 (admin-only). 1 also admits the support role.
+#             Sections 5's own words: "support may call grep and list only.
+#             Every other operation is admin" - so only list and grep carry
+#             this, and a test binds that (t/33-app.t).
+#   any_role  default 0. 1 admits ANY authenticated role regardless of
+#             `support` - for a route that is not itself one of the
+#             fourteen operations and has no security reason to
+#             discriminate by role (today: only /api/logout, since both
+#             roles may end their own session).
+#   anonymous default 0. 1 skips _gate() ENTIRELY - no session lookup, no
+#             role check, no CSRF check. The only legitimate use is a route
+#             that is reachable with no session by design, because it is
+#             how a session comes to exist in the first place
+#             (docs/WEBUI-RPC.md S5.14: authenticate is "pre-session").
+#             /api/login is the only row that sets it, and a test
+#             (t/33-app.t) asserts it is the only one.
 ###############################################################################
 our @ROUTES = (
 	{ method => 'GET',  path => '/api/status',    op => 'status' },
@@ -156,8 +199,16 @@ our @ROUTES = (
 	{ method => 'POST', path => '/api/reconcile_fix', op => 'reconcile_fix', mutates => 1 },
 	{ method => 'POST', path => '/api/restart',       op => 'restart',       mutates => 1 },
 
+	# A JSON "whoami" for any authenticated session - not one of the
+	# fourteen frozen operations (no RPC call at all, same standing as
+	# /api/logout below), added specifically so a JS-driven caller has a
+	# way to obtain the session's CSRF nonce on a page load that did not
+	# itself just log in (review: "nothing in this tier ever puts the
+	# nonce in a response, so the header path is currently unreachable").
+	{ method => 'GET',  path => '/api/session', handler => \&_route_session, any_role => 1 },
+
 	{ method => 'POST', path => '/api/login',  handler => \&_route_login,  anonymous => 1 },
-	{ method => 'POST', path => '/api/logout', handler => \&_route_logout },
+	{ method => 'POST', path => '/api/logout', handler => \&_route_logout, mutates => 1, any_role => 1 },
 );
 
 ###############################################################################
@@ -269,6 +320,35 @@ sub _route {
 			message => 'malformed request' }), undef, undef, undef);
 	}
 
+	# Important 3 (review): a missing or empty peer address would silently
+	# degrade protection rather than fail visibly - RateLimit.pm treats an
+	# empty address as "no key, not blocked" (by design: it must never
+	# refuse to persist a failure just because a caller handed it nothing
+	# to key on), so a request with no peer would get username-only
+	# protection with nothing anywhere saying so, and the access log would
+	# record who asked as an empty string. `peer` is mandatory in the
+	# request structure this file's header defines - its absence here is a
+	# producer defect (Task 5, or the front server adapter, failed to
+	# supply it), not something this tier can safely paper over by
+	# treating it as "no address" and moving on.
+	unless (defined $request->{peer} && length("$request->{peer}")) {
+		return (_json_response(400, { ok => _false(), error => 'WEB_BAD_REQUEST',
+			message => 'the request carries no peer address' }), undef, undef, undef);
+	}
+
+	# docs/WEBUI-RPC.md S14.1: a body over this many bytes is refused before
+	# any parsing is attempted, so a producer that forgets its own limit is
+	# still protected one layer in - though Task 5 should still impose its
+	# own bound before ever reading this much into memory in the first
+	# place, since this check runs only after the bytes already exist as a
+	# Perl string. Same figure as S3.1's wire line cap, for the same reason
+	# S14.1 gives: not derived from it, just easy to remember and already
+	# meaningful in this document.
+	if (defined $request->{body} && length("$request->{body}") > $MAX_BODY_BYTES) {
+		return (_json_response(400, { ok => _false(), error => 'WEB_BAD_REQUEST',
+			message => 'request body too large' }), undef, undef, undef);
+	}
+
 	my $method = uc(defined $request->{method} ? "$request->{method}" : '');
 	my $path   = defined $request->{path}      ? "$request->{path}"  : '';
 
@@ -286,32 +366,48 @@ sub _route {
 		return ($response, undef, undef, undef);
 	}
 
-	my $session = $route->{anonymous} ? undef : $self->_session_for($request);
+	if ($route->{anonymous}) {
+		# The only routes reachable with no session at all, by design
+		# (S5.14: authenticate is pre-session). No handler-less anonymous
+		# route exists, and _route_login is the only user of this branch.
+		my $args = $self->_args_for($request, $route);
+		return $route->{handler}->($self, $request, undef, $args);
+	}
 
-	return $route->{handler}->($self, $request, $session)
+	my $session = $self->_session_for($request);
+	my ($blocked, $args) = $self->_gate($request, $route, $session);
+	return @$blocked if $blocked;
+
+	return $route->{handler}->($self, $request, $session, $args)
 		if $route->{handler};
-	return $self->_handle_op($request, $route, $session);
+	return $self->_forward_to_helper($route, $session, $args);
 }
 
 ###############################################################################
-# The generic RPC-forwarding handler used by every route that just names an
-# `op`. Enforces, in this order: a valid session exists; the session's role
-# may reach this operation; if the operation mutates, the CSRF token
-# submitted with this request matches the session's.
+# _gate() - session, role and CSRF, run before EVERY non-anonymous route,
+# `op` or `handler` alike, so a route can only be as permissive as its own
+# declared flags, never as permissive as "forgot to add a check". Returns
+# (\@refusal, undef) when the request is refused - @refusal is exactly the
+# 4-element tuple _route() itself returns, ready to propagate straight back
+# up - or (undef, $args) when it may proceed, with $args already parsed
+# from the query string or body and the `_csrf` field already stripped out
+# of it.
 ###############################################################################
-sub _handle_op {
+sub _gate {
 	my ($self, $request, $route, $session) = @_;
 
 	unless ($session) {
-		return (_json_response(401, { ok => _false(), error => 'WEB_UNAUTHENTICATED',
-			message => 'sign in required' }), undef, undef, undef);
+		return ([ _json_response(401, { ok => _false(), error => 'WEB_UNAUTHENTICATED',
+			message => 'sign in required' }), undef, undef, undef ]);
 	}
 
 	my $role = $session->{role};
-	my $allowed = ($role eq 'admin') || ($route->{support} && $role eq 'support');
+	my $allowed = $route->{any_role}
+		|| ($role eq 'admin')
+		|| ($route->{support} && $role eq 'support');
 	unless ($allowed) {
-		return (_json_response(403, { ok => _false(), error => 'WEB_FORBIDDEN',
-			message => 'this account cannot perform this action' }), $session->{user}, $role, undef);
+		return ([ _json_response(403, { ok => _false(), error => 'WEB_FORBIDDEN',
+			message => 'this account cannot perform this action' }), $session->{user}, $role, undef ]);
 	}
 
 	my $args = $self->_args_for($request, $route);
@@ -319,15 +415,24 @@ sub _handle_op {
 	if ($route->{mutates}) {
 		my $submitted = _csrf_token($request, $args);
 		unless ($self->{sessions}->csrf_ok($session, $submitted)) {
-			return (_json_response(403, { ok => _false(), error => 'WEB_CSRF',
-				message => 'missing or invalid CSRF token' }), $session->{user}, $role, undef);
+			return ([ _json_response(403, { ok => _false(), error => 'WEB_CSRF',
+				message => 'missing or invalid CSRF token' }), $session->{user}, $role, undef ]);
 		}
 	}
 	delete $args->{_csrf} if ref($args) eq 'HASH';
 
+	return (undef, $args);
+}
+
+###############################################################################
+# The generic RPC-forwarding path used by every route that just names an
+# `op`, once _gate() has already passed.
+###############################################################################
+sub _forward_to_helper {
+	my ($self, $route, $session, $args) = @_;
 	my $id = $self->{client}->generate_id;
 	my $result = $self->{client}->call($route->{op}, $args, (defined $id ? (id => $id) : ()));
-	return (_response_for_rpc($result), $session->{user}, $role, $id);
+	return (_response_for_rpc($result), $session->{user}, $session->{role}, $id);
 }
 
 ###############################################################################
@@ -340,9 +445,8 @@ sub _handle_op {
 # attacker (S5.14's own words).
 ###############################################################################
 sub _route_login {
-	my ($self, $request, undef) = @_;
+	my ($self, $request, undef, $args) = @_;
 	my $peer = defined $request->{peer} ? "$request->{peer}" : '';
-	my $args = _parse_body($request);
 	my $user = (ref($args) eq 'HASH') ? $args->{user} : undef;
 	my $pass = (ref($args) eq 'HASH') ? $args->{pass} : undef;
 
@@ -401,27 +505,40 @@ sub _route_login {
 			message => 'could not start a session' }), $user, $role, $id);
 	}
 
-	my $response = _json_response(200, { ok => _true(), data => { role => $role } });
+	# `csrf` in the response body is the JS-driven path to the nonce this
+	# tier mints on login (R27/(f) in the review: nothing previously ever
+	# put it anywhere a caller could read it back, which left the
+	# X-CSRF-Token header this tier already accepts with no way to ever be
+	# populated). A server-rendered page gets the same value a different
+	# way: _gate() hands every non-anonymous handler route the session
+	# object directly, and $session->{csrf} is that page's copy.
+	my $response = _json_response(200, { ok => _true(),
+		data => { role => $role, csrf => $session->{csrf} } });
 	push @{ $response->{headers} }, ['Set-Cookie', $self->{sessions}->set_cookie_header($session->{id})];
 	return ($response, $user, $role, $id);
 }
 
-sub _route_logout {
-	my ($self, $request, $session) = @_;
-	my $args = _parse_body($request);
+# Reached only once _gate() has already required a session (any_role => 1
+# in @ROUTES: either role may ask who it is) and, being `mutates => 0`,
+# without needing a CSRF token to ask.
+sub _route_session {
+	my ($self, $request, $session, $args) = @_;
+	my $response = _json_response(200, { ok => _true(),
+		data => { user => $session->{user}, role => $session->{role}, csrf => $session->{csrf} } });
+	return ($response, $session->{user}, $session->{role}, undef);
+}
 
-	if ($session) {
-		my $submitted = _csrf_token($request, $args);
-		unless ($self->{sessions}->csrf_ok($session, $submitted)) {
-			return (_json_response(403, { ok => _false(), error => 'WEB_CSRF',
-				message => 'missing or invalid CSRF token' }), $session->{user}, $session->{role}, undef);
-		}
-		$self->{sessions}->destroy($session->{id});
-	}
+# _gate() has already required a session and, being `mutates => 1` on this
+# route, a valid CSRF token - so by the time this runs there is nothing left
+# to check: $session is never undef here, and destroying it is the whole
+# job.
+sub _route_logout {
+	my ($self, $request, $session, $args) = @_;
+	$self->{sessions}->destroy($session->{id});
 
 	my $response = _json_response(200, { ok => _true(), data => {} });
 	push @{ $response->{headers} }, ['Set-Cookie', $self->{sessions}->clear_cookie_header];
-	return ($response, ($session ? $session->{user} : undef), ($session ? $session->{role} : undef), undef);
+	return ($response, $session->{user}, $session->{role}, undef);
 }
 
 ###############################################################################

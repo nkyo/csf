@@ -35,7 +35,9 @@ use File::Temp qw(tempdir);
 use IO::Socket::UNIX ();
 use Socket qw(SOCK_STREAM);
 use POSIX ();
-use Test::More tests => 26;
+use Fcntl ();
+use Time::HiRes ();
+use Test::More tests => 32;
 
 require_ok('ConfigServer::UI::Client');
 my $C = 'ConfigServer::UI::Client';
@@ -287,13 +289,14 @@ sub _read_one_line {
 	my $source = <$fh>;
 	close $fh;
 
-	# Strip comments first - the header comment above call() names
-	# "IO::Socket::UNIX->new()" in prose while explaining why no separate
-	# connect timeout is needed, which is a second textual occurrence that
-	# has nothing to do with how many times the code actually calls it.
+	# Strip comments first - prose in this file talks about connect() and
+	# socket() while explaining why they are used, which has nothing to do
+	# with how many times the code actually calls them.
 	(my $code_source = $source) =~ s/#.*$//mg;
-	my $connects = () = $code_source =~ /IO::Socket::UNIX->new\(/g;
-	is($connects, 1, 'Client.pm opens a connection to the helper from exactly one place in the code');
+	my $sockets  = () = $code_source =~ /\bsocket\(/g;
+	my $connects = () = $code_source =~ /\bconnect\(/g;
+	is($sockets, 1, 'Client.pm creates a socket from exactly one place in the code');
+	is($connects, 1, 'Client.pm calls connect() from exactly one place in the code');
 
 	# Isolate call()'s own body - up to the next sub definition in the file
 	# - and confirm it contains no loop keyword. _write_all()'s internal
@@ -310,4 +313,61 @@ sub _read_one_line {
 	(my $code_only = $call_body) =~ s/#.*$//mg;
 	unlike($code_only, qr/\b(?:for|foreach|while|until|redo)\s*[(\{]/,
 		"call()'s own code contains no loop construct - there is nothing in it that could retry");
+
+	# _connect() is where the actual socket()/connect() pair now lives
+	# (Important 2 in the review: connect() itself must be inside the
+	# timeout budget). Checked the same way and for the same reason: a
+	# retry loop hidden in here would retry a connection attempt exactly as
+	# much as one hidden in call() would.
+	my ($connect_body) = $source =~ /\nsub _connect \{(.*?)\nsub _write_all\b/s;
+	ok(defined $connect_body && length($connect_body), "isolated _connect()'s body from the source to check it");
+	(my $connect_code_only = $connect_body) =~ s/#.*$//mg;
+	unlike($connect_code_only, qr/\b(?:for|foreach|while|until|redo)\s*[(\{]/,
+		"_connect()'s own code contains no loop construct either");
+}
+
+###############################################################################
+# Important 2 in the review, reproduced directly rather than only argued:
+# "measured on this machine, a blocking AF_UNIX connect() to a listener
+# whose backlog is full does not return until the listener accepts, with no
+# timeout of its own". Staged here with a backlog of 1, filled by opening
+# non-blocking connections to it without ever accepting a single one - the
+# same "children busy, connections queued" state the review measured
+# against the real helper (16 children, backlog 32), against a bare
+# listener instead so this test needs nothing from csf-ui-helper.
+#
+# The exact outcome (whether connect() itself times out, or succeeds into
+# the queue and the write/read that follow time out instead) is kernel-
+# dependent and not the point - either was already possible before this
+# fix for the write/read half. What matters, and is asserted directly, is
+# the one property that was NOT already true: call() returns within its own
+# budget regardless, rather than the whole process hanging on connect().
+###############################################################################
+{
+	my $path = _sock_path();
+	my $listener = IO::Socket::UNIX->new(Type => SOCK_STREAM, Local => $path, Listen => 1)
+		or die "cannot create a backlogged listener: $!";
+
+	my @filling;
+	for (1 .. 64) {
+		socket(my $s, Socket::PF_UNIX(), Socket::SOCK_STREAM(), 0) or next;
+		my $flags = fcntl($s, Fcntl::F_GETFL(), 0);
+		fcntl($s, Fcntl::F_SETFL(), $flags | Fcntl::O_NONBLOCK()) if defined $flags;
+		connect($s, Socket::pack_sockaddr_un($path)); # queued or refused - either is fine, never accepted either way
+		push @filling, $s;
+	}
+
+	my $client = $C->new(socket_path => $path, timeout => 0.3);
+	my $started = Time::HiRes::time();
+	my $response = $client->call('status', {});
+	my $elapsed = Time::HiRes::time() - $started;
+
+	close $_ for @filling;
+	close $listener;
+
+	ok($elapsed < 3,
+		'a connect() against a saturated, never-accepting listener returns well inside a few seconds - never hangs indefinitely');
+	ok(!_ok_flag($response->{ok}), 'and is always reported as a failure, never left silently unanswered');
+	ok(defined $response->{error} && $response->{error} =~ /\AE_(?:BUSY|UNAVAILABLE|BACKEND)\z/,
+		"reported with a recognised code (got '" . (defined $response->{error} ? $response->{error} : 'undef') . "')");
 }

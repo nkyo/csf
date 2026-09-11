@@ -40,7 +40,7 @@ use lib "$FindBin::Bin/..", "$FindBin::Bin/../ui-src/lib";
 
 use File::Temp qw(tempdir);
 use JSON::Tiny ();
-use Test::More tests => 55;
+use Test::More tests => 137;
 
 my $APP_PATH = "$FindBin::Bin/../ui-src/bin/csf-ui";
 ok(-f $APP_PATH, 'csf-ui is where the brief says it is');
@@ -125,6 +125,55 @@ sub _last_access_line {
 
 	$r = $app->dispatch("not a hashref");
 	is($r->{status}, 400, 'a malformed request (not even a hashref) is refused, not a crash');
+}
+
+###############################################################################
+# Important 3 in the review: a missing or empty peer address must fail
+# closed, loudly, before anything else runs - never silently degrade
+# RateLimit.pm's per-address cap or blank the access log's record of who
+# asked. Checked against a route that would otherwise succeed cleanly, so
+# there is no other reason a 400 could appear here.
+###############################################################################
+{
+	my ($app, $client, $sessions) = _build();
+	my $sess = $sessions->create(user => 'nadia', role => 'admin');
+	my $cookie = "csfui_sid=$sess->{id}";
+
+	my $r = $app->dispatch({ method => 'GET', path => '/api/status', headers => { cookie => $cookie } });
+	is($r->{status}, 400, 'a request with no peer key at all is refused before routing proceeds');
+	is(scalar(@{ $client->{calls} }), 0, 'and the helper is never reached');
+
+	$r = $app->dispatch({ method => 'GET', path => '/api/status', headers => { cookie => $cookie }, peer => '' });
+	is($r->{status}, 400, 'a request with an empty-string peer is refused the same way');
+
+	$r = $app->dispatch({ method => 'GET', path => '/api/status', headers => { cookie => $cookie }, peer => '203.0.113.1' });
+	is($r->{status}, 200, 'and the same request with a real peer address succeeds, confirming peer was the only thing missing');
+}
+
+###############################################################################
+# docs/WEBUI-RPC.md S14.1: a body over the documented 65536-byte cap is
+# refused by csf-ui itself, before any parsing is attempted - a defensive
+# backstop for a producer that forgets its own limit, not a replacement for
+# Task 5 imposing one earlier.
+###############################################################################
+{
+	no warnings 'once'; # ConfigServer::UI::App::MAX_BODY_BYTES is touched exactly once in this file
+	my ($app, undef, $sessions) = _build();
+	my $sess = $sessions->create(user => 'oscar', role => 'admin');
+
+	my $huge = 'x' x ($ConfigServer::UI::App::MAX_BODY_BYTES + 1);
+	my $r = $app->dispatch({ method => 'POST', path => '/api/deny',
+		headers => { cookie => "csfui_sid=$sess->{id}", 'x-csrf-token' => $sess->{csrf} },
+		body => "ip=192.0.2.1&note=$huge", peer => '1.2.3.4' });
+	is($r->{status}, 400, 'a body over the documented cap is refused outright');
+
+	my $body = eval { JSON::Tiny::decode_json($r->{body}) } || {};
+	is($body->{error}, 'WEB_BAD_REQUEST', 'with the bad-request code, not a crash or a helper call');
+
+	$r = $app->dispatch({ method => 'POST', path => '/api/deny',
+		headers => { cookie => "csfui_sid=$sess->{id}", 'x-csrf-token' => $sess->{csrf} },
+		body => "ip=192.0.2.1&note=x&_csrf=$sess->{csrf}", peer => '1.2.3.4' });
+	is($r->{status}, 200, 'and a normal-sized body for the same route is unaffected');
 }
 
 ###############################################################################
@@ -405,4 +454,150 @@ sub _last_access_line {
 	close $fh;
 	unlike($contents, qr/hunter2/, 'the submitted password never appears anywhere in the access log');
 	like($contents, qr/"user":"henry"/, 'the username, which is not a secret, does appear');
+}
+
+###############################################################################
+# R27: @ROUTES is bound to section 5's Mutates and role columns by a
+# mechanical test, not by inspection or memory - the same reasoning
+# t/12-contract-enum.t already applies to the error enumeration. A future
+# row that forgets `mutates => 1`, or wrongly sets `support => 1`, fails
+# THIS test rather than silently shipping without CSRF or with a widened
+# role.
+###############################################################################
+{
+	# docs/WEBUI-RPC.md S5's Mutates and role columns, as data. authenticate
+	# is excluded on purpose: S5.14 makes it pre-session, and its route
+	# (/api/login) is `anonymous`, which has no mutates/support pair to
+	# check in the first place - checked separately below instead.
+	my %SPEC = (
+		status        => { mutates => 0, support => 0 },
+		counts        => { mutates => 0, support => 0 },
+		deny          => { mutates => 1, support => 0 },
+		undeny        => { mutates => 1, support => 0 },
+		allow         => { mutates => 1, support => 0 },
+		unallow       => { mutates => 1, support => 0 },
+		tempdeny      => { mutates => 1, support => 0 },
+		temprm        => { mutates => 1, support => 0 },
+		list          => { mutates => 0, support => 1 },
+		'grep'        => { mutates => 0, support => 1 },
+		reconcile     => { mutates => 0, support => 0 },
+		reconcile_fix => { mutates => 1, support => 0 },
+		restart       => { mutates => 1, support => 0 },
+	);
+	is(scalar(keys %SPEC), 13, 'sanity: this checks all thirteen non-authenticate operations');
+
+	for my $op (sort keys %SPEC) {
+		my ($route) = grep { defined $_->{op} && $_->{op} eq $op } @ConfigServer::UI::App::ROUTES;
+		ok($route, "a route exists forwarding the '$op' operation");
+		next unless $route;
+		is(!!$route->{mutates}, !!$SPEC{$op}{mutates},
+			"'$op' route's mutates flag matches section 5's Mutates column");
+		is(!!$route->{support}, !!$SPEC{$op}{support},
+			"'$op' route's support flag matches section 5's role mapping");
+		next unless $SPEC{$op}{mutates};
+		isnt(uc($route->{method}), 'GET', "'$op' mutates and so must not be reachable by GET");
+	}
+
+	# Converse: every route that names an `op` names one of the thirteen
+	# real operations, and the only anonymous route is the one that has to
+	# be (S5.14).
+	for my $route (@ConfigServer::UI::App::ROUTES) {
+		if (defined $route->{op}) {
+			ok(exists $SPEC{ $route->{op} }, "route op '$route->{op}' is a real section 5 operation");
+		}
+		if ($route->{anonymous}) {
+			is($route->{path}, '/api/login', "the only anonymous route is /api/login, not '$route->{path}'");
+		}
+	}
+}
+
+###############################################################################
+# R27: a `handler` row gets the SAME gate as an `op` row, automatically -
+# proven by pushing a synthetic mutating handler route onto @ROUTES (scoped
+# to this block with `local`, so it cannot leak into any other test) and
+# confirming it behaves exactly like a real mutating operation would: no
+# session refuses it before the handler ever runs, a session with no CSRF
+# token also refuses it before the handler ever runs, and only a session
+# plus the correct token lets the handler's own body execute. This is
+# exactly the property Important 5 found missing in the review; if _gate()
+# is ever skipped again for handler rows, this fails before Task 7's own
+# screens would be the ones to find out.
+###############################################################################
+{
+	my ($app, undef, $sessions) = _build();
+	my $ran = 0;
+	local @ConfigServer::UI::App::ROUTES = (
+		@ConfigServer::UI::App::ROUTES,
+		{ method => 'POST', path => '/api/_test-synthetic-mutating-handler', mutates => 1,
+			handler => sub {
+				my ($self, $req, $sess, $args) = @_;
+				$ran++;
+				return (ConfigServer::UI::App::_json_response(200, { ok => \1, data => {} }),
+					$sess->{user}, $sess->{role}, undef);
+			} },
+	);
+
+	my $r = $app->dispatch({ method => 'POST', path => '/api/_test-synthetic-mutating-handler',
+		headers => {}, peer => '1.2.3.4' });
+	is($r->{status}, 401, 'a synthetic handler route with no session at all is refused before the handler runs');
+	is($ran, 0, 'and the handler body itself never ran');
+
+	my $sess = $sessions->create(user => 'zola', role => 'admin');
+	$r = $app->dispatch({ method => 'POST', path => '/api/_test-synthetic-mutating-handler',
+		headers => { cookie => "csfui_sid=$sess->{id}" }, peer => '1.2.3.4' });
+	is($r->{status}, 403, 'the same route with a session but no CSRF token is refused before the handler runs');
+	is($ran, 0, 'and the handler body still never ran');
+
+	$r = $app->dispatch({ method => 'POST', path => '/api/_test-synthetic-mutating-handler',
+		headers => { cookie => "csfui_sid=$sess->{id}", 'x-csrf-token' => $sess->{csrf} }, peer => '1.2.3.4' });
+	is($r->{status}, 200, 'with a session and the correct CSRF token, the handler finally runs');
+	is($ran, 1, 'exactly once');
+}
+
+###############################################################################
+# Minor 9 in the review: the CSRF nonce is now delivered to a client two
+# ways - in the login response body, and via /api/session on any later page
+# load that did not itself just log in. A server-rendered template has a
+# third path that needs no route at all: _gate() hands every non-anonymous
+# handler its $session directly, and $session->{csrf} is that page's copy.
+###############################################################################
+{
+	my ($app, undef, $sessions) = _build();
+
+	my $r = $app->dispatch({ method => 'GET', path => '/api/session', headers => {}, peer => '1.2.3.4' });
+	is($r->{status}, 401, '/api/session with no session at all is refused');
+
+	my $sess = $sessions->create(user => 'yara', role => 'support');
+	$r = $app->dispatch({ method => 'GET', path => '/api/session',
+		headers => { cookie => "csfui_sid=$sess->{id}" }, peer => '1.2.3.4' });
+	is($r->{status}, 200, '/api/session works for the support role too (any_role, not admin-only)');
+	my $body = eval { JSON::Tiny::decode_json($r->{body}) } || {};
+	is($body->{data}{user}, 'yara', 'and returns the username');
+	is($body->{data}{role}, 'support', 'and the role');
+	is($body->{data}{csrf}, $sess->{csrf}, "and the session's own CSRF nonce");
+}
+
+{
+	my ($app) = _build(
+		responses => { authenticate => [ { ok => 1, data => { ok => 1, role => 'admin' } } ] },
+	);
+	my $r = $app->dispatch({ method => 'POST', path => '/api/login', headers => {},
+		body => 'user=zach&pass=whatever', peer => '1.2.3.4' });
+	my $body = eval { JSON::Tiny::decode_json($r->{body}) } || {};
+	ok(defined $body->{data}{csrf} && length($body->{data}{csrf}),
+		"a successful login also returns the session's CSRF nonce in the response body, not only in the cookie");
+}
+
+###############################################################################
+# R27 side effect: /api/logout is now routed through the same shared gate,
+# so a request with no session at all is refused rather than silently
+# answered 200 - this was Minor 4 in the review ("the no-session branch is
+# the one place a state-changing-looking route answers 200 with no check at
+# all"), closed as a consequence of removing the special case rather than
+# by a change aimed at it directly.
+###############################################################################
+{
+	my ($app) = _build();
+	my $r = $app->dispatch({ method => 'POST', path => '/api/logout', headers => {}, peer => '1.2.3.4' });
+	is($r->{status}, 401, 'logout with no session at all is refused, not silently answered 200');
 }

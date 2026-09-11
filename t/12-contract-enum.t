@@ -81,7 +81,15 @@ for my $index (0 .. $#line) {
 		$section = $2;
 		next;
 	}
-	for my $token ($line =~ /(E_[A-Z_]+)/g) {
+	# \b before E_: without it this also matches the tail of an unrelated
+	# identifier that happens to end in an uppercase word after an
+	# underscore - e.g. Session.pm's $COOKIE_NAME reads as "...COOKI" + a
+	# false "E_NAME" token, because there is no non-word/word transition
+	# between the "I" and the "E" for the regex to require. \b anchors the
+	# match to a real token boundary (start of string, or after a
+	# non-word character - backtick, space, comma, parenthesis) rather
+	# than any uppercase-after-underscore substring, wherever it appears.
+	for my $token ($line =~ /(\bE_[A-Z_]+)/g) {
 		$used{$token} ||= { section => $section, line => $index + 1 };
 	}
 }

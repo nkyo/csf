@@ -36,7 +36,13 @@
 #     the way section 7's own "wall-clock deadline" language reads for the
 #     helper side. Nothing here blocks past it, and nothing here retries past
 #     it either - a slow or wedged helper gets one bounded attempt and a
-#     synthesised error, never a hang.
+#     synthesised error, never a hang. This includes connect() itself:
+#     measured, a blocking AF_UNIX connect() to a listener whose backlog is
+#     full does not return until the listener accepts - no timeout of its
+#     own - and "16 children busy, 32 queued" (section 2, section 7) is a
+#     reachable state, not a contrived one, especially with restart's 120s
+#     child deadline holding a slot. _connect() below is non-blocking and
+#     bounded by the same $deadline as everything else in this call.
 #
 # What this module returns is shaped exactly like a wire response (section
 # 3.3: id, ok, and either data or error+message), whether the response really
@@ -60,8 +66,8 @@ package ConfigServer::UI::Client;
 use strict;
 use warnings;
 
-use IO::Socket::UNIX ();
-use Socket qw(SOCK_STREAM);
+use Fcntl ();
+use Socket ();
 use Time::HiRes ();
 use ConfigServer::UI::Proto ();
 
@@ -148,20 +154,16 @@ sub call {
 	};
 	return _local_error($id, 'E_INTERNAL', 'could not encode the request') unless defined $line;
 
-	# IO::Socket::UNIX->new() performs a blocking connect(2). For AF_UNIX a
-	# connect to a socket that is already listening completes immediately -
-	# it does not wait for accept(), unlike a TCP handshake - so there is
-	# nothing here for the 10s budget to bound beyond what the syscall itself
-	# already bounds (ENOENT/ECONNREFUSED are immediate). What IS bounded
-	# below, against the same $deadline, is the write and the read that
-	# follow: a helper that accepted the connection and then stalled must not
-	# be able to hang this call past its budget.
-	my $socket = IO::Socket::UNIX->new(
-		Type => SOCK_STREAM,
-		Peer => $self->{socket_path},
-	);
+	my ($socket, $error_kind, $connect_error) = _connect($self->{socket_path}, $deadline);
 	unless ($socket) {
-		return _local_error($id, 'E_UNAVAILABLE', "cannot reach csf-ui-helper: $!");
+		# 'busy' (a non-blocking connect that never resolved before the
+		# deadline - the full-backlog case measured above) maps to the same
+		# transient/retry meaning section 3.5 gives E_BUSY. Every other
+		# connect failure (no such socket, permission denied, connection
+		# refused) is structural and maps to E_UNAVAILABLE, its existing
+		# meaning here.
+		my $code = (defined $error_kind && $error_kind eq 'busy') ? 'E_BUSY' : 'E_UNAVAILABLE';
+		return _local_error($id, $code, "cannot reach csf-ui-helper: $connect_error");
 	}
 
 	unless (_write_all($socket, $line, $deadline)) {
@@ -204,6 +206,88 @@ sub call {
 sub _local_error {
 	my ($id, $code, $message) = @_;
 	return { id => $id, ok => 0, error => $code, message => $message };
+}
+
+###############################################################################
+# _connect($path, $deadline) -> ($socket, undef, undef) | (undef, $kind, $why)
+#
+# A non-blocking connect, bounded by $deadline, with an explicit SO_ERROR
+# check once the descriptor is writable - not IO::Socket::UNIX's own
+# Timeout option. Measured directly: passing Timeout to IO::Socket::UNIX's
+# constructor returned a "connected" socket for every one of several
+# over-backlog attempts against a listener that was not accepting, so
+# whatever internal wait it performs does not reliably detect that a
+# non-blocking AF_UNIX connect has not actually completed. A writable
+# descriptor after a non-blocking connect() means only that the kernel has
+# an answer ready, not that the answer is success - SO_ERROR is what says
+# which.
+#
+# $kind distinguishes two different meanings section 3.5 already has: 'busy'
+# for a connect that never resolved before $deadline (the reachable
+# full-backlog state above, matching E_BUSY's transient/retry meaning
+# exactly), and 'unavailable' for everything else - no such socket,
+# permission denied, or an explicit connection refusal (E_UNAVAILABLE's
+# existing meaning here).
+###############################################################################
+sub _connect {
+	my ($path, $deadline) = @_;
+
+	socket(my $sock, Socket::PF_UNIX(), Socket::SOCK_STREAM(), 0)
+		or return (undef, 'unavailable', "socket: $!");
+
+	my $flags = fcntl($sock, Fcntl::F_GETFL(), 0);
+	unless (defined $flags) {
+		close $sock;
+		return (undef, 'unavailable', "fcntl: $!");
+	}
+	unless (fcntl($sock, Fcntl::F_SETFL(), $flags | Fcntl::O_NONBLOCK())) {
+		close $sock;
+		return (undef, 'unavailable', "fcntl: $!");
+	}
+
+	my $sockaddr = eval { Socket::pack_sockaddr_un($path) };
+	unless (defined $sockaddr) {
+		close $sock;
+		return (undef, 'unavailable', 'the socket path is not valid for AF_UNIX');
+	}
+
+	unless (connect($sock, $sockaddr)) {
+		unless ($!{EINPROGRESS} || $!{EWOULDBLOCK}) {
+			close $sock;
+			return (undef, 'unavailable', "connect: $!");
+		}
+
+		my $left = $deadline - Time::HiRes::time();
+		if ($left <= 0) {
+			close $sock;
+			return (undef, 'busy', 'connect did not complete within the timeout');
+		}
+		my $win = '';
+		vec($win, fileno($sock), 1) = 1;
+		my $wout = $win;
+		my $ready = select(undef, $wout, undef, $left);
+		unless ($ready) {
+			close $sock;
+			return (undef, 'busy', 'connect did not complete within the timeout');
+		}
+
+		my $err = getsockopt($sock, Socket::SOL_SOCKET(), Socket::SO_ERROR());
+		if (defined $err) {
+			my $errno = unpack('i', $err);
+			if ($errno != 0) {
+				close $sock;
+				local $! = $errno;
+				return (undef, 'unavailable', "connect: $!");
+			}
+		}
+	}
+
+	# Back to blocking mode: _write_all() below and Proto::read_message()
+	# each implement their own select()-based deadline and expect a
+	# blocking descriptor once connected, the same as every other socket
+	# operation in this tier.
+	fcntl($sock, Fcntl::F_SETFL(), $flags);
+	return ($sock, undef, undef);
 }
 
 # Bounded by $deadline, never by a blocking write with no ceiling. Mirrors

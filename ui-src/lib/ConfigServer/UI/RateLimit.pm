@@ -62,6 +62,18 @@ our $DEFAULT_WINDOW     = 900;  # 15 minutes
 our $DEFAULT_ADDR_LIMIT = 5;    # failed logins per address per window
 our $DEFAULT_USER_LIMIT = 10;   # failed logins per username per window
 
+# §7: "A limit that cannot be counted is not a limit." That rule is about
+# the helper's own counters, but the reasoning is not specific to the
+# helper - it is what stops any counter in this design from silently
+# becoming decorative. Bounding the number of distinct keys is the other
+# half of the same rule applied here: an unbounded file is a counter this
+# module could eventually fail to maintain (ENOSPC), and the fix for a
+# counter that cannot be maintained is never to let it grow without limit
+# in the first place. 4096 is generous headroom over any real deployment's
+# concurrently-failing population within one 15-minute window while still
+# bounding the cost of every read-decode-reencode-rename cycle.
+our $DEFAULT_MAX_KEYS = 4096;
+
 sub new {
 	my ($class, %opt) = @_;
 	return bless {
@@ -69,6 +81,7 @@ sub new {
 		window     => defined $opt{window}     ? $opt{window}     : $DEFAULT_WINDOW,
 		addr_limit => defined $opt{addr_limit} ? $opt{addr_limit} : $DEFAULT_ADDR_LIMIT,
 		user_limit => defined $opt{user_limit} ? $opt{user_limit} : $DEFAULT_USER_LIMIT,
+		max_keys   => defined $opt{max_keys}   ? $opt{max_keys}   : $DEFAULT_MAX_KEYS,
 		now        => $opt{now} || sub { time() },
 	}, $class;
 }
@@ -100,31 +113,50 @@ sub _lock_state {
 	return undef;
 }
 
+# Returns ($struct, 1) on a genuinely empty file (no state yet - a normal,
+# common condition, not a failure) or a well-formed JSON object; returns
+# (undef, 0) for anything else - unparseable JSON, or JSON that parsed to
+# something other than an object. §7: a state file this module cannot make
+# sense of is a counter that cannot be counted, and the only fail-closed
+# reading is to say so, not to treat "I could not read this" the same as
+# "there is nothing here yet". Reading corrupt content as {} is precisely
+# what let a failed write "reset" a counter to zero one layer up, at the
+# helper, in Task 2 (see the header comment above, and CHANGES.md) - the
+# same failure mode, arriving here by a different door.
 sub _read_state {
 	my ($fh) = @_;
 	seek($fh, 0, 0);
 	local $/;
 	my $data = <$fh>;
-	return {} unless defined $data && length $data;
+	return ({}, 1) unless defined $data && length $data;
 	my $struct = eval { JSON::Tiny::decode_json($data) };
-	return (ref($struct) eq 'HASH') ? $struct : {};
+	return (ref($struct) eq 'HASH') ? ($struct, 1) : (undef, 0);
 }
 
+# Returns 1 only once the new content is confirmed written and in place.
+# print() and close() are both checked - print() can report a failed write
+# outright, and a short write that print() does not catch (buffered I/O can
+# defer the error) is what close()'s own return value exists to surface, by
+# flushing and reporting the flush's outcome. Checking only one of the two,
+# which is the gap this replaces, lets a partially-written temp file reach
+# rename() and land on top of the last known-good state - the ENOSPC path
+# that turns a write failure into silent data loss rather than a refusal.
 sub _write_state {
 	my ($path, $struct) = @_;
 	my $temp = "$path.tmp.$$";
 	sysopen(my $fh, $temp, O_WRONLY | O_CREAT | O_TRUNC, 0600) or return 0;
 	my $json = eval { JSON::Tiny::encode_json($struct) };
 	unless (defined $json) { close $fh; unlink $temp; return 0 }
-	print { $fh } $json;
-	close $fh;
+	unless (print { $fh } $json) { close $fh; unlink $temp; return 0 }
+	unless (close $fh) { unlink $temp; return 0 }
 	unless (rename($temp, $path)) { unlink $temp; return 0 }
 	return 1;
 }
 
-# Returns undef when the state could not be opened, locked or (if the caller
-# marked it dirty) rewritten. Every caller below treats undef as "the count
-# cannot be trusted", never as "carry on unmetered" (G3).
+# Returns undef when the state could not be opened, locked, read as a valid
+# object, or (if the caller marked it dirty) rewritten. Every caller below
+# treats undef as "the count cannot be trusted", never as "carry on
+# unmetered" (G3, §7).
 sub _with_state {
 	my ($self, $kind, $code) = @_;
 	unless (-d $self->{dir}) {
@@ -133,7 +165,11 @@ sub _with_state {
 	my $path = $self->_path($kind);
 	my $fh = _lock_state($path);
 	return undef unless $fh;
-	my $struct = _read_state($fh);
+	my ($struct, $readable) = _read_state($fh);
+	unless ($readable) {
+		close $fh;
+		return undef;
+	}
 	my ($result, $dirty) = $code->($struct);
 	if ($dirty && !_write_state($path, $struct)) {
 		close $fh;
@@ -154,6 +190,30 @@ sub _prune_and_count {
 	my $total = 0;
 	$total += $bucket->{$_} for keys %$bucket;
 	return $total;
+}
+
+# Prunes every key's bucket IN PLACE, not just the one being touched, and
+# drops any key whose bucket is empty afterwards. Without this, a key that
+# is written once and never again (one failed login from an address never
+# seen again) sits in the file forever, because nothing but a write to THAT
+# SPECIFIC key would ever prune it - and every login attempt reads, decodes,
+# re-encodes and renames the WHOLE file under an exclusive lock, so the cost
+# of every login rises with the number of distinct addresses or usernames
+# that have EVER failed one. An attacker with a large address range can grow
+# this file without bound purely by trying, and failing, from a different
+# address each time - which is the disk-exhaustion route into the ENOSPC
+# failure §7 and the two functions above exist to answer safely rather than
+# the route to prevent outright. Called on every write, so the file is
+# always bounded by active keys, never by history.
+sub _prune_all {
+	my ($state, $now, $window) = @_;
+	for my $key (keys %$state) {
+		my $bucket = $state->{$key};
+		next unless ref($bucket) eq 'HASH';
+		_prune_and_count($bucket, $now, $window);
+		delete $state->{$key} unless %$bucket;
+	}
+	return;
 }
 
 ###############################################################################
@@ -216,8 +276,19 @@ sub record_failure {
 	if (defined $addr && length $addr) {
 		$self->_with_state('addr', sub {
 			my ($state) = @_;
+			_prune_all($state, $now, $self->{window});
+			my $is_new = !exists $state->{$addr};
+			# §7's "cap the number of keys" reading applied here: at
+			# capacity, a brand-new key is not admitted rather than
+			# evicting one that is actively being tracked - the file's
+			# size stays bounded, and the keys already in it (which may
+			# include the very address or username an operator is
+			# investigating) are never displaced to make room for a new
+			# one. Reaching this branch at all needs $max_keys distinct
+			# addresses or usernames failing inside one window, which is
+			# already an extreme population for this counter to hold.
+			return (1, 0) if $is_new && scalar(keys %$state) >= $self->{max_keys};
 			my $bucket = $state->{$addr} || {};
-			_prune_and_count($bucket, $now, $self->{window});
 			$bucket->{$now}++;
 			$state->{$addr} = $bucket;
 			return (1, 1);
@@ -226,8 +297,10 @@ sub record_failure {
 	if (defined $user && length $user) {
 		$self->_with_state('user', sub {
 			my ($state) = @_;
+			_prune_all($state, $now, $self->{window});
+			my $is_new = !exists $state->{$user};
+			return (1, 0) if $is_new && scalar(keys %$state) >= $self->{max_keys};
 			my $bucket = $state->{$user} || {};
-			_prune_and_count($bucket, $now, $self->{window});
 			$bucket->{$now}++;
 			$state->{$user} = $bucket;
 			return (1, 1);

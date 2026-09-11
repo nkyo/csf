@@ -37,6 +37,130 @@ line is added below the original notice; the original stays intact.
 
 ### Unreleased
 
+#### Task 4 fix round 1 — a rate limiter that stopped enforcing for the third time, connect() outside its own timeout, and a route table with no floor
+
+- **2026-09-11** — Fixed `RateLimit.pm` failing OPEN under exactly the
+  failure mode `docs/WEBUI-RPC.md` §7 exists to name — *"a limit that cannot
+  be counted is not a limit"* — and that this project has now shipped twice
+  before: once in the helper's own rate limiter (Task 2), and now here,
+  arriving by a different door. `_write_state()` did not check `print`'s or
+  `close`'s return value, so a short write under `ENOSPC` still reached
+  `rename()` and landed a truncated file on top of good state; `_read_state()`
+  then read anything it could not parse as `{}` — indistinguishable from "no
+  failures yet". Chained together: fill the disk, then guess a password
+  freely. Both are fixed at the source — a write is never renamed into place
+  unless every byte of it is confirmed written, and unparseable content is
+  now `undef` (fail closed) rather than `{}` (fail open) — and cited to §7 in
+  the code so the next state-file module in this tree does not have to
+  re-derive the lesson a third time.
+
+  Also fixed in the same module: `record_failure()` pruned only the bucket
+  it was touching, so a key that failed once and was never seen again sat in
+  the file forever — the remote-triggerable route to the `ENOSPC` above, from
+  an unauthenticated caller with a large address range. Every write now
+  prunes every key, and a new `max_keys` cap (default 4096) refuses to admit
+  a brand-new key once the table is full, rather than growing without limit.
+  (`ui-src/lib/ConfigServer/UI/RateLimit.pm`; `t/31-ratelimit.t` — a corrupt
+  state file, a genuinely short write staged with the same FIFO technique
+  `t/11-helper-validate.t` uses for the helper's audit log, unbounded growth,
+  and the key cap, each verified by reverting the fix and watching the
+  specific test fail)
+
+- **2026-09-11** — Fixed `Client.pm`'s 10-second budget not covering
+  `connect()`. Measured: a blocking `AF_UNIX` `connect()` to a listener whose
+  backlog is full does not return until the listener accepts, with no
+  timeout of its own — and "16 children busy, 32 queued" (`csf-ui-helper`'s
+  own limits) is a reachable state, not a contrived one. `IO::Socket::UNIX`'s
+  `Timeout` constructor option does not reliably detect this for `AF_UNIX`
+  either — measured returning a "connected" socket for every attempt against
+  a saturated listener. `Client.pm` now performs its own non-blocking
+  `connect()`, waits on the same deadline as everything else in the call, and
+  reads `SO_ERROR` once the descriptor is writable, rather than trusting that
+  writability alone means success. (`ui-src/lib/ConfigServer/UI/Client.pm`;
+  `t/32-client.t` — reproduced directly against a saturated listener, and
+  confirmed by reverting to the old blocking connect and watching the test
+  hang until an external timeout killed it)
+
+- **2026-09-11** — Fixed `csf-ui`'s `@ROUTES` extension shape defaulting to
+  *unenforced*: a `handler` row ran with no session check, no role check and
+  no CSRF check unless it re-implemented all three itself, which is exactly
+  backwards for an interface Task 7 is about to build five screens on top
+  of. Every route — `op` or `handler` alike — now runs through one shared
+  gate (`_gate()`) before anything route-specific executes; the only way to
+  skip it is the explicit, visible `anonymous => 1` that `/api/login` alone
+  carries, matching `docs/WEBUI-RPC.md` §5.14's "pre-session" reading. A new
+  `t/33-app.t` test pushes a synthetic mutating `handler` route and confirms
+  it is refused with no session, refused with no CSRF token, and only then
+  reaches its own body — the same route shape Task 7 will actually use.
+
+  A second, mechanical test now binds `@ROUTES` itself to `docs/WEBUI-RPC.md`
+  §5's Mutates and role columns — for each of the thirteen non-authenticate
+  operations, that a route exists, that its `mutates` flag matches the
+  contract, that `support` is set on `list` and `grep` and nowhere else, and
+  that no mutating operation is reachable by `GET` — the same reasoning
+  `t/12-contract-enum.t` already applies to the error enumeration, so a
+  future row that forgets `mutates => 1` fails a test instead of shipping
+  silently.
+
+  `/api/logout` moved onto the same shared gate as a consequence rather than
+  as a separate fix, which also closed a smaller gap noted in review: logout
+  with no session at all used to answer `200` with no check performed; it now
+  requires a session like anything else on this gate (a new `any_role => 1`
+  flag, since either role may end its own session).
+
+  Also added: the CSRF nonce this tier mints was previously delivered
+  nowhere a client could read it back, leaving the `X-CSRF-Token` header path
+  this tier already accepted with no way to ever be populated. A successful
+  login's response now includes it, and a new `GET /api/session` route (no
+  RPC call, the same standing as `/api/logout`) returns it for any later page
+  load that did not itself just log in. A server-rendered template has a
+  third path needing no route at all: `_gate()` hands every non-anonymous
+  `handler` the session object directly, and `$session->{csrf}` is that
+  page's copy — documented in `@ROUTES`'s own header comment, so Task 6/7 do
+  not have to rediscover it by reading `_gate()`'s source.
+  (`ui-src/bin/csf-ui`; `t/33-app.t`)
+
+- **2026-09-11** — Fixed `csf-ui` silently degrading protection when the
+  request structure's `peer` field was missing or empty — `RateLimit.pm`
+  treats an unkeyed address as "not blocked" by design (it must never refuse
+  to persist a failure just because it was handed nothing to key on), so a
+  request with no `peer` got username-only protection with nothing anywhere
+  saying so, and the access log recorded who asked as an empty string.
+  `csf-ui` now refuses any request with a missing or empty `peer` outright,
+  before routing or session lookup runs. A second, related gap — no size
+  limit was ever stated for the request body — is closed the same way: a
+  body over 65536 bytes (the same figure as the wire line cap, for
+  consistency rather than derivation) is refused before any parsing is
+  attempted, as a backstop behind whatever limit Task 5 imposes earlier.
+  (`ui-src/bin/csf-ui`; `t/33-app.t`)
+
+- **2026-09-11** — Added `docs/WEBUI-RPC.md` §14: the normalised request and
+  response structure between `csf-ui` and Task 5, written into the frozen
+  contract rather than left living only in `csf-ui`'s own header comment and
+  a task report — the same reasoning an earlier amendment in §11.9 already
+  used for two interpretations a review found living in one task's report
+  instead of the document every task reads. Closes three gaps a review found
+  the shape "implementable but not guess-free" over: `peer` is now mandatory
+  and explicitly required to be per-connecting-client, never a constant, and
+  never taken from a client-supplied header; a body over 65536 bytes is
+  refused (§14.1, enforced in the same commit); and the byte-versus-character
+  question after URL-decoding is answered directly, from measurement rather
+  than assumption — `JSON::Tiny` decodes a JSON body's string values into
+  proper UTF-8-flagged Perl characters, while this tier's own form-body
+  decoder produces raw, unflagged UTF-8 bytes for the identical logical
+  input, and both are correct: `Proto::as_chars()` already normalises either
+  shape, and §14.2 tells Task 5's query-string decoder to produce the same
+  raw-byte shape `_url_decode()` does, so the three paths (JSON body, form
+  body, query string) cannot disagree about what a value means.
+
+  Found and fixed in the same pass: `t/12-contract-enum.t`'s token scan
+  matched `E_NAME` inside the unrelated identifier `COOKIE_NAME`, because
+  nothing required a word boundary before `E_` — a false positive that
+  would have fired on any future document mention of that constant, not only
+  this one. The scan now requires `\bE_`, which excludes a match with no
+  non-word character before it while changing nothing about which real `E_*`
+  tokens it finds. (`docs/WEBUI-RPC.md`, `t/12-contract-enum.t`)
+
 #### Replacing the WebUI — the privilege boundary, written down before any code
 
 - **2026-09-11** — Added `docs/WEBUI-RPC.md`: the threat model and the frozen RPC

@@ -32,10 +32,21 @@ use lib "$FindBin::Bin/..", "$FindBin::Bin/../ui-src/lib";
 
 use File::Temp qw(tempdir);
 use Fcntl qw(:DEFAULT);
-use Test::More tests => 42;
+use JSON::Tiny ();
+use POSIX ();
+use Test::More tests => 54;
 
 require_ok('ConfigServer::UI::RateLimit');
 my $R = 'ConfigServer::UI::RateLimit';
+
+sub _decode_state_file {
+	my ($path) = @_;
+	open(my $fh, '<', $path) or return undef;
+	local $/;
+	my $raw = <$fh>;
+	close $fh;
+	return eval { JSON::Tiny::decode_json($raw) };
+}
 
 ###############################################################################
 # Opens and closes: the address bucket
@@ -172,6 +183,194 @@ my $R = 'ConfigServer::UI::RateLimit';
 			'access restored: the limiter goes back to reporting the true, uncorrupted count');
 	}
 	chmod(0700, $dir);
+}
+
+###############################################################################
+# R26: a corrupt or unparseable state file fails closed, and does not read
+# as "zero failures recorded". This is the read-side half of the chain the
+# review found - a state file that cannot be MADE SENSE of is exactly as
+# unusable as one that cannot be opened, and treating it as {} is what let
+# a write gone wrong elsewhere look identical to "nothing has ever failed
+# here", which is a silent, unauthenticated bypass: fill the disk, then
+# guess freely.
+###############################################################################
+{
+	my $dir = tempdir(CLEANUP => 1);
+	my $rl = $R->new(dir => $dir, addr_limit => 5, now => sub { 1000 });
+
+	# A real prior failure first, so a "corrupt -> {}" regression is visible
+	# as history actually being lost, not merely as an empty file behaving
+	# like an empty file.
+	$rl->record_failure('203.0.113.9', undef) for 1 .. 3;
+
+	open(my $fh, '>', "$dir/addr.state") or die "cannot write $dir/addr.state: $!";
+	print { $fh } "{ this is not valid json, on purpose }}}";
+	close $fh;
+
+	is($rl->blocked_addr('203.0.113.9'), 1,
+		'a corrupt state file is treated as unavailable, not as zero recorded failures');
+	is($rl->blocked_addr('an-address-never-seen-before'), 1,
+		'a corrupt state file blocks every address, not only the one with real history');
+}
+
+{
+	my $dir = tempdir(CLEANUP => 1);
+	my $rl = $R->new(dir => $dir, now => sub { 1000 });
+
+	# Valid JSON that is not an object (an array, here) is exactly as
+	# unusable as unparseable JSON, and must be refused the same way -
+	# ref($struct) eq 'HASH' is the actual gate, not "did decode_json die".
+	open(my $fh, '>', "$dir/user.state") or die "cannot write $dir/user.state: $!";
+	print { $fh } '["not", "an", "object"]';
+	close $fh;
+
+	is($rl->blocked_user('trudy'), 1, 'valid JSON that decodes to a non-object also fails closed');
+}
+
+###############################################################################
+# R26: a real short write - not a property assertion. Mirrors the technique
+# csf-ui-helper's own t/11-helper-validate.t uses for the identical claim
+# about its audit log: stage the write's target as a FIFO with a shrunk
+# pipe buffer and a reader that attaches, signals ready, and then goes away
+# before draining it, so the write cannot complete and must fail rather
+# than silently succeed with a truncated temp file that then gets renamed
+# over good state.
+#
+# _write_state() writes to "$path.tmp.$$" before renaming it into place;
+# since RateLimit's methods run in-process rather than forking, $$ is this
+# test's own pid, so that exact path can be pre-staged.
+###############################################################################
+SKIP: {
+	skip 'needs mkfifo and F_SETPIPE_SZ, which is Linux-specific', 3
+		unless eval { POSIX::mkfifo("$FindBin::Bin/../.mkfifo-probe-$$", 0600) };
+	unlink "$FindBin::Bin/../.mkfifo-probe-$$";
+
+	my $dir = tempdir(CLEANUP => 1);
+	my $rl = $R->new(dir => $dir, addr_limit => 5, now => sub { 1000 });
+
+	# Real prior state, to prove afterwards that it survived untouched.
+	$rl->record_failure('203.0.113.77', undef);
+
+	# Bulk the state past a shrunk 4 KiB pipe buffer using only the public
+	# interface, so the write under test is actually large enough to be
+	# forced short rather than fitting in one kernel-buffered chunk.
+	$rl->record_failure("198.51.100.$_", undef) for 1 .. 300;
+
+	my $temp_path = "$dir/addr.state.tmp.$$";
+	unlink $temp_path;
+	POSIX::mkfifo($temp_path, 0600) or skip 'could not create the fifo', 3;
+
+	pipe(my $ready_read, my $ready_write) or skip 'could not create the sync pipe', 3;
+	my $pid = fork();
+	skip 'could not fork the reader', 3 unless defined $pid;
+	unless ($pid) {
+		close $ready_read;
+		# O_NONBLOCK so the reader attaches without waiting for the writer,
+		# and the buffer is shrunk while it is still empty - F_SETPIPE_SZ
+		# refuses to shrink below what is already buffered.
+		sysopen(my $reader, $temp_path, Fcntl::O_RDONLY() | Fcntl::O_NONBLOCK())
+			or POSIX::_exit(1);
+		my $sized = fcntl($reader, 1031, 4096) ? 'y' : 'n'; # F_SETPIPE_SZ
+		syswrite($ready_write, "$sized\n");
+		close $ready_write;
+		# Never reads a byte - the point is a reader that goes away with
+		# the buffer still full, not one that drains it.
+		select(undef, undef, undef, 0.3);
+		close $reader;
+		POSIX::_exit(0);
+	}
+	close $ready_write;
+	my $sized = <$ready_read>;
+	close $ready_read;
+	chomp($sized = defined $sized ? $sized : 'n');
+
+	my $completed = eval {
+		local $SIG{PIPE} = 'IGNORE';
+		local $SIG{ALRM} = sub { die "the write did not return\n" };
+		alarm(15);
+		$rl->record_failure('203.0.113.99', undef); # this write is forced short
+		alarm(0);
+		1;
+	};
+	waitpid($pid, 0);
+	unlink $temp_path;
+
+	skip 'this kernel would not shrink the pipe buffer, so no short write can be staged', 4
+		unless $sized eq 'y';
+
+	ok($completed, 'a write that cannot complete returns rather than blocking forever');
+
+	# Checked as its own assertion, and gated on before reading any further:
+	# a fix that lets the FIFO itself get renamed over the real path (which
+	# is exactly what an unchecked rename() does with a source that never
+	# received real content) turns addr.state into a special file, and
+	# opening that for a read blocks forever waiting for a writer that will
+	# never come - a hang, not a failure, and a hang is worse than either.
+	# This is the concrete, non-hanging signal that catches that case.
+	my $intact = -f "$dir/addr.state";
+	ok($intact, 'the state path is still a regular file - a failed write must never replace it with something else');
+
+	SKIP: {
+		skip 'the state path was not left as a regular file; reading it further is not safe', 2
+			unless $intact;
+
+		is($rl->blocked_addr('203.0.113.77'), 0,
+			'the pre-existing state survived the failed write untouched, not corrupted and not reset');
+		is($rl->blocked_addr('203.0.113.99'), 0,
+			'the attempt that failed to persist is not counted either - it is simply as if it never happened, not as a false positive');
+	}
+}
+
+###############################################################################
+# R26: unbounded growth. A write must prune every key it is holding, not
+# only the one being incremented - otherwise a key that fails once and is
+# never touched again sits in the file forever, and every subsequent login
+# pays the cost of reading, decoding, re-encoding and renaming a file that
+# only ever grows. This is the remote-triggerable route to the ENOSPC the
+# two tests above exist to answer safely.
+###############################################################################
+{
+	my $now = 1000;
+	my $dir = tempdir(CLEANUP => 1);
+	my $rl = $R->new(dir => $dir, window => 100, now => sub { $now });
+
+	$rl->record_failure("198.51.100.$_", undef) for 1 .. 20; # 20 one-off addresses
+
+	$now += 200; # past the 100s window: all 20 above are now expired
+	$rl->record_failure('203.0.113.1', undef); # any write should prune the whole table
+
+	my $struct = _decode_state_file("$dir/addr.state");
+	is(scalar(keys %$struct), 1,
+		'a write prunes every stale key, not only the one being incremented - 20 expired addresses are gone, one fresh one remains');
+}
+
+###############################################################################
+# R26: the key cap. §7's "a limit that cannot be counted is not a limit"
+# applied to the file's own size: bounding it is what keeps the counter
+# maintainable in the first place, rather than relying only on catching the
+# failure once maintaining it has already become impossible.
+###############################################################################
+{
+	my $now = 1000;
+	my $dir = tempdir(CLEANUP => 1);
+	my $rl = $R->new(dir => $dir, window => 900, addr_limit => 5, max_keys => 5, now => sub { $now });
+
+	$rl->record_failure("198.51.100.$_", undef) for 1 .. 5; # fills the cap exactly
+	is(scalar(keys %{ _decode_state_file("$dir/addr.state") }), 5,
+		'the file holds exactly max_keys entries after filling it');
+
+	$rl->record_failure('203.0.113.200', undef); # a 6th, brand-new address
+
+	my $struct = _decode_state_file("$dir/addr.state");
+	is(scalar(keys %$struct), 5, 'a new key beyond the cap is not admitted - the file does not grow past max_keys');
+	ok(!exists $struct->{'203.0.113.200'}, 'and specifically, the address that arrived at capacity was not the one let in');
+
+	# A key already inside the cap keeps counting normally even while the
+	# table is completely full - the cap protects growth, not the keys
+	# already being watched.
+	$rl->record_failure('198.51.100.1', undef) for 1 .. 4; # 1 earlier + 4 now = 5
+	is($rl->blocked_addr('198.51.100.1'), 1,
+		'an existing key still reaches its own cap normally while the table is at max_keys');
 }
 
 ###############################################################################
