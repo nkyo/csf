@@ -15,7 +15,9 @@ last task.
 
 ## Global Constraints
 
-**G1 — no new runtime dependencies.** Perl 5.10-compatible. Core modules only,
+**G1 — no new runtime dependencies.** Perl 5.14-compatible (raised from 5.10 by
+Ruling R14: `Socket::inet_pton` and `SO_PEERCRED` need Socket >= 1.94, which ships
+with 5.14). Core modules only,
 plus what CSF already vendors under `/usr/local/csf/lib` (`JSON::Tiny` is
 vendored and is the wire format). `IO::Socket::SSL` is optional and must fail
 closed when absent — never downgrade to plain HTTP. Verified available on the
@@ -44,18 +46,30 @@ date, per GPLv3 §5(a). Never rewrite prior entries.
 
 **G7 — installed paths.**
 
+> **Ruling R11.** Nothing belonging to the UI lives under `/etc/csf`,
+> `/var/lib/csf` or `/usr/local/csf`. `lfd.pl:1187-1196` sits inside the `while (1)`
+> at `lfd.pl:1173` and resets all three to `0600` on every main-loop pass, logging
+> each reset — an unprivileged process can never traverse them, and permissions we
+> set are undone within seconds. `/usr/local/csf` being on that list also means
+> systemd could not exec a binary there as `csfui`, since exec happens after
+> credentials are dropped.
+
 | Thing | Path |
 |---|---|
-| helper (root) | `/usr/local/csf/bin/csf-ui-helper` |
-| web app (user `csfui`) | `/usr/local/csf/bin/csf-ui` |
-| modules | `/usr/local/csf/lib/ConfigServer/UI/*.pm` |
+| helper (root) | `/usr/local/csf-ui/bin/csf-ui-helper` |
+| web app (user `csfui`) | `/usr/local/csf-ui/bin/csf-ui` |
+| password CLI | `/usr/local/csf-ui/bin/csf-ui-passwd` |
+| setup wizard | `/usr/local/csf-ui/bin/csf-ui-setup` |
+| modules | `/usr/local/csf-ui/lib/ConfigServer/UI/*.pm` |
 | helper socket | `/var/run/csf-ui/helper.sock` (0660 `root:csfui`) |
-| users file | `/etc/csf/ui/users` (0600 root) |
-| UI config | `/etc/csf/ui/ui.conf` (0640 `root:csfui`) |
-| audit log | `/var/log/csf-ui-audit.log` (0640 root) |
+| users file | `/etc/csf-ui/users` (0600 root — the helper reads it, the web tier never does) |
+| UI config | `/etc/csf-ui/ui.conf` (dir 0750 `root:csfui`, file 0640 `root:csfui`) |
+| runtime state | `/var/lib/csf-ui/` — `sessions/`, `rl/`, `helper/authfail.state` |
+| audit log (root) | `/var/log/csf-ui-audit.log` (0640 root) |
+| access log (web) | `/var/log/csf-ui-access.log` (0640 `csfui`) |
 
 In-repo sources live at `ui-src/` (`ui-src/csf-ui`, `ui-src/csf-ui-helper`,
-`ui-src/ConfigServer/UI/*.pm`, `ui-src/web/*`). Installers copy from there.
+`ui-src/lib/ConfigServer/UI/*.pm`, `ui-src/web/*`). Installers copy from there.
 
 **G8 — the helper never trusts the web tier for identity.** It authenticates its
 peer with `SO_PEERCRED` and serves only the frozen allowlist; it does not accept a
@@ -90,7 +104,11 @@ Write, in this order:
    `status` · `counts` · `deny(ip,note)` · `undeny(ip)` · `allow(ip,note)` ·
    `unallow(ip)` · `tempdeny(ip,ttl,ports)` · `temprm(ip)` ·
    `list(which,offset,limit,filter)` · `grep(ip)` · `reconcile` ·
-   `reconcile_fix(ids)` · `restart`
+   `reconcile_fix(ids)` · `restart` · `authenticate(user,pass)`
+
+   Ruling R6 added `authenticate`: password hashes stay root-only and the web tier
+   never reads them. The helper keeps its own per-user failure counter, independent
+   of the web tier's rate limiter.
 
    All 13 are served on the single helper socket. Do not design a second
    read-only socket: with one web process it separates nothing (see G8).
@@ -126,7 +144,7 @@ depends on the caller", the boundary is wrong — fix the design, not the prose.
 
 ## Task 2: `csf-ui-helper` — the privileged half
 
-**Files:** `ui-src/csf-ui-helper`, `ui-src/ConfigServer/UI/Proto.pm`, `t/10-proto.t`,
+**Files:** `ui-src/csf-ui-helper`, `ui-src/lib/ConfigServer/UI/Proto.pm`, `t/10-proto.t`,
 `t/11-helper-validate.t`
 
 Implement the contract frozen in Task 1.
@@ -174,12 +192,20 @@ provider, so no root and no real socket are needed.
 
 ## Task 3: authentication store
 
-**Files:** `ui-src/ConfigServer/UI/Auth.pm`, `ui-src/csf-ui-passwd`, `t/20-auth.t`
+**Files:** `ui-src/lib/ConfigServer/UI/Auth.pm`, `ui-src/csf-ui-passwd`, `t/20-auth.t`
+
+> **Ruling R6 — read this before writing a line.** `Auth.pm` runs **inside the root
+> helper**, not in the web tier. `csf-ui` never opens the users file; it calls the
+> `authenticate` operation. Writing this module on the assumption that the web tier
+> loads it would silently undo the boundary R6 exists to create.
 
 - Password hashing: `crypt()` with a `$6$` SHA-512 salt, 16 random salt bytes
   from `/dev/urandom`, rounds from `ui.conf` (`UI_CRYPT_ROUNDS`, default 100000,
-  minimum 5000). If `Crypt::Argon2` loads, use Argon2id instead and record the
-  algorithm in the stored record. Never store plaintext.
+  minimum 5000). **Ruling R13: `$6$` SHA-512 is the only implemented algorithm.**
+  `Crypt::Argon2` is neither core nor vendored, so G1 forbids it, and a branch that
+  cannot run implies a strength the deployment does not have. Keep the `algo` field
+  in the record format so a future migration is possible; reject any record whose
+  `algo` is not `6`. Never store plaintext.
 - Record format, one user per line:
   `username:algo:hash:role:created_epoch` — `role` is `admin` or `support`.
   Username `[a-z0-9_-]{1,32}`. Reject anything else on write.
@@ -203,19 +229,19 @@ role values validated.
 
 ## Task 4: `csf-ui` core
 
-**Files:** `ui-src/ConfigServer/UI/Session.pm`, `ui-src/ConfigServer/UI/Client.pm`,
-`ui-src/ConfigServer/UI/RateLimit.pm`, `ui-src/csf-ui`, `t/30-session.t`,
+**Files:** `ui-src/lib/ConfigServer/UI/Session.pm`, `ui-src/lib/ConfigServer/UI/Client.pm`,
+`ui-src/lib/ConfigServer/UI/RateLimit.pm`, `ui-src/csf-ui`, `t/30-session.t`,
 `t/31-ratelimit.t`, `t/32-client.t`
 
 - **`Client.pm`** — connects to the helper socket, sends a request, reads one
   response, enforces a 10-second timeout, and never retries a mutating op.
 - **`Session.pm`** — 32 bytes from `/dev/urandom`, base64url. Stored server-side
-  in `/var/lib/csf/ui/sessions/<id>` mode 0600 with the username, role, CSRF
+  in `/var/lib/csf-ui/sessions/<id>` mode 0600 with the username, role, CSRF
   nonce, creation and last-use epochs. Idle timeout 1800s, absolute 43200s.
   Cookie attributes `HttpOnly; Secure; SameSite=Strict; Path=/`.
   `csrf_ok($session,$submitted)` compares in constant time.
 - **`RateLimit.pm`** — token bucket per source address AND per username, state
-  under `/var/lib/csf/ui/rl/`. Defaults: 5 failed logins per 15 min per address,
+  under `/var/lib/csf-ui/rl/`. Defaults: 5 failed logins per 15 min per address,
   10 per 15 min per username. **Never writes to `csf.deny`** — a login failure
   must not be able to add a firewall entry (spec §7).
 - **`csf-ui`** — the request handler. Given a normalised request (method, path,
@@ -232,7 +258,7 @@ returns 405 for unknown method, 404 for unknown path, 403 without CSRF.
 
 ## Task 5: minimal HTTP and TLS core (Mode B)
 
-**Files:** `ui-src/ConfigServer/UI/HTTP.pm`, `ui-src/ConfigServer/UI/Server.pm`,
+**Files:** `ui-src/lib/ConfigServer/UI/HTTP.pm`, `ui-src/lib/ConfigServer/UI/Server.pm`,
 `t/40-http-parse.t`, `t/41-http-hostile.t`
 
 `HTTP.pm` parses a request from a filehandle into the normalised structure Task 4
@@ -268,7 +294,7 @@ length before reading it.
 ## Task 6: templates, CSS, accessibility
 
 **Files:** `ui-src/web/layout.html`, `ui-src/web/app.css`,
-`ui-src/ConfigServer/UI/Render.pm`, `t/50-render.t`
+`ui-src/lib/ConfigServer/UI/Render.pm`, `t/50-render.t`
 
 - `Render.pm`: substitutes `{{key}}` in a template. **HTML-escapes by default**;
   a raw insert requires an explicitly different marker so that forgetting is safe
@@ -306,8 +332,8 @@ every mutating route with 403; CSRF missing or wrong → 403; pagination bounds.
 
 ## Task 8: setup wizard
 
-**Files:** `ui-src/csf-ui-setup`, `ui-src/ConfigServer/UI/Firewall.pm`,
-`ui-src/ConfigServer/UI/Rollback.pm`, `t/70-firewall-detect.t`, `t/71-rollback.t`
+**Files:** `ui-src/csf-ui-setup`, `ui-src/lib/ConfigServer/UI/Firewall.pm`,
+`ui-src/lib/ConfigServer/UI/Rollback.pm`, `t/70-firewall-detect.t`, `t/71-rollback.t`
 
 - `Firewall.pm` — detect the backend actually in use: `iptables-legacy`,
   `iptables-nft`, `nftables`, `firewalld`, `ufw`, or **unknown**. Detection is by
@@ -346,7 +372,7 @@ removed; answers file round-trips through the CLI path.
 - systemd units: `csf-ui` runs as `csfui` with `NoNewPrivileges=yes`,
   `ProtectSystem=strict`, `ProtectHome=yes`, `PrivateTmp=yes`,
   `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6`,
-  `CapabilityBoundingSet=` (empty), `ReadWritePaths=/var/lib/csf/ui`.
+  `CapabilityBoundingSet=` (empty), `ReadWritePaths=/var/lib/csf-ui`.
   `csf-ui-helper` runs as root with the narrowest set that still works.
 - Installer: create the `csfui` system account (no login shell, no home); detect
   nginx/Apache/LiteSpeed; offer Mode A (default when found) or Mode B; write
