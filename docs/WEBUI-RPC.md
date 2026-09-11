@@ -331,15 +331,22 @@ Closed enumeration. New codes are an amendment to this document.
 | `E_UNKNOWN_OP` | `op` is not one of the 14 | closed | 500 (a client bug) |
 | `E_ARG` | an argument is missing, the wrong JSON type, unknown, or fails its grammar in §4 | closed | 400, with the field name |
 | `E_PEER` | `SO_PEERCRED` check failed | closed | — (the web tier never sees this; it means something else connected) |
-| `E_UNAVAILABLE` | a structural precondition is unmet and no request can succeed until someone fixes it: the `csfui` group does not exist (§2.1), `LF_IPSET` is on and `reconcile` cannot be computed (§5.11), the password store is missing, unusable or empty so `authenticate` cannot answer, or the user's record carries an `algo` this helper cannot verify (both §5.14 — and that last one leaves the failure counter untouched). **Not** used for `csf` being disabled — that is a state the operator chose, and it is `E_REFUSED` | closed | 503 + the remedy |
+| `E_UNAVAILABLE` | a structural precondition is unmet and no request can succeed until someone fixes it: the `csfui` group does not exist (§2.1), `LF_IPSET` is on and `reconcile` cannot be computed (§5.11), the password store is missing, unusable or empty so `authenticate` cannot answer, the user's record carries an `algo` this helper cannot verify (both §5.14 — and that last one leaves the failure counter untouched), **or one of the helper's own counters cannot be opened, locked or rewritten, so the limit it enforces has stopped applying** (§7, §5.14 — the mutation cap, the `authenticate` caps, the restart interval and the per-username lockout all answer this way rather than proceeding uncounted). **Not** used for `csf` being disabled — that is a state the operator chose, and it is `E_REFUSED`, and not used for being over a cap that *is* being counted, which is `E_BUSY` | closed | 503 + the remedy |
 | `E_BUSY` | transient: concurrency cap, `csf` lock held, mutation-rate cap, restart interval (§7) | closed | 503 + `Retry-After` |
 | `E_REFUSED` | the request was well-formed and the system refused it: the address is one of this server's own, is in `csf.allow`/`csf.ignore`, is marked "do not delete", or `csf` has an unresolved start error | closed | 409, showing `message` |
-| `E_BACKEND` | `csf` or `iptables` failed, timed out, was killed, or left the state inconclusive | closed | 502 |
+| `E_BACKEND` | `csf` or `iptables` failed, timed out, was killed, or left the state inconclusive; or the password verifier failed or exceeded its deadline (§7 — the failure counter is untouched, §5.14) | closed | 502 |
 | `E_STALE` | a `reconcile_fix` request whose ids are all absent from a fresh scan (§5.12) | closed | 409 — "the page is out of date, reload" |
 | `E_INTERNAL` | an unexpected error in the helper | closed | 500 |
 
 `E_INTERNAL` never carries a stack trace, a file path outside the fixed set, or
 any part of the request back to the caller. Those go to the audit log.
+
+**This table is the closed enumeration, and it is the one that has to be
+amended.** A later section that introduces a new reason for an existing code —
+§7's unmaintainable counter and §5.14's verifier deadline were both added this way
+— must add it here too, or the document gives two answers depending on which
+section a reader opens. `t/12-contract-enum.t` checks the mechanical half of that:
+every `E_*` token used anywhere in this document appears in this table.
 
 ### 3.6 Output sanitising
 

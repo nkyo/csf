@@ -37,7 +37,7 @@ use File::Temp qw(tempdir);
 use Socket ();
 use Fcntl ();
 use JSON::Tiny ();
-use Test::More tests => 279;
+use Test::More tests => 281;
 
 my $HELPER_PATH = "$FindBin::Bin/../ui-src/bin/csf-ui-helper";
 my $PROTO_PATH  = "$FindBin::Bin/../ui-src/lib/ConfigServer/UI/Proto.pm";
@@ -808,6 +808,64 @@ SKIP: {
 	@lines = split(/\n/, _read($fx->{path}{audit_log}));
 	is(scalar @lines, 2, 'two entries are two lines');
 	is(JSON::Tiny::decode_json($lines[1])->{id}, 't6', 'and the second parses on its own');
+}
+
+###############################################################################
+# A real short write, not a property assertion
+#
+# A regular file does not short-write, so this stages the audit log as a FIFO
+# with a 4 KiB buffer and a reader that goes away mid-write. The entry cannot be
+# written whole, and what is asserted is that the helper KNOWS that: the
+# unchecked write this replaced returned success unconditionally.
+###############################################################################
+SKIP: {
+	skip 'needs mkfifo and F_SETPIPE_SZ, which is Linux-specific', 2
+		unless eval { POSIX::mkfifo("$FindBin::Bin/../.mkfifo-probe-$$", 0600) };
+	unlink "$FindBin::Bin/../.mkfifo-probe-$$";
+
+	my $fx = fixture();
+	my $fifo = "$fx->{dir}/audit.fifo";
+	unlink $fx->{path}{audit_log};
+	POSIX::mkfifo($fifo, 0600) or skip 'could not create the fifo', 2;
+	$fx->{ctx}{path}{audit_log} = $fifo;
+
+	pipe(my $ready_read, my $ready_write) or skip 'could not create the sync pipe', 2;
+	my $pid = fork();
+	skip 'could not fork the reader', 2 unless defined $pid;
+	unless ($pid) {
+		close $ready_read;
+		# O_NONBLOCK so the reader attaches without waiting for a writer, and the
+		# buffer is shrunk while it is still empty - F_SETPIPE_SZ refuses to
+		# shrink below what is already buffered.
+		sysopen(my $reader, $fifo, Fcntl::O_RDONLY() | Fcntl::O_NONBLOCK())
+			or POSIX::_exit(1);
+		my $sized = fcntl($reader, 1031, 4096) ? 'y' : 'n';
+		syswrite($ready_write, "$sized\n");
+		close $ready_write;
+		select(undef, undef, undef, 0.3);
+		close $reader;
+		POSIX::_exit(0);
+	}
+	close $ready_write;
+	my $sized = <$ready_read>;
+	close $ready_read;
+	chomp($sized = defined $sized ? $sized : 'n');
+
+	my $written;
+	my $completed = eval {
+		local $SIG{PIPE} = 'IGNORE';
+		local $SIG{ALRM} = sub { die "the write did not return\n" };
+		alarm(15);
+		$written = $H->can('audit')->($fx->{ctx}, { ts => $NOW, id => 'fifo', detail => 'z' x 60000 });
+		alarm(0);
+		1;
+	};
+	waitpid($pid, 0);
+
+	skip 'this kernel would not shrink the pipe buffer, so no short write can be staged', 2
+		unless $sized eq 'y';
+	ok($completed, 'the write returns rather than blocking for ever');
+	is($written, 0, 'and a line that could not be written whole is reported as not written');
 }
 
 ###############################################################################

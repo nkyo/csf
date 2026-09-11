@@ -190,6 +190,22 @@ line is added below the original notice; the original stays intact.
   refusals above. (`ui-src/bin/csf-ui-helper`, `docs/WEBUI-RPC.md`,
   `t/11-helper-validate.t`)
 
+- **2026-09-11** — `docs/WEBUI-RPC.md` §3.5 is the closed enumeration of error
+  codes, and two changes had added reasons to it in other sections without
+  amending the table — so the document answered differently depending on which
+  section you opened. The `E_UNAVAILABLE` and `E_BACKEND` rows now carry the
+  triggers added with the counter fixes above. Because this was the second time
+  the same staleness occurred, and nine tasks remain that could each add a
+  trigger, `t/12-contract-enum.t` now checks the mechanical half of it: every
+  `E_*` token used anywhere in the contract must appear as a row of that table.
+  It says plainly what it does not check — that an enumerated code is still
+  reachable, and that a row's *description* covers every reason the code is
+  returned, which is the defect it was written after and which no token-level
+  check can see. Also added a test that stages a real short write, through a FIFO
+  with a shrunk buffer and a reader that leaves mid-write, replacing an assertion
+  that could only observe the property indirectly. (`docs/WEBUI-RPC.md`,
+  `t/12-contract-enum.t` — new file, `t/11-helper-validate.t`)
+
 #### The update mechanism — moved to GitHub, and made verifiable
 
 The original update path fetched a tarball and ran `sh install.sh` from it **as
