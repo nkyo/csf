@@ -37,6 +37,24 @@ line is added below the original notice; the original stays intact.
 
 ### Unreleased
 
+#### Replacing the WebUI — the privilege boundary, written down before any code
+
+- **2026-09-11** — Added `docs/WEBUI-RPC.md`: the threat model and the frozen RPC
+  contract between the unprivileged web tier and the root helper that will replace
+  the built-in WebUI. It fixes, before anything is implemented, the thirteen
+  operations the root helper will ever perform, the grammar and limits of every
+  argument, the wire format and its ten error codes, the peer-credential check on
+  the socket, and the `ui.conf` keys. Nothing in it changes behaviour yet; its
+  purpose is that the privileged surface is decided once, in one reviewable place,
+  rather than growing one call at a time as screens are written.
+
+  It also records what the split does **not** buy, because the alternative is a
+  boundary people rely on that is not there: there is one web process, so the
+  operating-system boundary is unprivileged-vs-root, not admin-vs-support. The
+  `support` role is enforced inside the web tier, and anyone who takes over that
+  tier reaches every one of the thirteen operations whatever role their session
+  carries. (`docs/WEBUI-RPC.md` — new file)
+
 #### The update mechanism — moved to GitHub, and made verifiable
 
 The original update path fetched a tarball and ran `sh install.sh` from it **as
