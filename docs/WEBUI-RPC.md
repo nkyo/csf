@@ -27,6 +27,8 @@ becomes a wide one.
 | argue for a new operation | §9 |
 | read or write `ui.conf` | §10 |
 | know where this contract departs from the plan | §11 |
+| know what a later task owes this document | §12 |
+| know why a 0600 directory breaks the install | §13 |
 
 ---
 
@@ -37,7 +39,7 @@ becomes a wide one.
 | Zone | Runs as | Trusts | Must validate | An attacker who owns this zone reaches |
 |---|---|---|---|---|
 | **Network** — browsers, scanners, anyone who can open the port | nobody | — | — | The TLS endpoint only: the front web server (Mode A) or `csf-ui`'s own listener (Mode B). Without credentials: the login form, the rate limiter, and the static assets. Nothing else. |
-| **`csf-ui`** — HTTP routing, sessions, CSRF, rendering | `csfui`, no shell, no capabilities | the kernel; `ui.conf` and `users` (both root-written, read-only to it); helper responses | **everything from the network**: HTTP framing, method, `Content-Type`, all size limits, session cookie, CSRF nonce, role→route mapping, and every RPC argument before it is sent | **All 13 operations, whatever role the session carries** (see §1.2), at the rates in §7. Its own session store and web log. The password hashes in `/etc/csf/ui/users` (read-only — §11.1). It does **not** reach root, `csf.conf`, `csf.deny` directly, the helper's audit log, or any command not on the allowlist. |
+| **`csf-ui`** — HTTP routing, sessions, CSRF, rendering | `csfui`, no shell, no capabilities | the kernel; `ui.conf` (root-written, read-only to it); helper responses | **everything from the network**: HTTP framing, method, `Content-Type`, all size limits, session cookie, CSRF nonce, role→route mapping, and every RPC argument before it is sent | **All 14 operations, whatever role the session carries** (see §1.2), at the rates in §7. Its own session store and access log. It can ask the helper to test a password guess, five times per username per five minutes (§5.14). It does **not** reach root, `csf.conf`, `csf.deny` directly, **the password hashes in `/etc/csf/ui/users`** (§11.1), the helper's audit log, or any command not on the allowlist. |
 | **`csf-ui-helper`** — the allowlist | `root` | the kernel, and `SO_PEERCRED` on the connected socket | **every byte of every request**, including arguments `csf-ui` claims to have already checked; peer uid on every connection; its own startup preconditions | Everything. It is root. This is why it is ~200 lines with a fixed operation list and no argument that names a file, a command or a flag. |
 | **System** — `csf`, `iptables`/`ip6tables`, `/etc/csf`, `/var/lib/csf` | `root` | its own files | — | The machine. |
 
@@ -54,12 +56,18 @@ Therefore:
   privilege boundary.
 - **An attacker who owns `csf-ui` reaches every operation in §5 regardless of
   the session's role**, and regardless of whether they ever authenticate.
+- One thing they do **not** get is the password store. `authenticate` (§5.14) is
+  the only path to it, and it answers one guess at a time: the hashes never leave
+  the root process, so there is nothing to crack offline and nothing to replay
+  against another service where an operator reused a password. What a compromised
+  web tier holds is an oracle bounded at **5 guesses per username per 5 minutes**,
+  counted by the helper in its own state (§5.14), not an offline copy.
 - There is **no second, read-only socket**. Two sockets separate privilege only
   when two processes with different uids hold them. One process holding both
   separates nothing while implying that it does, and a claimed boundary that does
   not exist is worse than an absent one: it gets relied on.
 
-The column "which socket is this served on" is therefore constant for all 13
+The column "which socket is this served on" is therefore constant for all 14
 operations: **the helper socket, the only one**. What varies, and what the audit
 log and the screens key off, is whether an operation **mutates state** (§5).
 
@@ -70,7 +78,9 @@ Stated exactly, because the design is worth only what is on this list:
 1. A remote-code-execution bug in the HTTP tier gets `csfui`, not root. It cannot
    read `/etc/csf/csf.conf` (which still contains `UI_PASS` in plaintext until
    Task 11), cannot write `csf.deny` directly, cannot load a kernel module,
-   cannot read `/etc/shadow`, cannot alter the helper's audit log.
+   cannot read `/etc/shadow`, cannot alter the helper's audit log, and **cannot
+   read the WebUI's own password hashes** — `/etc/csf/ui/users` is `0600 root`
+   and only the helper opens it (§5.14, §11.1).
 2. The set of privileged actions reachable from the web tier is **finite,
    enumerated, and reviewable** — this document — instead of "whatever the
    process can be made to exec".
@@ -82,8 +92,17 @@ Stated exactly, because the design is worth only what is on this list:
    or erase *what was executed*.
 
 And what it does not buy: an attacker who reaches the socket can still block or
-unblock any address the grammar allows, and restart the firewall, at the rates in
-§7. That is the allowlist working as designed. It is bounded, not harmless.
+unblock any address the grammar allows, restart the firewall, and test passwords
+one guess at a time, at the rates in §7. That is the allowlist working as
+designed. It is bounded, not harmless.
+
+One cost is worth naming because it is new. Verifying a password means running
+`crypt()` with `UI_CRYPT_ROUNDS` rounds — deliberately expensive — and after §5.14
+that expense is spent **in the root process**. A caller who can reach the socket
+can therefore make root burn CPU. So the failure counter in §5.14 is two controls
+in one: it stops password guessing, and together with the concurrency and rate
+caps in §7 it stops `authenticate` from being a way to load the machine the
+firewall is protecting.
 
 ### 1.4 Why validation in the helper is load-bearing, not defence in depth
 
@@ -136,6 +155,11 @@ does not hold. It never starts in a degraded mode.
 never by evaluating the file and never by loading a config module that does more
 than we need.
 
+`/etc/csf/ui/users` is **deliberately not** on that list. No account exists until
+an administrator makes one (spec §7), so a missing store is a normal state for a
+fresh install, not a reason to refuse to start; `authenticate` checks it per call
+and answers `E_UNAVAILABLE` with the remedy (§5.14).
+
 If the group `csfui` does not exist (it is created in Task 9), the helper still
 starts — so that the unit is installable in either order — but the socket is
 `0600 root:root` and every accepted connection receives
@@ -166,8 +190,27 @@ This is stated as fact, not as a possibility to hedge around.
 is **informational**: by the time it is logged the pid may have been reused. The
 log says so rather than implying the pid identifies anything.
 
-The helper never accepts an identity, a role, a username or a source address from
-the message body. It cannot verify any of them, so it does not ask for them.
+The helper never accepts an identity, a role or a source address from the message
+body. It cannot verify any of them, so it does not ask for them. The one exception
+proves the rule: `authenticate` (§5.14) carries a username, and the helper does not
+believe it — it treats it as a lookup key and answers with a verdict of its own.
+
+### 2.3 Paths this contract depends on
+
+| Path | Mode / owner | Written by | Read by |
+|---|---|---|---|
+| `/var/run/csf-ui/helper.sock` | `0660 root:csfui` (§2) | helper | `csf-ui` |
+| `/var/run/csf-ui/` (rate state) | `0600 root:root` | helper | helper |
+| `/etc/csf/ui/users` | **`0600 root:root`** | `csf-ui-passwd` (root, Task 3) | **helper only** (§5.14) |
+| `/etc/csf/ui/ui.conf` | `0640 root:csfui` | installer, wizard | `csf-ui` (§10) |
+| `/var/lib/csf/ui/helper/` | `0700 root:root` | helper (failure counter, §5.14) | helper |
+| `/var/lib/csf/ui/sessions/`, `/var/lib/csf/ui/rl/` | `0700 csfui:csfui` | `csf-ui` | `csf-ui` |
+| `/var/log/csf-ui-audit.log` | `0640 root:root` | **helper** — what actually ran | root |
+| `/var/log/csf-ui-access.log` | `0640 csfui:csfui` | **`csf-ui`** — who asked for it | root, `csfui` |
+
+Both parent directories, `/etc/csf/ui` and `/var/lib/csf/ui`, must be traversable
+by `csfui` — a mode with the execute bit, not `0600`. The installers actively work
+against this; **§13 has the measurement, the exact modes, and when to set them.**
 
 ---
 
@@ -197,7 +240,7 @@ the message body. It cannot verify any of them, so it does not ask for them.
 
 | Field | Type | Rule |
 |---|---|---|
-| `op` | string | required; must be one of the 13 names in §5, exactly, lowercase. Anything else → `E_UNKNOWN_OP` |
+| `op` | string | required; must be one of the 14 names in §5, exactly, lowercase. Anything else → `E_UNKNOWN_OP` |
 | `args` | object | optional; absent, `null` and `{}` are equivalent. Any other type → `E_ARG`. **Unknown keys are rejected** (`E_ARG`), never ignored |
 | `id` | string | required; `^[A-Za-z0-9._:-]{1,64}$`. Opaque to the helper, echoed verbatim. Generated by `csf-ui` (a UUIDv4 or 32 hex bytes) and used to join the two audit logs (§8) |
 
@@ -244,10 +287,10 @@ Closed enumeration. New codes are an amendment to this document.
 | Code | Meaning | Connection | `csf-ui` should answer |
 |---|---|---|---|
 | `E_PROTOCOL` | framing or JSON is invalid: oversize line, invalid UTF-8, not an object, bad/missing `id`, bytes after the first newline | closed | 500 (a client bug — the browser never sees this) |
-| `E_UNKNOWN_OP` | `op` is not one of the 13 | closed | 500 (a client bug) |
+| `E_UNKNOWN_OP` | `op` is not one of the 14 | closed | 500 (a client bug) |
 | `E_ARG` | an argument is missing, the wrong JSON type, unknown, or fails its grammar in §4 | closed | 400, with the field name |
 | `E_PEER` | `SO_PEERCRED` check failed | closed | — (the web tier never sees this; it means something else connected) |
-| `E_UNAVAILABLE` | a structural precondition is unmet and no request can succeed until someone fixes it: the `csfui` group does not exist (§2.1), or `LF_IPSET` is on and `reconcile` cannot be computed (§5.11). **Not** used for `csf` being disabled — that is a state the operator chose, and it is `E_REFUSED` | closed | 503 + the remedy |
+| `E_UNAVAILABLE` | a structural precondition is unmet and no request can succeed until someone fixes it: the `csfui` group does not exist (§2.1), `LF_IPSET` is on and `reconcile` cannot be computed (§5.11), or the password store is missing, unusable or empty so `authenticate` cannot answer (§5.14). **Not** used for `csf` being disabled — that is a state the operator chose, and it is `E_REFUSED` | closed | 503 + the remedy |
 | `E_BUSY` | transient: concurrency cap, `csf` lock held, mutation-rate cap, restart interval (§7) | closed | 503 + `Retry-After` |
 | `E_REFUSED` | the request was well-formed and the system refused it: the address is one of this server's own, is in `csf.allow`/`csf.ignore`, is marked "do not delete", or `csf` has an unresolved start error | closed | 409, showing `message` |
 | `E_BACKEND` | `csf` or `iptables` failed, timed out, was killed, or left the state inconclusive | closed | 502 |
@@ -413,11 +456,46 @@ that `reconcile_fix` re-derives the entire set from a **fresh** scan and acts on
 on ids present in that fresh set (§5.12). A forged id names nothing and does
 nothing.
 
+### 4.9 `user`
+
+String, `^[a-z0-9_-]{1,32}$` — the same grammar Task 3 enforces when it writes a
+record, so a username that could not be created cannot be submitted either.
+Anything else → `E_ARG`.
+
+The helper treats it as a **lookup key and nothing else**. It is never used to
+build a path: the failure counter is a single file with one record per username
+(§5.14), specifically so that no argument in this contract ever names a file. It
+carries no authority — a username in a message is not an identity (§2.2, G8).
+
+### 4.10 `pass`
+
+| Rule | Value |
+|---|---|
+| type/length | string, 1–1024 bytes, valid UTF-8 |
+| control bytes | any byte `0x00`–`0x1F` or `0x7F` → `E_ARG` |
+| trimming | **none.** Leading and trailing spaces are part of a password |
+| normalisation | none. The bytes are compared as sent |
+
+Why 1024: `crypt()` ignores everything past the first few bytes anyway, and an
+unbounded password is a way to spend root's CPU (§1.3). The 64 KiB line cap bounds
+it too, but not tightly enough to be the only limit.
+
+**`pass` is never written anywhere and never echoed anywhere.** Not in `data`, not
+in `message`, not in the audit log, not in a debug line, not truncated, not
+hashed, not its length. An `E_ARG` on `pass` says `"pass: contains a control
+byte"` and stops there — naming the field and the rule, never quoting the value.
+The same applies to any validation failure that could reveal it by inference: the
+helper does not report which byte, or where.
+
+This is the one argument in the contract with an output rule attached to its input
+rule, and §8 repeats it, because a password that reaches a log file has leaked
+whether or not anyone was looking.
+
 ---
 
 ## 5. The frozen operation allowlist
 
-Thirteen operations. Not twelve, not fourteen.
+Fourteen operations. Not thirteen, not fifteen.
 
 | # | Operation | Arguments | Mutates | Socket | Screen | `csf`/system action |
 |---|---|---|---|---|---|---|
@@ -434,14 +512,17 @@ Thirteen operations. Not twelve, not fourteen.
 | 11 | `reconcile` | — | no | helper | Health | `iptables -S`, reads files |
 | 12 | `reconcile_fix` | `ids` | **yes** | helper | Health | `iptables -D <chain> <spec>` |
 | 13 | `restart` | — | **yes** | helper | Overview | `csf -r` |
+| 14 | `authenticate` | `user`, `pass` | no firewall state; writes its own failure counter (§5.14) | helper | Login | reads `/etc/csf/ui/users`, runs `crypt()` |
 
 The "Socket" column is constant by design; §1.2 says why. The "Mutates" column is
 what the audit log (§8), the CSRF requirement, the role check and the rate caps
 (§7) key off.
 
 **Role mapping, enforced in `csf-ui` (Task 7), not here:** `support` may call
-`grep` and `list` only. Every other operation is `admin`. The helper does not
-know about roles and will execute any of the 13 for the web tier — §1.2.
+`grep` and `list` only. Every other operation is `admin`, except `authenticate`,
+which is **pre-session** — it is how a role is discovered, so it cannot require
+one. The helper does not know about roles and will execute any of the 14 for the
+web tier — §1.2.
 
 ### 5.0 Rules that apply to every operation
 
@@ -708,6 +789,75 @@ is the point: there is nothing hostile to send. What an attacker who owns
 `csf-ui` gets is firewall flapping at most once per 10 seconds, logged every
 time by root.
 
+### 5.14 `authenticate(user, pass)` — no firewall state, own counter
+
+The web tier does not read the password store. It asks.
+
+```
+request   {"op":"authenticate","args":{"user":"alice","pass":"…"},"id":"…"}
+response  {"id":"…","ok":true,"data":{"ok":true,"role":"admin"}}
+```
+
+The envelope's `ok` means *the helper answered the question*. `data.ok` means *the
+credentials are valid*. A wrong password is **not** an RPC error: it is a
+successful call with a negative verdict. Confusing the two is how a web tier ends
+up treating a backend failure as a login.
+
+| Response | `data` |
+|---|---|
+| valid credentials | `{"ok":true,"role":"admin"}` — `role` is `admin` or `support`, from the record |
+| wrong password, **or no such user** | `{"ok":false,"role":null,"locked":false,"retry_after":0}` |
+| the username is locked out | `{"ok":false,"role":null,"locked":true,"retry_after":287}` |
+| the store is missing, unreadable, not a regular file, a symlink, not owned by uid 0, group/other-readable, or contains no accounts | `E_UNAVAILABLE` with the remedy |
+| `user` or `pass` fails §4.9 / §4.10 | `E_ARG`, naming the field and the rule only |
+
+**Why the hashes stay put.** `/etc/csf/ui/users` is `0600 root:root` and is opened
+by the helper and by `csf-ui-passwd` (root) and by nothing else. A compromise of
+`csf-ui` therefore yields no hashes: nothing to crack offline at leisure, nothing
+to replay against another service where an operator reused a password. What it
+yields is this operation, with the bounds set out below.
+
+**Verification.** The helper runs Task 3's `Auth::verify()` **in its own process**:
+`crypt()` with the record's own salt and round count, or Argon2id when the record
+says so, compared in constant time. Wrong password and unknown username must be
+indistinguishable, in the response **and in the time taken**, so when the username
+is not in the store the helper still runs one `crypt()` against a fixed dummy
+`$6$` record before answering. Skipping that turns response latency into a user
+enumeration oracle.
+
+**The failure counter — the helper's own, not the web tier's.**
+
+| Property | Value |
+|---|---|
+| Keyed by | the submitted `user` string, whether or not it exists |
+| Threshold | **5 consecutive failures → the username is locked for 300 s** |
+| Reset | a successful verification clears the record |
+| While locked | the helper answers `locked` **without running `crypt()`** — that is what makes the counter a CPU control as well as an anti-guessing one |
+| State | `/var/lib/csf/ui/helper/authfail.state`, `0600 root:root`, one record per username, rewritten atomically (temp file + `rename`) under `flock` |
+| Capacity | 256 usernames |
+| Eviction | **only records whose lockout has expired.** If all 256 are actively locked, a new username is answered `locked` with `retry_after` set to the earliest expiry — it is never admitted by evicting someone else's lockout |
+| Survives reboot | yes, deliberately — `/var/run` is tmpfs, and a lockout that a reboot clears is not a lockout |
+
+The capacity rule exists because the key comes from the caller: without it, an
+attacker cycling usernames grows the file without bound, and with naive eviction
+they flush a real account's lockout by submitting 256 invented names. Expired-only
+eviction closes both.
+
+This counter is **independent of `RateLimit.pm`** in the web tier (Task 4). That
+one protects the login form; this one holds even when the web tier is the
+attacker. `csf-ui` must not treat its own limiter as sufficient, and must not try
+to reset this one — it cannot: the state is `0600 root`.
+
+**Audit.** Every attempt is logged by the helper: `user`, the outcome
+(`ok` / `bad` / `locked`), the peer, the request id. **Never `pass`** — see §4.10
+and §8.
+
+**What this costs.** `crypt()` at `UI_CRYPT_ROUNDS` now runs as root. §7 caps
+`authenticate` at 2 concurrent children and 30 calls per rolling 60 s across all
+callers, so the worst a caller can spend is two cores' worth of hashing. The
+per-username lockout bounds the guessing itself at 5 attempts per 5 minutes,
+which is what a stolen web tier is reduced to.
+
 ---
 
 ## 6. Hostile-input matrix
@@ -730,6 +880,7 @@ somehow acquired the socket.
 | a value longer than its cap | `E_ARG`; if the whole line exceeds 64 KiB, `E_PROTOCOL` and the connection closes after 64 KiB is read |
 | unicode confusables, RTL overrides, combining marks | accepted only where valid UTF-8 is allowed (`note`, `filter`); rendered escaped by Task 6's default-escaping template layer; sanitised out of anything echoed back (§3.6) |
 | 10⁶ requests | `E_BUSY` past the caps in §7; each connection costs one forked child, capped at 16 |
+| a hostile value in `pass`, of any kind | rejected or verified, and **never echoed**: no argument value from `pass` appears in any response, message or log line (§4.10) |
 | a request replayed verbatim | executed again. There is no nonce at this layer — replay protection is CSRF and session state in `csf-ui`. A caller that can replay on this socket can also compose the request from scratch; a nonce here would protect nothing (§1.2) |
 
 ### 6.2 Per operation
@@ -799,8 +950,17 @@ arguments are valid, because that is the remaining question.
 | `restart` | — | `{"args":{"force":true}}` | `E_ARG` |
 | | | called in a loop | first call runs; the rest get `E_BUSY` for 10 s (§7) |
 | | valid | worst case | the firewall is rebuilt. Brief window during the rebuild; every call logged by root with its request id |
+| `authenticate` | `user` | `"../../etc/shadow"`, `"Alice"`, `"a"*33`, `"root\u0000"`, `["alice"]`, `""` | `E_ARG` — `^[a-z0-9_-]{1,32}$`, and the value never names a file (§4.9) |
+| | | a username that does not exist | `data.ok:false`, **identical shape and identical timing** to a wrong password — one dummy `crypt()` is run (§5.14). No enumeration |
+| | | 256 invented usernames, to flush a victim's lockout | fails — only expired records are evicted; when the table is full a new username is answered `locked` (§5.14) |
+| | `pass` | a control byte, invalid UTF-8, 1025 bytes | `E_ARG` naming the field and the rule, **never quoting or measuring the value** (§4.10) |
+| | | a 60 KiB password, to burn root CPU | `E_ARG` at 1024 bytes, before any hashing |
+| | | the right password, guessed | 5 tries per username per 5 minutes, then `locked` for 300 s with no `crypt()` run at all |
+| | | any value at all, seeking the hash | nothing — the hash never appears in `data`, in `message`, or in either log. `/etc/csf/ui/users` is `0600 root` and `csf-ui` cannot open it |
+| | | an automated flood | `E_BUSY` past 2 concurrent / 30 per 60 s (§7) |
+| | valid everything | worst case | a caller who already knows a valid password learns the role that goes with it. That is the operation. The web tier still has to mint a session, and the helper never sees it |
 
-### 6.3 The two answers that are not "the request is rejected"
+### 6.3 The three answers that are not "the request is rejected"
 
 Stated separately so they are not lost in the table:
 
@@ -811,6 +971,9 @@ Stated separately so they are not lost in the table:
 2. **`support` is not enforced at this boundary.** A compromised `csf-ui`
    executes admin operations with a support session, or with no session at all
    (§1.2).
+3. **A caller who reaches the socket can test passwords** — five per username per
+   five minutes, and each success tells them a role. What they cannot do is take
+   the hashes away and work on them offline (§5.14).
 
 ---
 
@@ -831,9 +994,20 @@ caller says — so they hold for a hostile caller.
 | Bytes read from any child | 65536 | kill, `E_BACKEND` |
 | Mutating operations, all callers combined | 120 per rolling 60 s | `E_BUSY` |
 | Minimum interval between successful `restart`s | 10 s | `E_BUSY` |
+| Concurrent `authenticate` children | 2 | `E_BUSY` |
+| `authenticate` calls, all callers combined | 30 per rolling 60 s | `E_BUSY` |
+| Consecutive `authenticate` failures per username | 5, then locked 300 s | `data.locked:true`, no `crypt()` run (§5.14) |
+| Wall-clock deadline — `authenticate` (hashing runs in the connection child, not a `csf` child) | 10 s | `E_BACKEND` |
 
-State for the last two lives in `/var/run/csf-ui/`, mode `0600 root:root`, so the
-web tier cannot reset a counter that is limiting it.
+State for the rate counters lives in `/var/run/csf-ui/`, and the per-username
+failure counter in `/var/lib/csf/ui/helper/authfail.state` (§5.14) — both
+`0600 root:root`, so the web tier cannot reset a counter that is limiting it. The
+failure counter is on `/var/lib` rather than `/var/run` on purpose: a lockout that
+a reboot clears is not a lockout.
+
+The `authenticate` caps are CPU caps as much as security caps. `crypt()` at
+`UI_CRYPT_ROUNDS` is deliberately slow, and after §5.14 it runs as root, so
+without a ceiling the login form is a way to load the machine (§1.3).
 
 These caps are not a rate limiter for users — that is `RateLimit.pm` in the web
 tier, with different thresholds and a different purpose. These exist so that a
@@ -850,10 +1024,10 @@ other's file.
 | Log | Written by | Mode | Records |
 |---|---|---|---|
 | `/var/log/csf-ui-audit.log` | `csf-ui-helper` (root) | `0640 root:root` | what was **executed** |
-| `/var/log/csf-ui-web.log` | `csf-ui` (`csfui`) | `0640 csfui:csfui` | who **asked** |
+| `/var/log/csf-ui-access.log` | `csf-ui` (`csfui`) | `0640 csfui:csfui` | who **asked** |
 
-Helper line — one JSON object per line, for every **mutating** operation and for
-every rejected request:
+Helper line — one JSON object per line, for every **mutating** operation, every
+`authenticate` attempt whatever its outcome, and every rejected request:
 
 ```json
 {"ts":1757548800,"id":"7b9f…","op":"deny","args":{"ip":"192.0.2.10","note":"abuse ticket 4471"},
@@ -861,6 +1035,12 @@ every rejected request:
 ```
 
 - `note` is truncated to 64 bytes in the log.
+- **`pass` is never logged.** Not the value, not a truncation, not a hash of it,
+  not its length. The helper's log line for `authenticate` carries `user`, the
+  outcome (`ok` / `bad` / `locked`), the peer and the id — and `args` is written
+  with `pass` **removed**, not blanked, so there is no field for a future change to
+  start filling in. The same applies to the web tier's access log: a login POST is
+  logged as a path and a status, never as a body (§4.10, G9).
 - All strings pass §3.6 first, and JSON encoding escapes what remains: there is
   no way to write a newline or a terminal escape into this file through an
   argument. That is the whole point of rejecting control bytes twice.
@@ -869,11 +1049,20 @@ every rejected request:
 Web line: `ts`, `id`, `user`, `role`, `source address`, `method`, `path`,
 `status`. No token, no cookie, no password, ever (G9).
 
-**The join is `id`.** Neither log alone answers "who blocked 192.0.2.10": the
-helper does not know the user and cannot be told, and the web log is only as
-trustworthy as `csf-ui`. An attacker who owns `csf-ui` can forge or truncate the
-web log; they cannot alter the helper's. Say that in the operator documentation
-rather than presenting the pair as a single tamper-proof audit trail.
+**The join is `id`, and an incident needs both files.** Neither alone answers
+"who blocked 192.0.2.10": the helper knows what ran but cannot know the user
+(§1.2, G8), and the access log knows the user but is written by the process most
+likely to have been compromised. Correlate by request id, and read the pair with
+that asymmetry in mind — an attacker who owns `csf-ui` can forge or truncate
+`/var/log/csf-ui-access.log`; they cannot touch `/var/log/csf-ui-audit.log`,
+because it is `0640 root:root` and they are not root. Say this in the operator
+documentation rather than presenting the pair as one tamper-proof trail.
+
+A worked example: `csf-ui-audit.log` shows `op:"authenticate"`, `user:"alice"`,
+`ok:true`, id `7b9f…`, then `op:"allow"` with the same id family; the access log
+shows which source address and session presented itself as alice for those ids. If
+the second file is missing the entries, the first still proves an address was
+allowed, and when — which is the half you cannot afford to lose.
 
 ---
 
@@ -895,7 +1084,8 @@ rather than presenting the pair as a single tamper-proof audit trail.
 | **Temporary *allow* (`csf -ta`)** | exempting an address from the firewall, temporarily, with no record in `csf.allow`. If it is worth allowing, it is worth allowing visibly |
 | **Direction and protocol on `tempdeny`** | `csf -td` parses `-p`/`-d` out of free text (§1.4); keeping them out of the grammar keeps that parser out of reach |
 | **A `note` on `tempdeny`** | same reason |
-| **Authentication as an RPC operation** | it would be the 14th, and the allowlist is 13. See §11.1 for the consequence |
+| **`csf.ignore` — reading it, editing it, or a Lists tab for it** | **not an oversight; ruled out deliberately.** `csf.ignore` is `lfd`'s ignore list, not a firewall list. No operation here mutates it, so showing it would put a delete button on rows nothing can delete, and giving it its own read and removal operations would widen the allowlist for a tuning file that administrators already edit by hand over SSH. Spec §2's screen description is amended accordingly (§11.2). Before re-adding it, read this row |
+| **Reading the password store — a `get_user` or "return the hash" operation** | `authenticate` (§5.14) returns a **verdict**, never a record. A hash that crosses the socket is a hash the web tier can lose. The store is `0600 root` and stays there |
 | **A second, read-only socket** | §1.2 |
 | **Any argument carrying a role, a username, or a source address** | the helper cannot verify them, so it does not accept them (G8) |
 
@@ -939,12 +1129,10 @@ Rules that bind both readers and writers:
 - Defaults apply **only** to keys that are absent. An empty string is a value,
   and for `UI_ALLOW` it is the value that refuses to start.
 
-**Installer note for Task 9.** Every installer ends with `chmod -R 600 /etc/csf`
-(`install.generic.sh:430` and its six siblings). A `0600` **directory** is not
-traversable, so `/etc/csf/ui/` and everything in it must be re-permissioned
-**after** that line, not before: directory `0750 root:csfui`, `ui.conf` `0640
-root:csfui`, `users` `0640 root:csfui` (§11.1). Setting them earlier in the
-script leaves a UI that cannot read its own configuration and gives no clue why.
+**Installer note for Task 9.** Every installer runs `chmod -R 600 /etc/csf` near
+its end, which leaves `/etc/csf/ui` unreachable by `csfui` no matter what mode
+`ui.conf` itself has. §13 has the measurement and the exact modes to set, and
+when.
 
 ---
 
@@ -953,33 +1141,58 @@ script leaves a UI that cannot read its own configuration and gives no clue why.
 Each of these is a change to a document that was written before the details were
 known. They are listed rather than quietly implemented.
 
-### 11.1 `/etc/csf/ui/users` must be `0640 root:csfui`, not `0600 root`
+### 11.1 A 14th operation, `authenticate` — the users file stays `0600 root`
 
-G7 gives the users file mode `0600 root`. Task 4's login handler runs as `csfui`
-and calls `Auth::verify()`, which must read that file. With `0600 root` nobody
-can ever log in.
+G7 gives `/etc/csf/ui/users` mode `0600 root`, and Task 4's login handler runs as
+`csfui`. Taken together those cannot both hold: with `0600 root` the web tier
+cannot read the store, and nobody can ever log in.
 
-The alternatives were: authentication as a helper operation (a 14th operation —
-the allowlist is frozen at 13), or a second socket (explicitly out of scope,
-§1.2). So: **`0640 root:csfui` — root writes, the web tier reads.**
+Two ways out. Relax the mode to `0640 root:csfui` and let the web tier read the
+hashes, or add an operation and let it ask. **The ruling is the operation**, and
+it is the right one: the split exists so that taking over the web tier yields as
+little as possible, and a copy of every password hash — offline-crackable at
+leisure, replayable wherever an operator reused one — is not "as little as
+possible". So the allowlist is **fourteen** operations, `authenticate` is §5.14,
+and the store stays `0600 root:root`, opened by the helper and by
+`csf-ui-passwd` and by nothing else.
 
-The consequence, stated plainly: a compromise of `csf-ui` yields the password
-hashes for offline attack. That is why they are `crypt()` SHA-512 with
-`UI_CRYPT_ROUNDS` rounds, or Argon2id where available, and why `UI_CRYPT_ROUNDS`
-has a floor. Moving the hashes out of the web tier's reach later requires a 14th
-operation and an amendment here — not a quiet change of file mode.
+What that costs, recorded so nobody has to rediscover it:
 
-**This affects Task 3 (which writes the file) and Task 9 (which installs it).**
+- **`crypt()` now runs as root.** Verifying a password is deliberately expensive,
+  and that expense has moved into the privileged process. §7 caps `authenticate`
+  at 2 concurrent and 30 per minute, and §5.14's lockout skips hashing entirely
+  for a locked username, so the login form cannot be used to load the machine.
+- **The helper is an authentication oracle**, bounded at 5 guesses per username
+  per 5 minutes by a counter it keeps itself (§5.14) — deliberately not the web
+  tier's rate limiter, which is useless precisely when the web tier is the
+  attacker.
+- **Task 3's `Auth.pm` is consumed by the helper, not by `csf-ui`.** That moves
+  `crypt()`/Argon2id and the constant-time compare inside the root process and
+  adds to the helper's line count; the "~200 lines" figure in the plan should be
+  read as a goal for the dispatch and validation core, not a budget the auth path
+  must fit inside.
 
-### 11.2 `list(which=allow)` is `csf.allow`, not `csf.ignore`
+**This changes Task 3 (writes the store, and its verify() is now called by the
+helper), Task 4 (calls `authenticate` instead of reading the store) and Task 9
+(installs the store `0600 root` — see §13).** It amends G7 only by making the
+mode achievable rather than contradictory.
 
-Spec §2 describes the Lists screen as "`csf.deny`, temp bans, `csf.ignore`", but
-the frozen operations `allow`/`unallow` run `csf -a`/`csf -ar`, which write
-`csf.allow`. `csf.ignore` is `lfd`'s ignore list and no frozen operation mutates
-it, so listing it would put a delete button on rows nothing can delete. §4.5
-freezes `allow` → `/etc/csf/csf.allow`. If the ignore list is genuinely wanted on
-that screen, it needs its own read operation and its own removal operation — an
-amendment, not an interpretation.
+### 11.2 The Lists screen shows `csf.allow`, not `csf.ignore` — spec §2 amended
+
+Spec §2 describes the Lists screen as "`csf.deny`, temp bans, `csf.ignore`". The
+frozen operations `allow`/`unallow` run `csf -a`/`csf -ar`, which write
+`csf.allow`; `csf.ignore` is `lfd`'s ignore list and no operation on this list
+touches it.
+
+**Ruled: `csf.ignore` is out of scope, and `which` stays `deny|temp|allow`.**
+Giving the ignore file its own read and removal operations would widen the
+allowlist — the one thing this whole design is arranged to prevent — for a tuning
+file administrators already edit by hand on a machine they have root on. This
+**amends spec §2**: the Lists screen shows `csf.deny`, temp bans and `csf.allow`.
+
+§9 carries the same decision in the "deliberately absent" table, with the reason,
+so that a later reader who notices the gap finds a decision rather than what looks
+like an omission.
 
 ### 11.3 Additions to the argument grammars
 
@@ -997,12 +1210,17 @@ justified by something verified in this tree (§1.4):
 `-tr` removes from the temporary ban list *and* the temporary allow list. The
 screen shows only bans. §5.8.
 
-### 11.5 Two audit logs, not one
+### 11.5 Two audit logs, not one — confirmed
 
 Spec §7 describes one audit log containing both the user and the action. The
-process that knows the user cannot write root's log, and the process that
-executes the action cannot know the user. §8 freezes two files joined by the
-request `id`, and says which one is trustworthy after a web-tier compromise.
+process that knows the user cannot write root's log, and the process that executes
+the action cannot know the user (G8). One shared file would mean one side writing
+where the other can tamper, which is worse than two honest files.
+
+**Ruled: keep both.** `/var/log/csf-ui-audit.log` (root, written by the helper,
+what actually ran) and `/var/log/csf-ui-access.log` (`csfui`, written by the web
+tier, who asked for it), joined by request id. Correlating an incident needs both,
+and §8 says which half survives a compromise of the other.
 
 ---
 
@@ -1010,14 +1228,76 @@ request `id`, and says which one is trustworthy after a web-tier compromise.
 
 | Task | Owes this document |
 |---|---|
-| 2 — helper | §2 startup and peer check, §3 framing and codes, §4 validators, §5 all 13 operations, §7 limits, §8 helper log |
-| 3 — auth store | §11.1 file mode, `UI_CRYPT_ROUNDS` from §10 |
-| 4 — `csf-ui` core | §3 client side, §5 role mapping, §8 web log, error→HTTP table in §3.5 |
+| 2 — helper | §2 startup and peer check, §3 framing and codes, §4 validators, §5 all 14 operations including `authenticate`, §5.14 failure counter, §7 limits, §8 helper log |
+| 3 — auth store | store stays `0600 root:root` (§2.3); `verify()` is called **by the helper**, not by `csf-ui` (§11.1); `UI_CRYPT_ROUNDS` from §10; the dummy-`crypt()` path for unknown usernames (§5.14) |
+| 4 — `csf-ui` core | §3 client side, §5 role mapping, **login calls `authenticate` and never opens the users file** (§5.14), §8 access log, error→HTTP table in §3.5 |
 | 5 — HTTP/TLS core | §10 keys `UI_MODE`, `UI_LISTEN`, `UI_PORT`, `UI_ALLOW` and their refusals |
 | 7 — screens | §5 mutating column (CSRF + role), §5.12 diff and second confirmation |
 | 8 — setup wizard | §10 — it writes `ui.conf` too, with these key names and these refusals |
-| 9 — installer | §10 writes every key with these names; §2.1 creates `csfui` and the socket directory; §11.1 file mode |
+| 9 — installer | §10 writes every key with these names; §2.1 creates `csfui` and the socket directory; **§13 the permission ordering, with the exact modes** |
 | 10 — fuzzing | §6 is the test table: every row is a case |
+
+---
+
+## 13. Deployment constraint: the installers' blanket `chmod`
+
+This is not a design choice. It is a property of the existing installers that will
+silently break the UI, found while freezing §10 and confirmed by measurement.
+
+**The measurement.** A directory at mode `0600` has no execute bit, and without it
+the path through it cannot be walked — by anyone subject to discretionary access
+control, *including the directory's own owner*. Reproduced on this host as an
+unprivileged user (uid 1000):
+
+```
+$ mkdir -p d/ui && echo 'UI_MODE = "b"' > d/ui/ui.conf && chmod 600 d/ui
+$ ls -ld d/ui
+drw------- 2 coder coder 4096 … d/ui
+$ cat d/ui/ui.conf
+cat: d/ui/ui.conf: Permission denied        # EACCES — the file's own mode is irrelevant
+$ chmod 750 d/ui && cat d/ui/ui.conf
+UI_MODE = "b"
+```
+
+**Why nobody has noticed.** Root holds `CAP_DAC_OVERRIDE` and walks through a
+`0600` directory without a complaint, so the installer, `csf`, `lfd` and every
+test run as root all succeed. `csfui` is the only account that would ever hit it,
+and it does not exist yet. The failure surfaces at first login, as a config file
+the UI "cannot read" for no visible reason — the file's own mode looks correct,
+because the problem is one level up.
+
+**Where it comes from.** Every installer re-permissions both trees near its end:
+
+| Installer | `chmod -R 600 /etc/csf` | `chmod -R 600 /var/lib/csf` |
+|---|---|---|
+| `install.cpanel.sh` | 424 | 425 |
+| `install.cwp.sh` | 450 | 451 |
+| `install.cyberpanel.sh` | 427 | 428 |
+| `install.directadmin.sh` | 412 | 413 |
+| `install.generic.sh` | 430 | 431 |
+| `install.interworx.sh` | 431 | 432 |
+| `install.vesta.sh` | 430 | 431 |
+
+`-R` means both `/etc/csf/ui` and `/var/lib/csf/ui` are swept, directories
+included.
+
+**Requirement on Task 9.** Set the UI's permissions **after** those two lines in
+all seven installers — never before, and never by editing the sweep, which exists
+to protect the rest of `/etc/csf` and must keep doing so. Exact modes:
+
+| Path | Mode | Owner | Why |
+|---|---|---|---|
+| `/etc/csf/ui` | `0750` | `root:csfui` | `csfui` must traverse it to reach `ui.conf` |
+| `/etc/csf/ui/ui.conf` | `0640` | `root:csfui` | the web tier reads its configuration |
+| `/etc/csf/ui/users` | `0600` | `root:root` | the password store — **helper only** (§11.1). Traversable-but-unreadable is exactly the intended combination |
+| `/var/lib/csf/ui` | `0755` | `root:root` | both halves keep state underneath it |
+| `/var/lib/csf/ui/helper` | `0700` | `root:root` | the failure counter (§5.14) |
+| `/var/lib/csf/ui/sessions`, `/var/lib/csf/ui/rl` | `0700` | `csfui:csfui` | web-tier state, out of the helper's way |
+| `/var/log/csf-ui-audit.log` | `0640` | `root:root` | §8 |
+| `/var/log/csf-ui-access.log` | `0640` | `csfui:csfui` | §8 |
+
+Task 9's tests should assert the resulting modes on a real install rather than
+asserting that the lines were written, because the ordering is the whole bug.
 
 ---
 

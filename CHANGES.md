@@ -55,6 +55,26 @@ line is added below the original notice; the original stays intact.
   tier reaches every one of the thirteen operations whatever role their session
   carries. (`docs/WEBUI-RPC.md` — new file)
 
+- **2026-09-11** — Amended the same day, on review, before anything was built on
+  it. The allowlist is **fourteen** operations, not thirteen: `authenticate` was
+  added so that the web tier never opens the password file. `/etc/csf/ui/users`
+  stays `0600 root` and the web tier asks the root helper to check a guess instead
+  of reading the hashes itself, so taking over the unprivileged half yields no
+  hashes to crack offline or replay elsewhere — only an oracle the helper limits
+  to five guesses per username per five minutes, with its own counter that the web
+  tier cannot reach or reset. Password verification therefore now runs as root, so
+  those limits are also what stops the login form being used to spend the
+  machine's CPU.
+
+  Recorded at the same time: `csf.ignore` is deliberately not reachable from the
+  UI, with the reason, so it is not mistaken later for an oversight; and a
+  deployment constraint measured rather than assumed — every installer runs
+  `chmod -R 600 /etc/csf` and `chmod -R 600 /var/lib/csf`, and a directory at mode
+  `0600` has no execute bit, so it cannot be traversed at all. Root passes through
+  it regardless, which is why nothing has ever noticed; the unprivileged UI account
+  would not. The exact modes and the ordering the installers must follow are now
+  part of the document. (`docs/WEBUI-RPC.md`)
+
 #### The update mechanism — moved to GitHub, and made verifiable
 
 The original update path fetched a tarball and ran `sh install.sh` from it **as
