@@ -69,6 +69,7 @@ use warnings;
 
 use Socket ();
 use POSIX ();
+use Time::HiRes ();
 use ConfigServer::UI::Proto ();
 use ConfigServer::UI::HTTP  ();
 
@@ -378,6 +379,13 @@ sub _netmask {
 #                  handle_connection(). Nothing in t/40 or t/41 needs this;
 #                  it exists so a future integration test can, without
 #                  needing root or a privileged port.
+#   watchdog_exit  the $SIG{ALRM} handler _serve_accepted() installs around
+#                  the TLS handshake plus request handling (task-5-review.md
+#                  R31). Defaults to POSIX::_exit(1), matching every other
+#                  early exit a forked child takes in this file; a test
+#                  overrides it with something that dies instead, so it can
+#                  prove the watchdog actually fired without killing the
+#                  test process itself.
 ###############################################################################
 sub new {
 	my ($class, %opt) = @_;
@@ -391,6 +399,7 @@ sub new {
 		header_timeout => defined $opt{header_timeout} ? $opt{header_timeout} : $ConfigServer::UI::HTTP::HEADER_TIMEOUT,
 		body_timeout   => defined $opt{body_timeout}   ? $opt{body_timeout}   : $ConfigServer::UI::HTTP::BODY_TIMEOUT,
 		write_timeout  => defined $opt{write_timeout}  ? $opt{write_timeout}  : $ConfigServer::UI::HTTP::WRITE_TIMEOUT,
+		watchdog_exit  => $opt{watchdog_exit} || sub { POSIX::_exit(1) },
 		allow          => $opt{allow} || [],
 	}, $class;
 }
@@ -502,6 +511,72 @@ sub _default_tls_wrap {
 	);
 }
 
+###############################################################################
+# _serve_accepted($self, $connection, $peer_addr)
+#
+# Everything a forked child of run()'s accept loop does with one accepted,
+# already allowlist-checked connection: wrap it in TLS, verify the wrap
+# actually produced TLS, hand it to handle_connection(), close. Extracted
+# from run() so it is callable - and its watchdog provable - without a real
+# fork (task-5-review.md R31/R32).
+#
+# BOUNDED, END TO END, BY A WATCHDOG (R31). HTTP.pm's own 15s-headers/15s-
+# body deadlines are excellent, and they do not start until start_SSL()
+# returns - a peer that completes the TCP handshake and then sends nothing,
+# or an SSL handshake that never completes on either side, parks this child
+# forever with nothing of this module's own making to stop it. Thirty-two
+# such connections - $DEFAULT_MAX_CHILDREN, no more - permanently deny the
+# admin UI: every slot is held by a child that will never exit, waitpid()
+# never reaps them because they never exit, and every further peer, however
+# legitimate, is refused at the "busy" check with no attacker having sent a
+# single byte HTTP.pm would ever see. The watchdog covers the handshake
+# AND the header wait AND the body wait AND the response write, because any
+# one of those - not only the handshake - can be the thing that never
+# completes.
+#
+# alarm()/$SIG{ALRM}, not this module's usual select()-based style:
+# select() cannot interrupt a blocking call already inside
+# IO::Socket::SSL's own handshake loop, which is exactly what needs
+# interrupting here, and a signal-based watchdog in a forked child that
+# does one job and then exits carries none of the risk alarm() would in the
+# parent's accept loop - which is why that loop still avoids it entirely.
+# Time::HiRes::alarm() rather than the builtin: the builtin truncates to
+# whole seconds, which would make a test's short, injected timeouts (0.1s
+# each) round down to "cancel the alarm" instead of "fire almost at once".
+###############################################################################
+sub _serve_accepted {
+	my ($self, $connection, $peer_addr) = @_;
+
+	my $budget = $self->{header_timeout} + $self->{body_timeout} + $self->{write_timeout};
+	local $SIG{ALRM} = $self->{watchdog_exit};
+	Time::HiRes::alarm($budget);
+
+	my $tls_socket = $self->{tls_wrap}
+		? $self->{tls_wrap}->($connection)
+		: _default_tls_wrap($connection);
+
+	# R32: tls_wrap is a constructor injection so tests never need a real
+	# certificate or IO::Socket::SSL installed - but that makes it a seam
+	# that can put a plaintext socket into this pipeline if it is only
+	# ever trusted, never checked. Asserted here, where the socket is
+	# about to be handed to HTTP.pm, not where it was injected.
+	# UNIVERSAL::isa's function form (not a method call) is used because
+	# a handshake failure some path other than undef can hand back
+	# something that is not a blessed reference at all, and a method call
+	# on that would die instead of simply failing the check.
+	if ($tls_socket && UNIVERSAL::isa($tls_socket, 'IO::Socket::SSL')) {
+		$self->handle_connection($tls_socket, $peer_addr);
+		close $tls_socket;
+	}
+	else {
+		close $tls_socket if $tls_socket;
+		close $connection;
+	}
+
+	Time::HiRes::alarm(0);
+	return;
+}
+
 sub run {
 	my ($self) = @_;
 
@@ -532,7 +607,20 @@ sub run {
 
 		my $paddr = accept(my $connection, $listener);
 		unless ($paddr) {
-			next if $!{EINTR};
+			# task-5-review.md I2/R31: EINTR means "a signal arrived,
+			# nothing is actually wrong" and the right answer is to call
+			# accept() again immediately. Everything else - EMFILE/ENFILE
+			# from descriptor exhaustion (which a pile-up of children
+			# stuck in an unbounded TLS handshake, R31's other half, makes
+			# reachable), ECONNABORTED, or anything this loop has not seen
+			# before - is a real condition that will not clear itself
+			# between one accept() and the next, so retrying instantly
+			# would spin this loop as fast as the CPU allows, forever,
+			# with no line anywhere to say why the admin UI went
+			# unresponsive. Back off briefly and log once per occurrence.
+			if ($!{EINTR}) { next }
+			print STDERR "csf-ui (Server.pm): accept() failed: $!\n";
+			select(undef, undef, undef, 0.1);
 			next;
 		}
 
@@ -567,16 +655,7 @@ sub run {
 		$SIG{TERM} = 'DEFAULT';
 		$SIG{INT}  = 'DEFAULT';
 
-		my $tls_socket = $self->{tls_wrap}
-			? $self->{tls_wrap}->($connection)
-			: _default_tls_wrap($connection);
-		if ($tls_socket) {
-			$self->handle_connection($tls_socket, $peer_addr);
-			close $tls_socket;
-		}
-		else {
-			close $connection;
-		}
+		$self->_serve_accepted($connection, $peer_addr);
 		POSIX::_exit(0);
 	}
 

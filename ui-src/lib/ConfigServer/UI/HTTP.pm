@@ -154,7 +154,7 @@ sub read_request {
 	my $buffer = '';
 	my $deadline_headers = _now() + $header_timeout;
 
-	return undef unless _await_first_byte($fh, \$buffer, $deadline_headers);
+	return undef unless _await_first_byte($fh, \$buffer, $deadline_headers, $MAX_REQUEST_LINE);
 
 	my $request_line = _read_line($fh, \$buffer, $MAX_REQUEST_LINE, $deadline_headers,
 		too_long_status => 414, too_long_message => 'the request line is longer than this server accepts',
@@ -260,14 +260,24 @@ sub _ready_to_read {
 }
 
 sub _await_first_byte {
-	my ($fh, $bufref, $deadline) = @_;
+	my ($fh, $bufref, $deadline, $max) = @_;
 	while (1) {
 		return 1 if length $$bufref;
 		my $left = $deadline - _now();
 		return 0 if $left <= 0;
 		unless (_ready_to_read($fh, $left)) { next }
+		# R34 (task-5-review.md): the same shape as the bug _read_line's
+		# refill was fixed for below, and it is a live bug rather than a
+		# theoretical one - a flat 8192 here is bounded by $MAX_REQUEST_LINE
+		# only by coincidence, because the two numbers happen to be equal
+		# today. Bounded to $max instead, this read can never hand
+		# _read_line a buffer already holding more than the request-line
+		# cap - including, critically, a buffer that already contains the
+		# line's own terminator, which is exactly how the original bug let
+		# an over-cap line be accepted whole: found via the newline branch
+		# before the length check ever ran.
 		my $chunk;
-		my $read = sysread($fh, $chunk, 8192);
+		my $read = sysread($fh, $chunk, $max - length($$bufref));
 		if (!defined $read) {
 			next if $!{EINTR};
 			return 0;
