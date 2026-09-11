@@ -35,7 +35,7 @@ use lib "$FindBin::Bin/..", "$FindBin::Bin/../ui-src/lib";
 use File::Temp qw(tempdir);
 use Fcntl qw(:DEFAULT);
 use POSIX ();
-use Test::More tests => 140;
+use Test::More tests => 177;
 
 require_ok('ConfigServer::UI::Auth');
 my $A = 'ConfigServer::UI::Auth';
@@ -88,6 +88,48 @@ ok($C->can('run'), 'the CLI loads as a module without touching /etc/csf-ui');
 	# Default rounds, used when none is given.
 	my $default_hash = $A->can('hash_password')->('x');
 	like($default_hash, qr/^\$6\$rounds=100000\$/, 'hash_password defaults to 100000 rounds');
+}
+
+###############################################################################
+# Important 1 (review round 1): a non-ASCII password must authenticate.
+#
+# docs/WEBUI-RPC.md S4.10 - "normalisation: none. The bytes are compared as
+# sent" - but the two places a password enters this module disagree about
+# what "the bytes" are. csf-ui-passwd hashes raw BYTES straight off stdin/a
+# prompt, with no utf8 flag. Proto::validate_pass (Task 2) decodes the wire's
+# UTF-8 and hands the helper - and so verify() - a utf8-flagged CHARACTER
+# string for anything outside ASCII. crypt() croaks on that flag rather than
+# hashing the bytes underneath it, so before this fix a genuinely correct
+# non-ASCII password would crypt()-croak inside verify()'s eval, come back
+# as an ordinary wrong-password 0, and burn the S5.14 lockout counter on
+# every attempt - a live denial of service triggered by the *right*
+# password. Both call shapes must converge on the same octets.
+###############################################################################
+{
+	my $password_chars = "correct \x{1F512} battery staple"; # padlock emoji: multi-byte UTF-8
+	ok(utf8::is_utf8($password_chars), 'the test password is genuinely a wide-character string');
+
+	my $password_bytes = $password_chars;
+	utf8::encode($password_bytes); # what csf-ui-passwd actually hashes: raw bytes read from stdin
+
+	isnt($password_chars, $password_bytes, 'sanity: the character and byte forms are not the same scalar bytes');
+
+	my $hash = $A->can('hash_password')->($password_bytes, 5000);
+	ok($A->can('verify')->($hash, $password_chars),
+		'verify accepts the utf8-flagged character-string form the helper receives from JSON');
+	ok($A->can('verify')->($hash, $password_bytes),
+		'and the raw byte-string form csf-ui-passwd itself hashed');
+	ok(!$A->can('verify')->($hash, "$password_chars!"), 'and still rejects a genuinely wrong non-ASCII password');
+
+	# hash_password() must also accept a utf8-flagged string directly, in
+	# case a future caller passes one instead of bytes, and produce a hash
+	# that verifies against EITHER form afterwards - not croak, and not
+	# silently hash something other than what was asked for.
+	my $hash_from_chars = $A->can('hash_password')->($password_chars, 5000);
+	ok($A->can('verify')->($hash_from_chars, $password_bytes),
+		'hash_password given the character-string form still produces a hash the byte form verifies against');
+	ok($A->can('verify')->($hash_from_chars, $password_chars),
+		'and the character form verifies against it too');
 }
 
 ###############################################################################
@@ -174,6 +216,29 @@ ok($C->can('run'), 'the CLI loads as a module without touching /etc/csf-ui');
 		ok(!$result, 'and is reported as a mismatch');
 		use strict 'refs';
 	}
+}
+
+###############################################################################
+# Minor 12 / R25: everything above proves constant_time_equal() itself never
+# short-circuits, but nothing yet proved verify() actually calls it rather
+# than, say, `return $computed eq $hash ? 1 : 0` - a change every other
+# assertion in this file would still pass. $COMPARE_VISITS is set by
+# constant_time_equal() alone, so seeing it move off a sentinel after a
+# verify() call is a direct, falsifiable check that the comparison already
+# proved safe above is the one actually reached from the seam.
+###############################################################################
+{
+	no strict 'refs';
+	${"${A}::COMPARE_VISITS"} = -1;
+	use strict 'refs';
+
+	my $hash = $A->can('hash_password')->('routing check', 5000);
+	$A->can('verify')->($hash, 'routing check');
+
+	no strict 'refs';
+	isnt(${"${A}::COMPARE_VISITS"}, -1,
+		'verify() actually routes its comparison through constant_time_equal (COMPARE_VISITS moved)');
+	use strict 'refs';
 }
 
 ###############################################################################
@@ -316,6 +381,109 @@ my $path = "$dir/users";
 }
 
 ###############################################################################
+# Important 2 (review round 1): a line this module cannot parse must not be
+# silently dropped on the next write.
+#
+# read_store() collects unparsable line numbers into `malformed` and leaves
+# them out of `records`/`order` - correctly, since it cannot guess what a
+# broken line meant. But write_store() serialises exactly `records`/`order`,
+# so without a check, the very next add/passwd/delete would silently rewrite
+# the file minus every line it could not parse - including a comment, and
+# including a record the HELPER's own looser reader (csf-ui-helper's
+# _auth_store, which only requires user/algo/hash/role - not five colon
+# fields) would still authenticate. Every write-side operation must refuse
+# instead, before touching the file, and say why; `list`, being read-only,
+# is safe to show what it can and warn about what it cannot.
+###############################################################################
+{
+	my $malformed_dir = tempdir(CLEANUP => 1);
+	my $malformed_path = "$malformed_dir/users";
+	my $original = "# admin accounts, do not hand-edit lightly\n"
+		. "alice:6:\$6\$rounds=5000\$abc\$def:admin\n"                       # 4 fields: no created_epoch
+		. "bob:6:\$6\$rounds=5000\$abc\$ghi:support:1757548800\n";
+	open(my $fh, '>', $malformed_path) or die $!;
+	print $fh $original;
+	close $fh;
+	chmod 0600, $malformed_path;
+
+	my ($store, $store_error) = $A->can('read_store')->($malformed_path);
+	ok($store, 'read_store still succeeds when some lines cannot be parsed') or diag($store_error);
+	is_deeply($store->{malformed}, [2], 'and reports which line it could not parse (the comment is not malformed, just skipped)');
+	ok(exists $store->{records}{bob}, 'the parseable record is still readable');
+	ok(!exists $store->{records}{alice}, 'the unparsable one is absent from records, as documented');
+
+	for my $case (
+		['add_user',      sub { $A->can('add_user')->($malformed_path, 'carol', 'support', 'x') }],
+		['set_password',  sub { $A->can('set_password')->($malformed_path, 'bob', 'x') }],
+		['delete_user',   sub { $A->can('delete_user')->($malformed_path, 'bob') }],
+	) {
+		my ($name, $code) = @$case;
+		my ($ok, $error) = $code->();
+		ok(!$ok, "$name refuses to run while the store has an unparsable line");
+		like($error, qr/cannot parse/, "$name says why");
+		like($error, qr/\b2\b/, "$name names the line number");
+		is(_slurp($malformed_path), $original, "$name left the file byte-for-byte untouched");
+	}
+
+	my ($rows, $list_error, $malformed) = $A->can('list_users')->($malformed_path);
+	ok($rows, 'list_users still succeeds') or diag($list_error);
+	is(scalar(@$rows), 1, 'and lists only what it could parse');
+	is_deeply($malformed, [2], 'reporting the malformed line number as its third return value');
+}
+
+###############################################################################
+# Important 3 (review round 1): a foreign-algo record must not brick every
+# other write.
+#
+# parse_record() deliberately admits algo != 6 on read (R13/S5.14) so a
+# caller can still name a row it cannot verify. But format_record() -
+# correctly - refuses to MINT a new record claiming any algo but 6, and
+# write_store() used to run every record in the snapshot through it, so a
+# single foreign-algo row anywhere in the file made every unrelated add,
+# passwd or delete die uncaught (exit 255) trying to re-serialise it - even
+# though the contract's own documented remedy for that row
+# ("csf-ui-passwd passwd <user>") requires this CLI to keep working.
+###############################################################################
+{
+	my $foreign_dir = tempdir(CLEANUP => 1);
+	my $foreign_path = "$foreign_dir/users";
+	$A->can('add_user')->($foreign_path, 'bob', 'support', 'hunter2');
+	# Splice in a foreign-algo row the way a store copied from a machine that
+	# had something else would carry one - parse_record() admits it; nothing
+	# in this module can mint it.
+	open(my $fh, '>>', $foreign_path) or die $!;
+	print $fh "carol:2:somehash:admin:1757548800\n";
+	close $fh;
+
+	my ($store) = $A->can('read_store')->($foreign_path);
+	ok(exists $store->{records}{carol}, 'the foreign-algo record parses on read');
+	is($store->{records}{carol}{algo}, '2', 'carrying the algo this module cannot verify');
+
+	{
+		my ($ok, $error) = $A->can('set_password')->($foreign_path, 'bob', 'newpass');
+		ok($ok, 'set_password on an unrelated user succeeds despite a foreign-algo record elsewhere') or diag($error);
+	}
+	{
+		my ($after) = $A->can('read_store')->($foreign_path);
+		is($after->{records}{carol}{algo}, '2', "the foreign row survives verbatim, unchanged, in someone else's write");
+		is($after->{records}{carol}{hash}, 'somehash', 'byte-for-byte, not re-hashed or altered');
+	}
+	{
+		my ($ok, $error) = $A->can('delete_user')->($foreign_path, 'bob');
+		ok($ok, 'delete_user on an unrelated user also succeeds') or diag($error);
+	}
+	{
+		# The documented remedy itself: fixing the offending row must work,
+		# which is the scenario a blanket refusal would have broken.
+		my ($ok, $error) = $A->can('set_password')->($foreign_path, 'carol', 'fixedpass');
+		ok($ok, "the contract's own remedy - passwd on the foreign-algo user - succeeds") or diag($error);
+		my ($after) = $A->can('read_store')->($foreign_path);
+		is($after->{records}{carol}{algo}, '6', 'and carol is now algo 6, mintable and verifiable normally');
+		ok($A->can('verify')->($after->{records}{carol}{hash}, 'fixedpass'), 'with a hash that verifies the new password');
+	}
+}
+
+###############################################################################
 # Atomic replace leaves no partial file
 ###############################################################################
 {
@@ -401,12 +569,52 @@ SKIP: {
 }
 
 ###############################################################################
+# Minor 9 / R25: if echo cannot be turned off, refuse rather than read the
+# password anyway with it silently still on - the one place a password
+# becomes visible, to shoulder-surfing, a terminal log, or tmux scrollback.
+# G3 says refuse, not degrade. A real captured tty is not available under
+# `prove`, so POSIX::Termios::getattr is made to fail instead - done in a
+# forked child so the monkey-patch and the STDIN redirection are confined to
+# one throwaway process rather than this test file's own.
+###############################################################################
+{
+	my ($result_read, $result_write);
+	pipe($result_read, $result_write) or die $!;
+	my ($in_read, $in_write);
+	pipe($in_read, $in_write) or die $!;
+
+	my $pid = fork();
+	die "fork failed: $!" unless defined $pid;
+	if (!$pid) {
+		close $in_write;
+		close $result_read;
+		open(STDIN, '<&', $in_read) or POSIX::_exit(126);
+		no warnings 'redefine';
+		local *POSIX::Termios::getattr = sub { die "simulated termios failure\n" };
+		my $line = ConfigServer::UI::PasswdCLI::_read_line_no_echo();
+		print $result_write (defined $line ? "DEFINED:$line" : 'UNDEF');
+		close $result_write;
+		POSIX::_exit(0);
+	}
+	close $in_read;
+	print $in_write "should-not-be-read\n";
+	close $in_write;
+	close $result_write;
+	local $/;
+	my $result = <$result_read>;
+	close $result_read;
+	waitpid($pid, 0);
+	is($result, 'UNDEF', '_read_line_no_echo refuses instead of reading with echo on when it cannot disable echo');
+}
+
+###############################################################################
 # The CLI: no default account, and each command's happy and unhappy paths.
 # STDIN here is never a tty under `prove`, so this exercises the
-# read-from-stdin branch of read_new_password(); the interactive,
-# echo-disabled branch needs a real terminal and is not reachable from an
-# automated suite, for the same reason G5 lets a root-only test skip rather
-# than fake root.
+# read-from-stdin branch of read_new_password(). The interactive branch's
+# happy path (successfully disabling echo, then reading) needs a real
+# terminal and is not reachable from an automated suite, for the same
+# reason G5 lets a root-only test skip rather than fake root; its refusal
+# path when echo cannot be disabled is tested directly just above.
 ###############################################################################
 {
 	# $C holds a string too, so its two path variables are also reached by

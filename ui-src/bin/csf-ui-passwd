@@ -98,13 +98,17 @@ sub _read_line_no_echo {
 			1;
 		};
 	}
+	# G3 (Minor, R25): if echo cannot be turned off, refuse rather than read
+	# anyway with it silently still on - this is the one place the password
+	# would become visible, to shoulder-surfing, a terminal log, or tmux
+	# scrollback, and a caller that degrades a security property on failure
+	# instead of refusing is not failing closed.
+	return undef unless $ok;
 	my $line = <STDIN>;
-	if ($ok) {
-		eval {
-			$term->setlflag($restore);
-			$term->setattr($fd, &POSIX::TCSANOW);
-		};
-	}
+	eval {
+		$term->setlflag($restore);
+		$term->setattr($fd, &POSIX::TCSANOW);
+	};
 	return undef unless defined $line;
 	$line =~ s/[\r\n]+\z//;
 	return $line;
@@ -218,10 +222,16 @@ sub cmd_list {
 		print STDERR "usage: csf-ui-passwd list\n";
 		return 2;
 	}
-	my ($rows, $error) = ConfigServer::UI::Auth::list_users($USERS_PATH);
+	my ($rows, $error, $malformed) = ConfigServer::UI::Auth::list_users($USERS_PATH);
 	unless ($rows) {
 		print STDERR "$error\n";
 		return 1;
+	}
+	if ($malformed && @$malformed) {
+		print STDERR "warning: " . scalar(@$malformed) . " line(s) in the store could not be "
+			. "parsed and are not shown below (line" . (@$malformed == 1 ? '' : 's') . ' '
+			. join(', ', @$malformed) . "); add/passwd/delete will refuse to run until they "
+			. "are fixed or removed by hand\n";
 	}
 	unless (@$rows) {
 		print "no accounts exist yet; create one with: csf-ui-passwd add <user> <admin|support>\n";

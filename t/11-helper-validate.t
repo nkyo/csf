@@ -37,7 +37,7 @@ use File::Temp qw(tempdir);
 use Socket ();
 use Fcntl ();
 use JSON::Tiny ();
-use Test::More tests => 281;
+use Test::More tests => 283;
 
 my $HELPER_PATH = "$FindBin::Bin/../ui-src/bin/csf-ui-helper";
 my $PROTO_PATH  = "$FindBin::Bin/../ui-src/lib/ConfigServer/UI/Proto.pm";
@@ -595,6 +595,22 @@ my $IPTABLES_OUT = join("\n",
 	ok(${ $response->{ok} }, 'now that Auth.pm exists the seam answers instead of failing closed');
 	ok(${ $response->{data}{ok} }, 'and verifies a password it actually hashed, through the real crypt() path');
 	is(_authfail_count($fx, 'alice'), 0, 'a correct password leaves the failure counter at zero');
+
+	# Important 4 (review round 1): this is what the R17 placeholder block
+	# actually guarded and the replacement above does not - not "no verifier
+	# is installed" (Auth.pm makes that untrue now), but the general shape
+	# behind it: a verifier that answers "I cannot tell" (returns (undef,
+	# $message) without dying) must be E_UNAVAILABLE with the counter left
+	# alone (csf-ui-helper:1863-1866). A half-installed or truncated Auth.pm
+	# hits exactly this branch in production, and until this line nothing in
+	# the suite drove it - every other auth_verify mock in this file returns
+	# a defined verdict or dies, which is the neighbouring branch, not this
+	# one.
+	$fx = fixture(users => "alice:6:\$6\$salt\$hash:admin:1757548800\n");
+	$fx->{ctx}{auth_verify} = sub { return (undef, 'the password verifier is not installed') };
+	$response = req($fx, 'authenticate', { user => 'alice', pass => 'whatever' });
+	is($response->{error}, 'E_UNAVAILABLE', 'a verifier that cannot answer is E_UNAVAILABLE, not a verdict');
+	is(_authfail_count($fx, 'alice'), 0, 'and the failure counter is untouched - an unanswerable verifier has not said the password was wrong');
 
 	$fx = fixture(users => "alice:6:\$6\$salt\$hash:admin:1757548800\nbob:6:\$6\$salt\$other:support:1757548800\n");
 	my @seen;

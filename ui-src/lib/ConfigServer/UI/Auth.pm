@@ -55,6 +55,7 @@ use strict;
 use warnings;
 
 use Digest::SHA ();
+use Encode ();
 use Fcntl qw(:DEFAULT :flock :mode);
 use IO::Handle ();
 
@@ -88,6 +89,28 @@ sub validate_role {
 	my ($role) = @_;
 	return 0 unless defined $role && !ref($role);
 	return $VALID_ROLE{$role} ? 1 : 0;
+}
+
+# R24. docs/WEBUI-RPC.md S4.10: "normalisation: none. The bytes are compared
+# as sent." Proto::validate_pass (Task 2, ui-src/lib/ConfigServer/UI/Proto.pm)
+# decodes the wire's UTF-8 and hands the helper a utf8-flagged CHARACTER
+# string for any password outside ASCII - the same normalisation Proto.pm
+# applies to everything else it handles. csf-ui-passwd, on the other hand,
+# hashes whatever raw BYTES it read from a prompt or stdin, with no such
+# flag. crypt() croaks on a utf8-flagged argument rather than hashing the
+# bytes underneath it, so without this the two paths mint and check two
+# different strings for what is, on the wire, one password: a correct
+# non-ASCII password would crypt()-croak at verify time, be swallowed by
+# verify()'s eval, come back as a plain wrong-password 0, and burn the
+# S5.14 lockout counter on every attempt - a live denial of service
+# triggered by the *right* password. Encoding both sides to the same UTF-8
+# octets here, once, is what makes "the bytes are compared as sent" true
+# regardless of which of the two calling conventions handed this module the
+# password.
+sub _pass_octets {
+	my ($pass) = @_;
+	return $pass unless defined $pass;
+	return utf8::is_utf8($pass) ? Encode::encode('UTF-8', $pass) : $pass;
 }
 
 ###############################################################################
@@ -128,6 +151,7 @@ sub _random_salt {
 sub hash_password {
 	my ($pass, $rounds) = @_;
 	die "password must be defined\n" unless defined $pass;
+	$pass = _pass_octets($pass);
 	$rounds = $DEFAULT_ROUNDS unless defined $rounds;
 	die "UI_CRYPT_ROUNDS must be an integer between $MIN_ROUNDS and $MAX_ROUNDS\n"
 		unless $rounds =~ /\A[0-9]+\z/ && $rounds >= $MIN_ROUNDS && $rounds <= $MAX_ROUNDS;
@@ -189,6 +213,7 @@ sub constant_time_equal {
 sub verify {
 	my ($hash, $pass) = @_;
 	return 0 unless defined $hash && length($hash) && defined $pass;
+	$pass = _pass_octets($pass);
 
 	# crypt() does not die on a malformed salt/setting string on any platform
 	# this ships for; it returns something that will not match. The eval is
@@ -206,10 +231,14 @@ sub verify {
 ###############################################################################
 # Record format (docs/WEBUI-RPC.md S5.14, S11.8):
 #   username:algo:hash:role:created_epoch
-# `algo` is kept for a future migration but only `6` can ever be written by
-# this module, and parse_record() refuses any other value on read as well -
-# a store this module cannot fully trust to write is not one it will silently
-# round-trip.
+# `algo` is kept for a future migration. format_record() is the gate this
+# module mints a record through - add_user() and set_password() always pass
+# algo => '6', and this refuses to serialise anything else, so this module
+# can never ORIGINATE a record claiming an algorithm it does not itself
+# implement. parse_record() below deliberately admits a foreign `algo` on
+# READ, so a caller can still name a row it cannot verify rather than lose
+# it - see _verbatim_record() for how such a row survives being written back
+# out unminted.
 ###############################################################################
 sub format_record {
 	my (%rec) = @_;
@@ -224,6 +253,33 @@ sub format_record {
 	die "format_record: hash must not contain ':' or a newline\n"
 		if $rec{hash} =~ /[:\n]/;
 	die "format_record: hash must not be empty\n" unless length($rec{hash});
+	return join(':', $rec{user}, $rec{algo}, $rec{hash}, $rec{role}, $rec{created});
+}
+
+# format_record()'s "only algo 6" rule is a mint-time gate: it stops this
+# module ORIGINATING a new record it cannot itself verify. It must not also
+# apply to a foreign-algo row parse_record() already admitted from an
+# existing store (R13/S5.14) - refusing to re-serialise that row on every
+# unrelated write would make the contract's own advertised remedy for it
+# ("the record for this user carries an algo this helper cannot verify...
+# reset it with csf-ui-passwd passwd <user>", csf-ui-helper's E_UNAVAILABLE
+# message) unreachable: the offending row would still be sitting there,
+# byte-identical, blocking the very next write - including the `passwd`
+# call meant to fix it. So a foreign-algo row is carried through verbatim,
+# unchanged, by whichever write touches OTHER users; only the row actually
+# being added or reset is ever required to be algo 6 (Important 3).
+sub _verbatim_record {
+	my (%rec) = @_;
+	for my $field (qw(user algo hash role created)) {
+		die "cannot write a record missing '$field'\n" unless defined $rec{$field};
+	}
+	die "cannot write a record with an invalid username\n" unless validate_username($rec{user});
+	die "cannot write a record with an invalid role\n" unless validate_role($rec{role});
+	die "cannot write a record whose created field is not a non-negative integer epoch\n"
+		unless $rec{created} =~ /\A[0-9]+\z/;
+	die "cannot write a record whose hash contains ':' or a newline\n"
+		if $rec{hash} =~ /[:\n]/;
+	die "cannot write a record with an empty hash\n" unless length($rec{hash});
 	return join(':', $rec{user}, $rec{algo}, $rec{hash}, $rec{role}, $rec{created});
 }
 
@@ -260,6 +316,27 @@ sub parse_record {
 	};
 }
 
+# The brief and docs/WEBUI-RPC.md's S9/S11.1 both say the store must be
+# "owned by uid 0" - a literal statement about production, where this process
+# always is root. Checking that literally would refuse every fixture in
+# t/20-auth.t outright, since nothing under `prove` runs as uid 0, which is
+# exactly what G5 rules out. Root's own euid IS 0, so "owned by $>" and
+# "owned by uid 0" are the same check whenever this process actually is root;
+# the fallback below only ever relaxes anything when it is not, which is
+# precisely the unprivileged test harness this module must keep working
+# without root (Minor 6).
+sub _owned_correctly {
+	my (@stat) = @_;
+	return $> == 0 ? $stat[4] == 0 : $stat[4] == $>;
+}
+
+sub _not_owned_message {
+	my ($path) = @_;
+	return $> == 0
+		? "$path is not owned by uid 0; refusing to operate on it"
+		: "$path is not owned by this process; refusing to operate on it";
+}
+
 ###############################################################################
 # Reading the store.
 #
@@ -279,8 +356,7 @@ sub read_store {
 	return (undef, "$path could not be stat'd: $!") unless @stat;
 	return (undef, "$path is not a regular file; refusing to operate on it")
 		unless S_ISREG($stat[2]);
-	return (undef, "$path is not owned by this process; refusing to operate on it")
-		unless $stat[4] == $>;
+	return (undef, _not_owned_message($path)) unless _owned_correctly(@stat);
 	return (undef, "$path is readable or writable by group or other; it must be mode 0600")
 		if ($stat[2] & 0077);
 
@@ -325,14 +401,28 @@ sub write_store {
 		return (0, "$path could not be stat'd: $!") unless @stat;
 		return (0, "$path is not a regular file; refusing to overwrite it")
 			unless S_ISREG($stat[2]);
-		return (0, "$path is not owned by this process; refusing to write it")
-			unless $stat[4] == $>;
+		return (0, _not_owned_message($path)) unless _owned_correctly(@stat);
 	}
 
 	my $body = '';
 	for my $user (@{ $snapshot->{order} }) {
 		my $rec = $snapshot->{records}{$user} or next;
-		$body .= format_record(%$rec) . "\n";
+		# Important 3: a foreign-algo row (parse_record admitted one; see
+		# above) must not go through format_record()'s mint-time "algo must
+		# be 6" gate, or every unrelated write dies uncaught the moment such
+		# a row exists anywhere in the store. Wrapped in eval regardless, so
+		# any other malformed-in-memory record is a clean (0, $error) refusal
+		# rather than an uncaught die with an exit code nothing here chose.
+		my $line = eval {
+			(defined $rec->{algo} && $rec->{algo} eq '6')
+				? format_record(%$rec)
+				: _verbatim_record(%$rec);
+		};
+		if ($@) {
+			(my $reason = $@) =~ s/\s+\z//;
+			return (0, "cannot write the record for '$user': $reason");
+		}
+		$body .= "$line\n";
 	}
 
 	my $temp = "$path.tmp.$$";
@@ -393,6 +483,29 @@ sub _with_lock {
 	return @result;
 }
 
+# Important 2: read_store() collects the line numbers it could not parse
+# into `malformed` and drops them from `records`/`order` - correctly, since
+# it cannot guess what a broken line meant. But `records`/`order` is exactly
+# what write_store() serialises, so the naive read -> mutate -> write cycle
+# silently deletes every such line, and every comment, the next time ANYONE
+# runs add/passwd/delete - including a line the *helper's own*, looser
+# reader still authenticates against (csf-ui-helper's _auth_store() requires
+# only user/algo/hash/role, not a five-field split). Data loss that reports
+# ok=1 is the worst shape this could take, so every write-side operation
+# refuses outright, before touching the file, when the store it just read
+# has anything it could not parse - the same "fix or remove it by hand"
+# recovery the module already asks for elsewhere in this file, and the only
+# one that exists for a line with no field this module can even guess at.
+sub _malformed_error {
+	my ($store) = @_;
+	my @lines = @{ $store->{malformed} || [] };
+	return undef unless @lines;
+	return "the store has " . scalar(@lines) . " line(s) this module cannot parse (line"
+		. (@lines == 1 ? '' : 's') . ' ' . join(', ', @lines)
+		. "); refusing to rewrite it until they are fixed or removed by hand - "
+		. "a write here would silently delete them";
+}
+
 ###############################################################################
 # The four operations csf-ui-passwd needs. Each is lock -> read -> mutate ->
 # write, so two invocations racing each other cannot interleave into a
@@ -408,6 +521,7 @@ sub add_user {
 	return _with_lock($path, sub {
 		my ($store, $error) = read_store($path);
 		return (0, $error) unless $store;
+		if (my $malformed_error = _malformed_error($store)) { return (0, $malformed_error) }
 		return (0, "user '$user' already exists; use 'passwd' to change the password")
 			if exists $store->{records}{$user};
 
@@ -431,6 +545,7 @@ sub set_password {
 	return _with_lock($path, sub {
 		my ($store, $error) = read_store($path);
 		return (0, $error) unless $store;
+		if (my $malformed_error = _malformed_error($store)) { return (0, $malformed_error) }
 		return (0, "no such user: $user") unless exists $store->{records}{$user};
 
 		my $hash = eval { hash_password($pass, $option{rounds}) };
@@ -450,6 +565,7 @@ sub delete_user {
 	return _with_lock($path, sub {
 		my ($store, $error) = read_store($path);
 		return (0, $error) unless $store;
+		if (my $malformed_error = _malformed_error($store)) { return (0, $malformed_error) }
 		return (0, "no such user: $user") unless exists $store->{records}{$user};
 
 		delete $store->{records}{$user};
@@ -460,6 +576,11 @@ sub delete_user {
 	});
 }
 
+
+# Third return value: the line numbers read_store() could not parse (never
+# undef; empty when there are none), so the CLI's `list` - read-only, and so
+# in no danger of destroying them - can at least say they exist instead of
+# presenting a store that looks complete when it is not.
 sub list_users {
 	my ($path) = @_;
 	my ($store, $error) = read_store($path);
@@ -468,7 +589,7 @@ sub list_users {
 		my $rec = $store->{records}{$_};
 		{ user => $rec->{user}, role => $rec->{role}, algo => $rec->{algo}, created => $rec->{created} };
 	} @{ $store->{order} };
-	return (\@rows, undef);
+	return (\@rows, undef, $store->{malformed});
 }
 
 1;

@@ -264,6 +264,53 @@ line is added below the original notice; the original stays intact.
   — the placeholder-seam case in section 5.14 now exercises the real module
   instead of its absence)
 
+- **2026-09-11** — Review round 1 on the credential store found four
+  Important-severity defects, all measured against the tree rather than
+  argued, and fixed here. **A correct non-ASCII password could never
+  authenticate, and burned the S5.14 lockout counter trying**:
+  `Proto::validate_pass` hands the helper a utf8-flagged *character* string
+  for anything outside ASCII, `csf-ui-passwd` hashes raw *bytes* read from
+  stdin with no such flag, and `crypt()` croaks on the flagged form rather
+  than hashing the bytes underneath it — so a right password looked exactly
+  like a wrong one, five times, and locked the account. `Auth.pm` now
+  encodes both sides to the same UTF-8 octets before every `crypt()` call.
+
+  **A line this module could not parse was silently deleted by the next
+  write** — `read_store()` already dropped anything unparsable from its
+  result, but nothing read the count it kept, so `write_store()` rewrote the
+  file minus those lines on the very next `add`, `passwd` or `delete`,
+  taking any comment and any record with it — including a four-field record
+  the helper's own, looser reader still authenticates against. Every
+  write-side operation now refuses outright, naming the line numbers,
+  before touching the file; `list` (read-only, so safe to be more lenient)
+  warns instead.
+
+  **A record with an algorithm this module cannot verify made almost every
+  other command die uncaught.** `parse_record()` deliberately admits such a
+  row on read, so an operator can still be told to fix it with
+  `csf-ui-passwd passwd <user>` — but `write_store()` re-serialised every
+  record through the mint-time "only algo 6" gate, so the very next
+  unrelated write crashed with exit 255, including the one command that was
+  supposed to fix the row. Foreign-algo records are now carried through a
+  write verbatim, unchanged, unless they are the one actually being reset —
+  the mint-time gate still refuses to *originate* anything but algo 6.
+
+  **The R17 placeholder's fail-closed branch lost its only test** when the
+  previous commit replaced the block asserting its absence: the branch
+  itself — a verifier that cannot answer gets `E_UNAVAILABLE` with the
+  failure counter untouched (`csf-ui-helper:1863-1866`) — was never touched,
+  but every remaining mock in the suite returns a defined verdict or dies,
+  which is the neighbouring branch. Three lines restore it.
+
+  Also fixed: the store's ownership check now compares against uid 0 when
+  this process is actually root, rather than always against its own euid —
+  identical in production, where the difference only mattered for a store
+  deliberately owned by someone else; and `csf-ui-passwd`'s echo-off prompt
+  now refuses to read a password at all if it cannot first confirm echo is
+  disabled, rather than falling back to reading it with echo silently still
+  on. (`ui-src/lib/ConfigServer/UI/Auth.pm`, `ui-src/bin/csf-ui-passwd`,
+  `t/20-auth.t`, `t/11-helper-validate.t`)
+
 #### The update mechanism — moved to GitHub, and made verifiable
 
 The original update path fetched a tarball and ran `sh install.sh` from it **as
