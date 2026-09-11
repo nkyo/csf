@@ -41,7 +41,7 @@ use lib "$FindBin::Bin/..", "$FindBin::Bin/../ui-src/lib";
 
 use File::Temp qw(tempdir);
 use JSON::Tiny ();
-use Test::More tests => 143;
+use Test::More tests => 147;
 
 my $APP_PATH = "$FindBin::Bin/../ui-src/bin/csf-ui";
 ok(-f $APP_PATH, 'csf-ui is where the brief says it is');
@@ -240,6 +240,37 @@ sub _pct_decode {
 	# is what catches that specific regression.
 	like($r->{body}, qr/action="\/ui\/health\/review"/, 'the findings form posts to the review step, not straight to a mutation');
 	unlike($r->{body}, qr/action="\/ui\/health\/apply"/, 'GET /ui/health never renders a form that posts directly to /ui/health/apply');
+}
+
+###############################################################################
+# R59 (fix round 2 review): the zero-findings case, on its own - the R58
+# fix put `display: none` on `findings_class`, which health.html's FIRST
+# version used to wrap BOTH the (legitimately empty, correctly hidden)
+# table+form AND the summary message "No reconciliation issues found." -
+# so the fix for one accessibility bug (a destructive form left
+# focusable-while-invisible) introduced another on the same screen: the
+# one message this screen most needs to show ("you are clean") went
+# blank along with the table it was never meant to be grouped with.
+#
+# This scenario is exactly why the fix is tested in isolation: with
+# findings, "ORPHAN"/"GHOST" text elsewhere on the page would still have
+# made the earlier block above pass even if the summary line vanished -
+# nothing else on THIS page, when reconcile finds nothing, would notice
+# its absence. An operator opening Health specifically to ask "are we
+# clean?" must see an affirmative answer, not a blank panel
+# indistinguishable from the page being broken.
+###############################################################################
+{
+	my ($app, undef, $sessions) = _build(responses => { reconcile => [ _reconcile_empty() ] });
+	my $sess = $sessions->create(user => 'alice', role => 'admin');
+	my $r = $app->dispatch({ method => 'GET', path => '/ui/health', headers => { cookie => "csfui_sid=$sess->{id}" }, peer => '203.0.113.1' });
+	is($r->{status}, 200, 'GET /ui/health renders when reconcile finds nothing');
+	like($r->{body}, qr/No reconciliation issues found\./,
+		'R59: the "no issues" message is present in the raw body at all');
+	like($r->{body}, qr{<p class="text-muted">No reconciliation issues found\.</p>\s*<div class="fully-hidden">},
+		'R59: ...specifically OUTSIDE the fully-hidden wrapper, not swallowed by it');
+	unlike($r->{body}, qr{<div class="fully-hidden">\s*<p class="text-muted">No reconciliation issues found\.</p>},
+		'R59: ...and specifically not the R58-regressed shape, where the message sat INSIDE the hidden div');
 }
 
 {

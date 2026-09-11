@@ -37,6 +37,49 @@ line is added below the original notice; the original stays intact.
 
 ### Unreleased
 
+#### Task 7 fix round 2 — the R58 accessibility fix hid the one message Health exists to show
+
+**2026-09-11** — One finding. R55, R56, R57 and the destructive-control half of R58 all
+confirmed addressed by independent review of the shipped code and its behaviour, not the
+report describing it - including re-sweeping every `/ui/*` route with a fresh `support`
+session and a valid CSRF token and getting the same 13-refused/4-allowed split as the
+first pass.
+
+- **R59 — the R58 fix put `.fully-hidden` on the wrong element.** `health.html` wrapped
+  BOTH the reconciliation summary message ("No reconciliation issues found." on the clean
+  path, or the finding count otherwise) AND the findings table+form in one
+  `findings_class` div. R58 correctly hid that div's table+form when there is nothing to
+  act on - but hiding the *whole* div with `display: none` took the summary message with
+  it, so the one clean-path success message vanished along with the (correctly) empty
+  table. An operator who opens Health specifically to ask "are we clean?" got a blank
+  panel, indistinguishable from the page being broken - on the one screen where that
+  ambiguity is exactly wrong, since doubt is the reason to visit it. The reviewer found
+  this by dispatching a real request with an empty reconcile result and reading the
+  response, not by reading the template.
+
+  Fixed by moving the summary paragraph outside the `findings_class` wrapper in
+  `ui-src/web/screens/health.html`, so it renders unconditionally while `findings_class`
+  now hides only the table+form - the thing that genuinely has nothing to show on that
+  path. No Perl changes: `_route_ui_health()`'s `summary_text`/`findings_class` values
+  were already correct: the class was on the wrong element, not computed from the wrong
+  condition. Checked every other toggle in both Health templates for the same shape (a
+  class wrapping sibling content that must survive being hidden) - `health-review.html`'s
+  `apply_class` wraps `count_text` alongside its form too, but `count_text` is already ''
+  in exactly the branch that hides it, so no second instance exists.
+
+  New test in `t/60-screens.t` dispatches `/ui/health` with an empty reconcile result in
+  isolation (findings-bearing tests elsewhere would not have caught this - "ORPHAN"/"GHOST"
+  text on the page would still have passed even with the summary line gone) and asserts
+  the message is present in the response body, specifically outside the `fully-hidden`
+  wrapper. Guard-removal: reverted the template to the regressed shape (summary paragraph
+  back inside `findings_class`) and re-ran - both new assertions failed, showing the exact
+  literal markup the review flagged (`<div class="fully-hidden">` immediately followed by
+  the "No reconciliation issues found." paragraph); reverted back, confirmed byte-identical,
+  full suite green.
+
+`t/60-screens.t`: 143 → 147 assertions. Whole suite: **1841 tests** (was 1837),
+`prove -I. t/`.
+
 #### Task 7 fix round 1 — a test bound to nothing, a role check by memory, a class fixed but not closed, focusable-while-invisible on the one screen that can't afford it
 
 **2026-09-11** — Two independent reviews came back PASS with no Critical and the role

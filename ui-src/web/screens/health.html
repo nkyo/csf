@@ -59,8 +59,26 @@ this contract leaves unspecified.
 <section class="panel">
 	<h2 class="panel-title">Reconciliation</h2>
 	<div class="{{unavailable_class}}" role="alert">{{unavailable_text}}</div>
+	<!--
+	R59 (fix round 2 review): the summary-text paragraph right below sits
+	OUTSIDE the findings-class wrapper on purpose, and must stay there. It
+	is the one thing that answers "does Health have anything to say" -
+	"No reconciliation issues found." on the empty path, or the N-finding
+	count otherwise - and empty-but-fine is exactly the state a fully-
+	hidden table+form (see ui-src/bin/csf-ui's _route_ui_health(): the
+	total==0 branch hides the findings wrapper, because there is genuinely
+	nothing in that table to show or act on) must NOT also swallow. The
+	first version of this file put the message INSIDE that wrapper, so the
+	empty-findings success message vanished along with the (correctly)
+	hidden table - an operator opening Health specifically to ask "are we
+	clean?" saw a blank panel, indistinguishable from the page being
+	broken, which is the one ambiguity this screen exists to rule out.
+	Never move the summary paragraph back inside the findings wrapper below -
+	if a future change needs to hide a table+form again, hide ONLY that,
+	never the sentence that says why.
+	-->
+	<p class="text-muted">{{summary_text}}</p>
 	<div class="{{findings_class}}">
-		<p class="text-muted">{{summary_text}}</p>
 		<form method="POST" action="/ui/health/review">
 			<input type="hidden" name="_csrf" value="{{csrf}}">
 			<div class="table-responsive">
