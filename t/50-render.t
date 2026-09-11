@@ -47,7 +47,7 @@ use lib "$FindBin::Bin/..", "$FindBin::Bin/../ui-src/lib";
 
 use File::Find ();
 use File::Temp qw(tempdir);
-use Test::More tests => 115;
+use Test::More tests => 153;
 
 require_ok('ConfigServer::UI::Render');
 
@@ -327,144 +327,397 @@ ok($@, 'escape_html: a coderef dies');
 }
 
 ###############################################################################
+# THE CONTEXT SCANNER - and why it is no longer built out of regexes.
+#
 # R38 (fix round 1, spec review): the boundary between where {{ }} is safe
 # and where it is not - documented in Render.pm's and layout.html's own
 # header comments as element content and quoted attributes only, NEVER a
 # <script>/<style> body, an event-handler attribute, or a URL-bearing
-# attribute - was, until this round, enforced by nothing but that comment.
+# attribute - was, until that round, enforced by nothing but that comment.
 # Task 7 adds five screens directly on top of this file with nothing
-# stopping any of them from writing {{value}} inside an onclick or an href.
-# The reviewer also punctured the fallback comfort of "tag/quote entities
-# survive inside <script> anyway": a value ending in an unescaped backslash
-# still corrupts a JS string literal there, escaped or not, so the boundary
-# is not merely undefended, it is not as forgiving as it looks when crossed
-# either. This section turns the boundary into a test - the third landmine
-# of this exact shape in the project (an unbound @ROUTES table, a read sized
-# by a literal that happened to equal its cap, now an undefended escaping
-# context boundary), each time ruled into enforcement rather than left as
-# description.
+# stopping any of them from writing {{value}} inside an onclick or an
+# href. The reviewer also punctured the fallback comfort of "tag/quote
+# entities survive inside <script> anyway": a value ending in an
+# unescaped backslash still corrupts a JS string literal there, escaped
+# or not, so the boundary is not merely undefended, it is not as
+# forgiving as it looks when crossed either.
 #
-# _find_unsafe_placeholders() is a text scan, not an HTML parser: <script>/
-# <style> bodies, on*=/href=/src=/action= attribute values, and (R40,
-# below) ANY unquoted attribute value are located with regexes, and each
-# is checked only for the literal substring "{{" - deliberately not
-# distinguishing the escaped {{key}} marker from the raw {{{key}}} one,
-# because neither is safe in any of these positions and a value that only
-# ever needs the raw marker should not have been attacker-reachable text
-# to begin with. This can be fooled by sufficiently contrived markup the
-# way any regex-based scan can (a <script> tag split by an HTML comment,
-# for instance); it is a trip-wire for the ordinary way this gets broken -
-# a screen author reaching for the nearest placeholder while wiring up an
-# onclick - not a proof that the rule can never be violated. Said here
-# plainly rather than left for a re-review to notice: this test's
-# advertised scope is "the ordinary mistake", not "every mistake".
+# Rounds 1-3 enforced that boundary with a growing set of regexes, and
+# each round's bypass lived inside the previous round's fix:
 #
-# R40 (fix round 2, live-verified by the reviewer): the on*/href/src/action
-# check above only matches a QUOTED value ((["'])(.*?)\2) - an unquoted
-# attribute, legal HTML5 (<a href={{evil}}>), bypassed detection entirely.
-# This is not merely a scanner gap: escape_html() does not escape spaces,
-# so an unquoted value containing one does not just break out of the
-# value, it injects a whole new attribute - onmouseover is one space away.
-# Enumerating "the dangerous attributes" is the wrong shape for the
-# unquoted case, because without quotes EVERY attribute is injectable, not
-# only on*/href/src/action - so the fix below flags {{ in an unquoted
-# value regardless of the attribute's name, as an addition alongside the
-# quoted checks above, not a replacement for them.
+#   round 1  on*/href/src/action, quoted values only
+#            -> R40: <a href={{evil}}> (unquoted) was invisible.
+#   round 2  + "any unquoted attribute", matched against the whole
+#            document
+#            -> R43: "<p>Max attempts = {{max}}</p>" - ordinary prose
+#               with no tag in it - was misread as an unquoted attribute
+#               named "attempts", which is exactly the shape a stats
+#               screen writes, and a guard that blocks correct work is a
+#               guard someone switches off;
+#            -> R41: a placeholder in attribute-NAME position;
+#            -> R42: the raw marker after an embedded </script>.
+#   round 3  + scope every attribute check to <tag ...> regions captured
+#            by <[a-zA-Z][a-zA-Z0-9-]*([^>]*)>
+#            -> R45: [^>]* stops at the FIRST '>' anywhere in the tag,
+#               including one inside an earlier QUOTED attribute value,
+#               so <div title="Count > 5" onclick="{{v}}"> handed the
+#               checks a region of just ' title="Count ' and the onclick
+#               went unseen. Confirmed live: not flagged, and render()
+#               emits a real onclick="alert(1)".
 #
-# Other evasion candidates raised in the round 2 review, checked
-# individually rather than assumed (see the positive/negative controls
-# below this sub, and task-6-report.md for the input/scanner/render()
-# table on each):
-#   - single-quoted attributes: already handled - (["'])(.*?)\2 matches
-#     either quote character via backreference, not only ".
-#   - uppercase ONCLICK/HREF: already handled - every while loop below
-#     carries /i.
-#   - <script> carrying attributes or a type: already handled -
-#     <script\b[^>]*> consumes any attributes before the opening tag's >.
-#   - whitespace around an attribute's =: already handled - \s*=\s*
-#     already allows it on both sides.
-#   - {{ split across a line inside a script body: already handled for
-#     the ordinary case (dotall /s lets (.*?) cross the newline) - but see
-#     the "split across a literal {{" negative control below for the one
-#     sub-case that is NOT live, and why.
+# That is not three careless rounds. HTML is not a regular language, so
+# "where am I in this document" is not a question a regular expression
+# can answer; a regex can only approximate it, and every approximation
+# has a next counterexample. There is no patch sequence that converges -
+# the recommended round-4 patch (alternate "[^>]*" with
+# '"[^"]*"|\x27[^\x27]*\x27|[^>]' so an in-value '>' cannot terminate the
+# region) is itself only the next approximation: it still cannot tell a
+# comment from markup, still cannot see that a '<' inside an attribute
+# value is not a new tag, and still has to be re-argued from scratch
+# against every construction nobody has thought of yet.
 #
-# R41 (fix round 3, live-verified): a placeholder used AS THE ATTRIBUTE
-# NAME, not its value - <div {{attr}}="{{val}}"> lets the substituted
-# value choose which attribute exists at all (onclick, onerror, ...).
-# render() was confirmed to actually do this: with vars (attr=>'onclick',
-# val=>'alert(1)') that template becomes a live
-# <div onclick="alert(1)">. escape_html() only ever escapes a VALUE;
-# nothing it does touches a NAME, so a name position is dangerous
-# regardless of which marker is used or how the value is quoted - the
-# check below fires on the placeholder syntax appearing immediately
-# before '=', before any of the value-position checks run.
+# So this round replaces the regexes with an explicit single-pass scan
+# that tracks which context it is in: element content, inside a tag,
+# inside a quoted or unquoted attribute value, inside a comment or other
+# markup declaration, or inside a <script>/<style> raw-text body. It
+# follows the HTML5 tokenizer's own state transitions for the subset
+# that decides those boundaries, so the questions the regexes were
+# failing one at a time (the truncating '>', the comment that looks like
+# markup, the '<' inside an attribute value, the tag spanning lines, the
+# missing whitespace between two attributes) are all answered by the
+# same mechanism rather than by five more patterns. It is ~120 lines,
+# bounded, and every branch below names the HTML5 state it mirrors, so
+# it can be checked against the spec rather than against intuition.
 #
-# R43 (fix round 3, live-verified): the round-2 unquoted-attribute check
-# (R40) matched against the WHOLE document text, with no requirement
-# that it actually be inside a tag - so "<p>Max attempts = {{max}}</p>",
-# ordinary element content with no attribute anywhere in it, was
-# misread as an unquoted attribute named "attempts". That is exactly
-# the shape Task 7's Overview screen was going to write
-# ("<div class=\"stat\">Blocked count = {{count}}</div>"), and a guard
-# that blocks correct work is a guard someone disables - at which point
-# R40 and R41 stop being theoretical again. Fixed by requiring REAL TAG
-# CONTEXT: every attribute-level check (R41's name check, on*, href/
-# src/action, and R40's unquoted-any) now runs only against the region
-# TAG_RE captures between a tag's name and its closing '>', never
-# against text that sits between tags. "<p>" contributes an empty
-# region; the prose after it is never handed to any attribute check at
-# all, because nothing in it is preceded by an actual '<tagname'.
+# What it reports, and why each is unsafe (escape_html() escapes
+# & < > " ' - enough for element content and for a QUOTED attribute
+# value, and nothing else):
+#
+#   <script>/<style> body   neither JS nor CSS treats any of those five
+#                           characters as special, and an HTML tokenizer
+#                           ends a <script> at the byte sequence
+#                           "</script" without decoding entities first.
+#   attribute NAME          escape_html() only ever escapes a VALUE;
+#                           nothing it does touches a name, so a
+#                           placeholder here chooses which attribute
+#                           exists at all - onclick is one substitution
+#                           away (R41).
+#   tag-NAME position       "<{{v}}", "</{{v}}" or "<d{{v}}" - the
+#                           template supplied the '<' itself, and
+#                           escape_html() escapes neither space nor '='
+#                           nor '/', so the value supplies a tag name
+#                           and every attribute after it. Found in this
+#                           round while probing the new scan, confirmed
+#                           live: "<p>5 <{{v}}> 6</p>" with
+#                           v = "img src=x onerror=alert(1)" renders
+#                           exactly that img (R46). Missed by every
+#                           earlier round, because the question it asks
+#                           is about the OUTPUT's structure, not the
+#                           template's.
+#   unquoted value          there is no boundary to defend: escape_html()
+#                           does not escape SPACE, so a value containing
+#                           one does not widen this attribute, it injects
+#                           a new one - onmouseover is one space away
+#                           (R40). Any attribute, not only the enumerated
+#                           ones - without quotes they are all injectable.
+#   quoted on*=             the value is JavaScript source, not text.
+#   quoted href/src/action= the value is a URL, and "javascript:" is one.
+#
+# Deliberately NOT reported, each with its reason:
+#
+#   comment content         inert to the browser, and an escaped value
+#                           cannot break out: every way HTML5 ends a
+#                           comment ("-->", "--!>", the abrupt "<!-->"
+#                           and "<!--->" forms, EOF) needs a literal '>',
+#                           escape_html() turns '>' into "&gt;", and
+#                           entities are not decoded inside a comment.
+#                           This also clears the round-3 false positive
+#                           on a commented-out <button onclick=...>. It
+#                           does NOT extend to the raw marker, which is
+#                           why _find_unauthorized_raw_markers() below
+#                           checks every {{{key}}} context-free, comments
+#                           included.
+#   end-tag attributes      </div onclick="{{v}}"> - an end tag's
+#                           attributes are discarded by the HTML parser
+#                           and can never become live. Parsed with the
+#                           same quoting rules anyway, so a '>' inside
+#                           one of them cannot desynchronise the scan.
+#                           An end tag's NAME is still reported (R46).
+#   quoted value, ordinary  escape_html() covers it: that is the whole
+#   attribute               point of the escaping, and flagging it would
+#                           block correct work (R43's lesson).
+#
+# Known and accepted, stated here rather than left for a re-review:
+#   - RCDATA elements (<title>, <textarea>) are scanned as ordinary
+#     markup, so markup written inside one is parsed as tags here but is
+#     plain text to a browser. That over-reports (fails closed) and no
+#     template in this tree does it.
+#   - a tag with no closing '>' at all is still reported, though a
+#     browser discards it. Over-reporting again, and such a template is
+#     visibly broken anyway.
+#   - the URL-bearing set is an enumeration (href/src/action) and
+#     therefore incomplete by construction - formaction, xlink:href and
+#     friends are not in it. Left exactly as rounds 1-3 had it rather
+#     than widened on a guess; the real rule this codebase follows is
+#     that a URL in a template is a literal it wrote, never a
+#     substituted value.
 ###############################################################################
+
+# _find_unsafe_placeholders($html) -> @findings
+#
+# The DATA state: ordinary element content, which is the one place the
+# escaped marker is unconditionally safe. Everything interesting starts
+# at a '<', so this loop's only job is to classify each '<' and hand off
+# to the routine for that context.
 sub _find_unsafe_placeholders {
 	my ($html) = @_;
 	my @findings;
+	my $len = length $html;
+	my $pos = 0;
 
-	while ($html =~ m{<script\b[^>]*>(.*?)</script>}gis) {
-		push @findings, '<script> block' if index($1, '{{') >= 0;
-	}
-	while ($html =~ m{<style\b[^>]*>(.*?)</style>}gis) {
-		# Beyond what R38 asked for, added for consistency with the SCOPE
-		# OF THE ESCAPING paragraph in Render.pm's own header comment,
-		# which names <style>/CSS alongside <script> as unsafe - leaving
-		# it out here would mean this module documents a fourth unsafe
-		# context and enforces only three of them.
-		push @findings, '<style> block' if index($1, '{{') >= 0;
-	}
+	while ($pos < $len) {
+		my $lt = index($html, '<', $pos);
+		last if $lt < 0;                      # DATA through to EOF
+		my $c = substr($html, $lt + 1, 1);
 
-	# R43: every check in this loop body sees only $region - the text
-	# between a tag's name and its own closing '>' - never the whole
-	# document, so element content between tags can never be mistaken
-	# for an attribute.
-	while ($html =~ m{<[a-zA-Z][a-zA-Z0-9-]*([^>]*)>}gis) {
-		my $region = $1;
-
-		# R41: checked first, before any value-position check, because
-		# a placeholder in name position is dangerous on its own,
-		# independent of whatever the value turns out to be.
-		while ($region =~ m{(\{\{\{?[A-Za-z_][A-Za-z0-9_]*\}\}\}?)\s*=}gs) {
-			push @findings, "placeholder used as an attribute name ('$1')";
+		# R46: TAG-NAME POSITION. A '<' the TEMPLATE wrote, immediately
+		# followed by a placeholder, is markup structure the escaping
+		# cannot reach: escape_html() escapes '<' and '>' in a VALUE, so
+		# a value can never invent a tag on its own - but here the
+		# template has already supplied the '<', and escape_html()
+		# escapes neither SPACE nor '=' nor '/', so the value supplies
+		# the tag name and as many attributes as it likes. Confirmed
+		# live: "<p>5 <{{v}}> 6</p>" with v = "img src=x
+		# onerror=alert(1)" renders exactly that img. Note "< {{v}}"
+		# (whitespace between) is NOT this - an HTML tokenizer emits
+		# that '<' as text, and the escaped value beside it is ordinary
+		# element content.
+		if (substr($html, $lt, 4) =~ m{\A<[/]?\{\{}) {
+			push @findings, 'placeholder in tag-name position (immediately after the template\'s own "<")';
 		}
 
-		while ($region =~ m{\s(on[a-zA-Z]+)\s*=\s*(["'])(.*?)\2}gis) {
-			push @findings, "event-handler attribute '$1'" if index($3, '{{') >= 0;
+		# MARKUP DECLARATION OPEN: <!-- comment -->, <!DOCTYPE ...>,
+		# <![CDATA[...]]> (a bogus comment in an HTML document).
+		if ($c eq '!') {
+			$pos = _skip_declaration($html, $lt, $len);
+			next;
 		}
-		while ($region =~ m{\s(href|src|action)\s*=\s*(["'])(.*?)\2}gis) {
-			push @findings, "URL-bearing attribute '$1'" if index($3, '{{') >= 0;
+
+		# '<?' is a bogus comment to an HTML parser, ended by '>'.
+		if ($c eq '?') {
+			$pos = _skip_to_gt($html, $lt + 2, $len);
+			next;
 		}
-		# R40: any attribute at all, unquoted. The negative lookahead
-		# (?!["']) is what keeps this from double-counting the quoted
-		# cases already caught above - it only matches when the
-		# character right after = (and any whitespace) is neither
-		# quote, i.e. genuinely unquoted. The value itself is captured
-		# up to the next whitespace or '>' (which R43's $region never
-		# contains, having already been trimmed to it by TAG_RE), which
-		# is where HTML5 ends an unquoted attribute value.
-		while ($region =~ m{\s([a-zA-Z][a-zA-Z0-9:_-]*)\s*=\s*(?!["'])([^\s>]+)}gis) {
-			push @findings, "unquoted attribute '$1'" if index($2, '{{') >= 0;
+
+		# END TAG OPEN.
+		if ($c eq '/') {
+			my $d = substr($html, $lt + 2, 1);
+			if ($d =~ /\A[A-Za-z]\z/) {
+				# Parsed with the same quoting rules as a start tag so a
+				# '>' inside one of its (browser-ignored) attribute
+				# values cannot desynchronise the scan. The $end_tag
+				# flag suppresses the ATTRIBUTE findings - an end tag's
+				# attributes are discarded by the HTML parser - but not
+				# the tag-NAME one, so "</d{{v}}>" is reported exactly
+				# as "</{{v}}>" is.
+				(undef, $pos) = _scan_tag($html, $lt + 2, $len, \@findings, 1);
+			}
+			elsif ($d eq '>') {
+				$pos = $lt + 3;               # "</>" is discarded
+			}
+			else {
+				$pos = _skip_to_gt($html, $lt + 2, $len);
+			}
+			next;
 		}
+
+		# TAG OPEN: only an ASCII letter starts a tag.
+		if ($c =~ /\A[A-Za-z]\z/) {
+			my ($name, $after) = _scan_tag($html, $lt + 1, $len, \@findings, 0);
+			$pos = $after;
+
+			# RAW TEXT: a <script>/<style> body is not markup and not
+			# text - it is program source, where none of the five
+			# characters escape_html() handles means anything at all.
+			if ($name eq 'script' || $name eq 'style') {
+				my ($body, $next) = _scan_raw_text($html, $pos, $len, $name);
+				push @findings, "<$name> block" if index($body, '{{') >= 0;
+				$pos = $next;
+			}
+			next;
+		}
+
+		# A '<' followed by anything else is literal text to an HTML
+		# tokenizer ("5 < 6", "<{{v}}>"), not the start of a tag - the
+		# single most common source of false positives in a regex scan.
+		$pos = $lt + 1;
 	}
 
 	return @findings;
+}
+
+# _scan_tag($html, $p, $len, $findings, $end_tag) -> ($lc_name, $pos_after)
+#
+# $p points at the first character of the tag NAME. Mirrors HTML5's tag
+# name / before-attribute-name / attribute-name / after-attribute-name /
+# before-attribute-value / attribute-value(double|single|unquoted)
+# states. The whole point of walking these states rather than matching
+# them is that a '>' inside a quoted attribute value is an ordinary
+# character here (R45), and so is a '<'.
+sub _scan_tag {
+	my ($html, $p, $len, $findings, $end_tag) = @_;
+
+	# An end tag's attributes never become live, so they are parsed for
+	# position and not reported; its NAME still is.
+	my $attr_findings = $end_tag ? undef : $findings;
+
+	my $name_at = $p;
+	$p++ while $p < $len && substr($html, $p, 1) !~ m{[\s/>]};
+	my $raw_name = substr($html, $name_at, $p - $name_at);
+	my $name = lc $raw_name;
+
+	# R46 again, the in-tag half: "<d{{v}}>" with v = "iv onclick=..."
+	# is a live <div onclick=...>. Reported for end tags too, not
+	# because a substituted end-tag name can carry an attribute (it
+	# cannot - they are discarded) but so that "</{{v}}>" and
+	# "</d{{v}}>" cannot differ: an asymmetry there is the shape a
+	# future bypass grows in.
+	push @$findings, "placeholder in tag-name position ('<$raw_name')"
+		if index($raw_name, '{{') >= 0;
+
+	while ($p < $len) {
+		my $ch = substr($html, $p, 1);
+
+		# BEFORE ATTRIBUTE NAME. A stray '/' is skipped here, which is
+		# also how the solidus of a self-closing tag is consumed - and
+		# note that <div/onclick="{{v}}"> really does give the browser
+		# an onclick, with no whitespace anywhere before it.
+		if ($ch =~ /\s/ || $ch eq '/') { $p++; next; }
+		if ($ch eq '>')               { $p++; last; }
+
+		# ATTRIBUTE NAME: ends at whitespace, '/', '>' or '='. The first
+		# character is consumed unconditionally because an '=' in that
+		# position is part of the name per HTML5
+		# (unexpected-equals-sign-before-attribute-name), not a value
+		# separator.
+		my $name_start = $p;
+		$p++;
+		$p++ while $p < $len && substr($html, $p, 1) !~ m{[\s/>=]};
+		my $attr = substr($html, $name_start, $p - $name_start);
+
+		# AFTER ATTRIBUTE NAME / BEFORE ATTRIBUTE VALUE: whitespace is
+		# allowed on both sides of '=', including newlines.
+		my $q = $p;
+		$q++ while $q < $len && substr($html, $q, 1) =~ /\s/;
+		if ($q >= $len || substr($html, $q, 1) ne '=') {
+			_report_attribute($attr_findings, $attr, undef, 0);
+			next;                             # valueless attribute
+		}
+		$q++;
+		$q++ while $q < $len && substr($html, $q, 1) =~ /\s/;
+
+		my $quote = $q < $len ? substr($html, $q, 1) : '';
+		if ($quote eq '"' || $quote eq q{'}) {
+			# ATTRIBUTE VALUE (DOUBLE|SINGLE QUOTED): ends at the
+			# matching quote and at nothing else. '>' and '<' inside are
+			# data.
+			my $end = index($html, $quote, $q + 1);
+			if ($end < 0) {
+				_report_attribute($attr_findings, $attr, substr($html, $q + 1), 1);
+				return ($name, $len);         # eof-in-tag
+			}
+			_report_attribute($attr_findings, $attr, substr($html, $q + 1, $end - $q - 1), 1);
+			$p = $end + 1;
+		}
+		else {
+			# ATTRIBUTE VALUE (UNQUOTED): ends at whitespace or '>'.
+			# NOT at '/' - <img src={{x}}/> has the value "{{x}}/".
+			my $value_at = $q;
+			$q++ while $q < $len && substr($html, $q, 1) !~ m{[\s>]};
+			_report_attribute($attr_findings, $attr, substr($html, $value_at, $q - $value_at), 0);
+			$p = $q;
+		}
+	}
+
+	return ($name, $p);
+}
+
+# _report_attribute($findings, $name, $value, $quoted)
+#
+# The only place a judgement about safety is made. $value is undef for a
+# valueless attribute. $findings is undef when the caller is parsing for
+# position only (an end tag).
+sub _report_attribute {
+	my ($findings, $attr, $value, $quoted) = @_;
+	return unless defined $findings;
+
+	push @$findings, "placeholder used as an attribute name ('$attr')"
+		if index($attr, '{{') >= 0;
+
+	return unless defined $value;
+	return unless index($value, '{{') >= 0;
+
+	if (!$quoted) {
+		push @$findings, "unquoted attribute '$attr'";
+	}
+	elsif ($attr =~ /\Aon[A-Za-z]+\z/i) {
+		push @$findings, "event-handler attribute '$attr'";
+	}
+	elsif ($attr =~ /\A(?:href|src|action)\z/i) {
+		push @$findings, "URL-bearing attribute '$attr'";
+	}
+}
+
+# _scan_raw_text($html, $p, $len, $name) -> ($body, $pos_of_end_tag)
+#
+# HTML5 leaves a script/style raw-text element only at "</name" followed
+# by whitespace, '/' or '>' (or EOF). "</scriptx" is still script source
+# to a browser, so ending the body there would hand the rest of a live
+# script to the element-content rules, which consider it safe. The
+# returned position is the '<' of the end tag, so the caller's main loop
+# re-reads it as an end tag and parses it with the ordinary quoting
+# rules.
+sub _scan_raw_text {
+	my ($html, $p, $len, $name) = @_;
+
+	pos($html) = $p;
+	while ($html =~ m{</\Q$name\E}gi) {
+		my $hit  = $-[0];
+		my $next = pos($html);
+		my $after = $next < $len ? substr($html, $next, 1) : '';
+		next unless $after eq '' || $after =~ m{[\s/>]};
+		return (substr($html, $p, $hit - $p), $hit);
+	}
+	return (substr($html, $p), $len);
+}
+
+# _skip_declaration($html, $lt, $len) -> $pos_after
+#
+# COMMENT and everything else introduced by "<!". Comment content is
+# skipped, not scanned - see the "Deliberately NOT reported" note above
+# for why that is sound for the escaped marker and why it does not
+# extend to the raw one.
+sub _skip_declaration {
+	my ($html, $lt, $len) = @_;
+
+	if (substr($html, $lt, 4) eq '<!--') {
+		my $p = $lt + 4;
+		return $p + 1 if substr($html, $p, 1) eq '>';    # <!-->
+		return $p + 2 if substr($html, $p, 2) eq '->';   # <!--->
+		pos($html) = $p;
+		return pos($html) if $html =~ m{--!?>}g;         # --> and --!>
+		return $len;                                     # eof-in-comment
+	}
+
+	# <!DOCTYPE ...> and any other markup declaration: to an HTML parser
+	# this is a bogus comment, ended by the first '>'.
+	return _skip_to_gt($html, $lt + 2, $len);
+}
+
+sub _skip_to_gt {
+	my ($html, $p, $len) = @_;
+	my $gt = index($html, '>', $p);
+	return $gt < 0 ? $len : $gt + 1;
 }
 
 ###############################################################################
@@ -682,6 +935,157 @@ sub _html_files_under {
 		'and comes back byte-identical - Render.pm never treated the split braces as a placeholder either');
 }
 
+###############################################################################
+# R45 (fix round 4) and the rest of the context-tracking corpus.
+#
+# R45 is the finding that retired the regexes: round 3 scoped every
+# attribute check to a tag region captured by <[a-zA-Z][a-zA-Z0-9-]*([^>]*)>,
+# and [^>]* stops at the FIRST '>' in the tag - including one sitting
+# inside an earlier QUOTED attribute value, which is ordinary business
+# text ("Attempts > 5") next to a dynamic handler in the same tag. The
+# reviewer confirmed it live: no findings, and render() emitting a real
+# onclick. Every case below was run through BOTH the scanner and the
+# real render() before being written down (see task-6-report.md for the
+# full input/scanner/render() table), because "the scanner doesn't flag
+# it" and "render() cannot produce it" are different facts and only the
+# second one makes a gap safe.
+###############################################################################
+{
+	# Positive: things the scanner MUST catch, each one reachable -
+	# render() really does emit the live construct named.
+	my %must_flag = (
+		'R45: a > inside an earlier quoted value no longer truncates the tag'
+			=> ['<div title="Count > 5" onclick="{{v}}">x</div>',        qr/event-handler attribute 'onclick'/],
+		'R45: the reviewer\'s own stat-button shape'
+			=> [q{<button title="Attempts > {{max}}" onclick="retry('{{id}}')">go</button>}, qr/event-handler attribute 'onclick'/],
+		'R45: a > inside an earlier SINGLE-quoted value'
+			=> [q{<div title='a > b' onclick="{{v}}">x</div>},           qr/event-handler attribute 'onclick'/],
+		'R45: a > in an earlier value with an UNQUOTED dangerous attribute after it'
+			=> ['<a title="a > b" href={{evil}}>x</a>',                  qr/unquoted attribute 'href'/],
+		'a < inside an earlier quoted value is data, not a new tag'
+			=> ['<div title="a < b" onclick="{{v}}">x</div>',            qr/event-handler attribute 'onclick'/],
+		'an earlier quoted value containing a whole fake <script> tag'
+			=> ['<div title="<script>" onclick="{{v}}">x</div>',         qr/event-handler attribute 'onclick'/],
+		'no whitespace at all between two attributes'
+			=> ['<a href="{{evil}}"onclick="{{v}}">x</a>',               qr/event-handler attribute 'onclick'/],
+		'a stray solidus where the whitespace before an attribute would be'
+			=> ['<div/onclick="{{v}}">x</div>',                          qr/event-handler attribute 'onclick'/],
+		'an unquoted value ends at whitespace or >, never at the / of a self-closing tag'
+			=> ['<img src={{x}}/>',                                      qr/unquoted attribute 'src'/],
+		'"</scriptx" does not end a script body, so the {{ after it is still in script'
+			=> [q{<script>var a='</scriptx'; var b="{{v}}";</script>},   qr/script/],
+		'a DOCTYPE before the violation does not swallow it'
+			=> ['<!DOCTYPE html><a href="{{evil}}">x</a>',               qr/URL-bearing attribute 'href'/],
+		'a tag with no closing > at all is still reported (over-reports rather than under-reports)'
+			=> ['<div onclick="{{v}}"',                                  qr/event-handler attribute 'onclick'/],
+		'R46: a placeholder immediately after a < the template itself wrote'
+			=> ['<p>5 <{{v}}> 6</p>',                                    qr/tag-name position/],
+		'R46: a placeholder inside a tag NAME'
+			=> ['<d{{d}} title="x">y</d>',                               qr/tag-name position/],
+		'R46: a placeholder immediately after a </'
+			=> ['</{{d}}>',                                              qr/tag-name position/],
+		'R46: a placeholder inside an END-tag name, reported symmetrically'
+			=> ['</d{{d}}>',                                             qr/tag-name position/],
+		'R46: the raw marker in the same position'
+			=> ['<p><{{{v}}}></p>',                                      qr/tag-name position/],
+	);
+
+	for my $name (sort keys %must_flag) {
+		my ($html, $expect) = @{ $must_flag{$name} };
+		my @f = _find_unsafe_placeholders($html);
+		ok((grep { $_ =~ $expect } @f), "context scan: $name")
+			or diag("findings: " . (@f ? join('; ', @f) : '(none)'));
+	}
+
+	# The R45 case is reachable, not theoretical - the same proof the
+	# reviewer used: render() puts a live handler on the page.
+	my $r45 = render('<div title="Count > 5" onclick="{{v}}">x</div>', { v => 'alert(1)' });
+	like($r45, qr/onclick="alert\(1\)"/,
+		'render() confirms the R45 danger is real: the onclick after the in-value > is a live attribute');
+
+	# R46 is reachable too, and by the same mechanism as R41: the
+	# escaping never touches structure the TEMPLATE supplied.
+	# escape_html() escapes '<' and '>' inside a value - so a value can
+	# never invent a tag - but it escapes neither space nor '=' nor '/',
+	# so once the template has written the '<' itself the value supplies
+	# the tag name and every attribute after it.
+	my $r46 = render('<p>5 <{{v}}> 6</p>', { v => 'img src=x onerror=alert(1)' });
+	like($r46, qr/<img src=x onerror=alert\(1\)>/,
+		'render() confirms the R46 danger is real: a placeholder after the template\'s own < becomes a live tag');
+
+	# And the whitespace case beside it is genuinely safe, not merely
+	# unflagged: an HTML tokenizer emits a '<' followed by anything
+	# other than a letter, '!', '/' or '?' as a character token, so the
+	# escaped value next to it stays ordinary element content.
+	my $r46_safe = render('<p>a < b and {{v}}</p>', { v => 'img src=x onerror=alert(1)' });
+	like($r46_safe, qr/a < b and img src=x onerror=alert\(1\)</,
+		'and "< {{v}}" with whitespace between is text to a tokenizer, which is why it is not flagged');
+
+	# Negative: ordinary things a stats screen writes, plus every
+	# construct the tokenizer now understands well enough NOT to flag.
+	# Each of these was round-tripped through render() too; none can
+	# produce a live handler or URL from a substituted value.
+	my %must_not_flag = (
+		'a commented-out handler is inert markup (the round-3 false positive)'
+			=> '<!-- <button onclick="{{oldVal}}">Old</button> -->',
+		'a commented-out <script> is inert too'
+			=> '<!-- <script>{{v}}</script> -->',
+		'a downlevel-revealed conditional comment is just a comment'
+			=> '<!--[if IE]><script>{{v}}</script><![endif]-->',
+		'a < in prose is text, not a tag'
+			=> '<p>a < b and {{v}} too</p>',
+		'a stat line whose prose contains a > comparison'
+			=> '<p>Blocked > {{max}} attempts</p>',
+		'a placeholder in a table cell'
+			=> '<td>{{value}}</td>',
+		'an = inside a <pre>'
+			=> '<pre>key = {{value}}</pre>',
+		'prose that happens to contain src='
+			=> '<p>Try src="{{url}}" in config</p>',
+		'an ordinary quoted attribute that is neither a handler nor a URL'
+			=> '<div class="{{value}}">x</div>',
+		'an aria-label carrying a value'
+			=> '<button aria-label="Unblock {{id}}">x</button>',
+		'a placeholder in a <title>'
+			=> '<title>{{title}} - CSF</title>',
+		'an end tag\'s attributes are discarded by the HTML parser'
+			=> '</div onclick="{{v}}">',
+		'a > inside an UNQUOTED value ends the tag, exactly as a browser ends it'
+			=> '<div title=a>b onclick="{{v}}">x</div>',
+		'"<!--" inside a tag is an attribute NAME, and the --> closes the tag'
+			=> '<div <!-- -->onclick="{{v}}">x</div>',
+		'a < followed by a digit starts nothing'
+			=> '<1div onclick="{{v}}">',
+	);
+
+	for my $name (sort keys %must_not_flag) {
+		my @f = _find_unsafe_placeholders($must_not_flag{$name});
+		is_deeply(\@f, [], "context scan: not flagged - $name")
+			or diag("unexpected findings: " . join('; ', @f));
+	}
+
+	# Why skipping comment content is sound rather than merely
+	# convenient, proved against the real escape_html() rather than
+	# asserted: EVERY way HTML5 ends a comment ("-->", "--!>", the
+	# abrupt "<!-->"/"<!--->" forms) needs a literal '>', escape_html()
+	# turns '>' into "&gt;", and entities are not decoded inside a
+	# comment - so a substituted value cannot close the comment it sits
+	# in and reach live markup.
+	my $comment_out = render('<!-- {{v}} -->', { v => '--> <img src=x onerror=alert(1)>' });
+	like($comment_out, qr/--&gt; &lt;img src=x onerror=alert\(1\)&gt;/,
+		'comment safety: an escaped value carrying "-->" comes out with its > escaped');
+	my $terminators = () = $comment_out =~ m{--!?>}g;
+	is($terminators, 1,
+		'comment safety: the rendered comment still has exactly one terminator - the template\'s own, not one the value supplied');
+
+	# And the argument above covers the ESCAPED marker only. The raw
+	# marker escapes nothing, so comment position must not exempt it -
+	# _find_unauthorized_raw_markers() is context-free for exactly this
+	# reason, and here is the proof it reaches inside a comment.
+	my @raw_in_comment = _find_unauthorized_raw_markers('<!-- {{{v}}} -->', 'ui-src/web/layout.html');
+	ok((grep { /\{\{\{v\}\}\}/ } @raw_in_comment),
+		'comment safety does NOT extend to the raw marker: {{{v}}} inside a comment is still flagged');
+}
 # R42: the raw-marker allowlist, tested directly against
 # _find_unauthorized_raw_markers() rather than only through real files,
 # plus the exact embedded-</script> scenario that motivated it, run
@@ -776,7 +1180,7 @@ sub _html_files_under {
 			. "Fix: move the value out of that position, don't reach for the raw {{{ }}} marker instead - "
 			. "neither marker is safe there. A URL should be a literal this codebase wrote, not a substituted "
 			. "value; server-rendered HTML should not have inline event-handler attributes at all; a placeholder "
-			. "must never be the NAME of an attribute, only (sometimes) its value; the raw {{{ }}} marker is only "
+			. "must never be the NAME of an attribute nor any part of a TAG name, only (sometimes) an attribute's value; the raw {{{ }}} marker is only "
 			. "authorised for layout.html's own nav/content slots - if a screen genuinely needs to insert raw HTML "
 			. "it built itself, add it to \%RAW_MARKER_ALLOWLIST in this file and say why in the same commit; and "
 			. "dynamic data a <script> needs should be placed OUTSIDE the <script> tag (a data-* attribute the "

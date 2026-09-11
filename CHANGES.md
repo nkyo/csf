@@ -37,6 +37,56 @@ line is added below the original notice; the original stays intact.
 
 ### Unreleased
 
+#### Task 6 fix round 4 — the context scanner is no longer built out of regular expressions
+
+- **2026-09-11** — Re-review of fix round 3 found R43's fix unsound: scoping every attribute check
+  to a tag region captured by `<[a-zA-Z][a-zA-Z0-9-]*([^>]*)>` meant `[^>]*` stopped at the *first*
+  `>` in the tag, including one inside an earlier **quoted** attribute value. Confirmed live:
+  `<div title="Count > 5" onclick="{{v}}">` produced no findings while `render()` emitted a real
+  `onclick="alert(1)"` — ordinary business text (a `>` comparison in a label) beside a dynamic
+  handler in the same tag, exactly the shape a screen author writes. That was a regression from
+  round 2, whose unscoped regex would have caught it.
+
+  Rather than patch the regex again (the recommended round-4 patch, alternating
+  `"[^"]*"|'[^']*'|[^>]` inside the repetition, is only the next approximation — it still cannot
+  tell a comment from markup, nor see that a `<` inside an attribute value is not a new tag), the
+  scanner was **replaced with an explicit single-pass scan that tracks context**: element content,
+  inside a tag, inside a quoted or unquoted attribute value, inside a comment or other markup
+  declaration, inside a `<script>`/`<style>` raw-text body. It follows the HTML5 tokenizer's own
+  state transitions for the subset that decides those boundaries. The reason is structural, not
+  stylistic: each of rounds 1–3 introduced its bypass inside the fix for the previous bypass,
+  because HTML is not a regular language and "where am I in this document" is not a question a
+  regular expression can answer — there is no patch sequence that converges, only the next
+  construction nobody thought of.
+
+  Closed by the replacement, each verified against both the scanner and the real `render()`: the
+  truncating `>` in any earlier quoted value (R45, all quote styles); a `<` inside an attribute
+  value; two attributes with no whitespace between them (`<a href="{{v}}"onclick="{{v}}">`, live to
+  a browser, invisible to every earlier round's `\s`-anchored patterns); a stray `/` where that
+  whitespace would be (`<div/onclick="{{v}}">`, same); `</scriptx` not ending a script body; a tag
+  whose attribute value contains a whole fake `<script>`.
+
+  **R46, found while probing the new scan and fixed in the same round** — a placeholder in
+  **tag-name position**: `<{{v}}`, `</{{v}}` or `<d{{v}}`. `escape_html()` escapes `<` and `>` in a
+  *value*, so a value can never invent a tag; but where the *template* wrote the `<` itself, the
+  value supplies the tag name and every attribute after it, because `escape_html()` escapes neither
+  space nor `=` nor `/`. Confirmed live: `<p>5 <{{v}}> 6</p>` with `v = "img src=x
+  onerror=alert(1)"` renders exactly that `img`. Missed by every earlier round — the question it
+  asks is about the *output's* structure, not the template's. `< {{v}}` with whitespace between is
+  not this and is not flagged: an HTML tokenizer emits that `<` as a character token.
+
+  Also resolved naturally rather than by a special case: round 3's known false positive on a
+  commented-out `<!-- <button onclick=...> -->`. Comment content is now skipped, and soundly — every
+  way HTML5 ends a comment (`-->`, `--!>`, the abrupt `<!-->`/`<!--->` forms, EOF) needs a literal
+  `>`, `escape_html()` turns `>` into `&gt;`, and entities are not decoded inside a comment, so a
+  substituted value cannot close the comment it sits in. That argument covers the escaped marker
+  only, which is why `_find_unauthorized_raw_markers()` stays context-free and still reports a
+  `{{{key}}}` inside a comment.
+
+  No change to `Render.pm`'s escaping behaviour, to the screens, or to the raw-marker allowlist's
+  contents. `t/50-render.t`: 115 → 153 assertions. Whole suite: **1560 tests** (was 1522),
+  `prove -I. t/`.
+
 #### Task 6 fix round 3 — the fix for R40 itself had two more holes, plus a false positive that would have gotten it disabled
 
 - **2026-09-11** — Re-review of fix round 2's scanner confirmed R40 (`<a href={{evil}}>` now flags,
