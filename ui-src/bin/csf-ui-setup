@@ -694,6 +694,20 @@ sub apply {
 		}
 	}
 
+	# CAN these files be written at all? Asked before either is committed,
+	# and asked by actually creating and renaming a file rather than by
+	# consulting -w (task-8-review.md C10). The residual window between the
+	# two renames is covered by the armed timer and cannot be closed without
+	# a journal - but a read-only /etc, a full filesystem or a directory
+	# this process cannot write are FORESEEABLE, and a foreseeable failure
+	# deserves a check of its own rather than a net.
+	for my $target ($self->{csf_conf}, (length $ui_text ? ($self->{ui_conf}) : ())) {
+		my $probe = $self->{rollback}->writable_probe($target);
+		next if $probe->{ok};
+		return { ok => 0, reason => "nothing was applied: $probe->{reason}",
+			problems => [], snapshot => $snapshot->{dir}, armed => 1 };
+	}
+
 	my $csf_text = _slurp($self->{csf_conf});
 	return { ok => 0, reason => "$self->{csf_conf} could not be read", snapshot => $snapshot->{dir}, problems => [] }
 		unless defined $csf_text;
@@ -709,8 +723,14 @@ sub apply {
 	push @step, "csf.conf: " . scalar(keys %csf) . ' settings written (TESTING=1, TESTING_INTERVAL=' . $FORCED_TESTING_INTERVAL . ')';
 
 	if (length $ui_text) {
+		# 0640 root:csfui - docs/WEBUI-RPC.md section 2.3, frozen, and the
+		# ownership is the half that is easy to leave out and impossible to
+		# notice from here: the startup gate this program runs above is run
+		# BY ROOT, and root can read a root:root file perfectly well. The
+		# process that will actually read this file execs as csfui.
 		my $ui_wrote = $self->{rollback}->write_atomic($self->{ui_conf}, $ui_text,
 			mode     => 0640,
+			group    => $ConfigServer::UI::Rollback::UI_CONF_GROUP,
 			validate => sub { return validate_ui_conf($_[0]) });
 		unless ($ui_wrote->{ok}) {
 			return { ok => 0, reason => "ui.conf was left unchanged: $ui_wrote->{reason}",
@@ -720,16 +740,50 @@ sub apply {
 		push @step, 'ui.conf: ' . scalar(keys %ui) . ' settings written and accepted by csf-ui\'s own startup gate';
 	}
 
+	my @warning;
 	my $csf_binary = $self->{firewall}->locate('csf');
+	my $restarted = 0;
 	if ($csf_binary) {
 		my $restart = $self->{firewall}->run($csf_binary, '-r');
-		my $ok = (!$restart->{error} && !$restart->{timeout} && !$restart->{signal}
+		$restarted = (!$restart->{error} && !$restart->{timeout} && !$restart->{signal}
 			&& defined $restart->{exit} && $restart->{exit} == 0) ? 1 : 0;
-		push @step, $ok ? 'csf -r: the new configuration is in force'
+		push @step, $restarted ? 'csf -r: the new configuration is in force'
 			: 'csf -r: FAILED - the rollback timer will restore the previous configuration unless you confirm';
 	}
 	else {
 		push @step, 'csf: binary not found, so the new configuration is on disk but not in force';
+	}
+
+	# THE CONFIRMATION ROUTE, WHICH THE APPLY ITSELF HAS JUST DESTROYED.
+	#
+	# csf -r is dostop;dostart (csf.pl:125), and dostop FLUSHES - including
+	# the INPUT 1 rule the wizard added to let the operator reach it. This
+	# tier serves one request per connection and implements no keep-alive,
+	# so the next thing the operator does - POST /confirm - is a NEW
+	# connection, to a port that is no longer open. Without this step the
+	# rollback always fires and setup over the temporary port can never
+	# succeed: the route that exists to confirm the apply is destroyed by
+	# the apply.
+	#
+	# Re-asserted here rather than in the wizard because the wizard is a
+	# DIFFERENT PROCESS - it re-invokes this program to apply (see THE NAME
+	# in the header) - so this child is the only thing that knows csf has
+	# just been restarted. The two halves meet at the state file.
+	if ($csf_binary) {
+		my $again = $self->reassert_temporary_port;
+		if ($again) {
+			if ($again->{ok}) {
+				push @step, $again->{restored}
+					? 'temporary port: csf -r flushed the wizard rule; it has been put back and read back again'
+					: 'temporary port: the wizard rule survived csf -r and is still in place';
+			}
+			else {
+				push @step, 'temporary port: COULD NOT be re-established after csf -r - ' . $again->{reason};
+				push @warning, 'The port you reached this wizard on is now closed, because restarting csf '
+					. 'flushed the rule and it could not be added again. Confirm from a shell instead: '
+					. 'csf-ui-setup --confirm - otherwise the rollback timer will undo this apply.';
+			}
+		}
 	}
 
 	return {
@@ -738,8 +792,88 @@ sub apply {
 		armed    => 1,
 		window   => $armed->{window},
 		steps    => \@step,
+		warnings => \@warning,
 		problems => [],
 	};
+}
+
+###############################################################################
+# reassert_temporary_port() -> undef (there was no temporary port)
+#                           | { ok => 1, restored => 0|1 }
+#                           | { ok => 0, reason => ... }
+#
+# Idempotent, and it ASKS BEFORE IT ACTS: if the recorded rule is still in
+# the backend's own listing, nothing is added - which is what keeps this safe
+# to call when csf was never restarted, and what stops it stacking a second
+# copy of a rule that only one close_port() would ever remove.
+#
+# When it does re-add, it stores the NEW read-back, not the old string: the
+# rule is a new rule, and the canonical form has to come from the backend
+# that is showing it now. And a rule that cannot be recorded is taken back
+# out immediately - an unrecorded rule is a hole nothing will ever close.
+###############################################################################
+###############################################################################
+# record_offer($offer) -> $offer, or a refusal that replaces it
+#
+# THE RECORD IS PART OF OPENING THE PORT, NOT A NOTE ABOUT IT
+# (task-8-review.md C3). --cleanup, the two signal handlers and the END block
+# all close the port by READING THE STATE FILE; if the write failed and
+# nothing checked, the rule would be installed with nothing on the system
+# that knows it exists, and a session that then died badly would leave the
+# hole open permanently, with no record anywhere to find it by.
+#
+# So a failed write closes the port again at once and turns the offer into a
+# refusal - which costs the operator nothing, because the fallback is the SSH
+# tunnel and that always works.
+#
+# Extracted from cmd_web() so it is testable: cmd_web() needs root and a real
+# listening socket, and this decision needs neither.
+###############################################################################
+sub record_offer {
+	my ($self, $offer) = @_;
+	return $offer unless ref($offer) eq 'HASH' && $offer->{ok} && ref($offer->{spec}) eq 'HASH';
+
+	my $saved = $self->save_state($offer->{spec});
+	return $offer if $saved->{ok};
+
+	my $closed = $self->{firewall}->close_port($offer->{spec});
+	return {
+		ok     => 0,
+		code   => 'E_NO_STATE',
+		reason => 'the temporary rule could not be recorded, and a rule nothing is tracking is a rule nothing will close',
+		note   => "the temporary rule could not be recorded ($saved->{reason}), so it was "
+			. ($closed->{ok}
+				? 'removed again'
+				: 'left in place and MUST be removed by hand: '
+					. (defined $closed->{manual} ? $closed->{manual} : $closed->{reason})),
+	};
+}
+
+sub reassert_temporary_port {
+	my ($self) = @_;
+
+	my $spec = $self->load_state or return undef;
+
+	my ($present, $why) = $self->{firewall}->rule_present($spec);
+	unless (defined $present) {
+		return { ok => 0, reason => "whether the wizard rule is still installed could not be determined: $why" };
+	}
+	return { ok => 1, restored => 0 } if $present;
+
+	my $again = $self->{firewall}->open_port(port => $spec->{port}, address => $spec->{address});
+	unless ($again->{ok}) {
+		return { ok => 0, reason => $again->{reason}, code => $again->{code} };
+	}
+
+	my $saved = $self->save_state($again->{spec});
+	unless ($saved->{ok}) {
+		my $closed = $self->{firewall}->close_port($again->{spec});
+		return { ok => 0, reason => 'the rule was added again but could not be recorded ('
+			. $saved->{reason} . '), so it was '
+			. ($closed->{ok} ? 'removed again rather than left with nothing tracking it'
+			                 : 'left in place and MUST be removed by hand: ' . (defined $closed->{manual} ? $closed->{manual} : $closed->{reason})) };
+	}
+	return { ok => 1, restored => 1 };
 }
 
 # The ui.conf candidate, judged by the same gate that will judge it at
@@ -751,9 +885,18 @@ sub apply {
 sub _precheck_ui_conf {
 	my ($self, $ui_text) = @_;
 
-	_make_state_dir($self->{state_dir});
+	my ($made, $why) = _make_state_dir($self->{state_dir});
+	return (0, ["the state directory $self->{state_dir} could not be created: $why"]) unless $made;
+
+	# The probe is written with the SAME mode and the SAME group the real
+	# file will get, so the dry run exercises the gid lookup and the chown
+	# as well as the content. A missing csfui group is exactly as
+	# foreseeable as a read-only /etc (task-8-review.md C10) and deserves
+	# the same treatment: found before csf.conf is committed, not after.
 	my $probe = "$self->{state_dir}/ui.conf.candidate";
-	my $wrote = $self->{rollback}->write_atomic($probe, $ui_text, mode => 0600);
+	my $wrote = $self->{rollback}->write_atomic($probe, $ui_text,
+		mode  => 0640,
+		group => $ConfigServer::UI::Rollback::UI_CONF_GROUP);
 	return (0, [$wrote->{reason}]) unless $wrote->{ok};
 
 	my ($ok, $problems) = validate_ui_conf($probe);
@@ -983,7 +1126,12 @@ sub _do_apply {
 	# keeps a fault in this web tier from being a fault in the firewall's
 	# configuration.
 	my $path = $self->answers_path;
-	_make_state_dir($self->{state_dir});
+	my ($made, $made_why) = _make_state_dir($self->{state_dir});
+	unless ($made) {
+		return $self->_page_wizard($request, $args,
+			message => _problem_block('Nothing was changed.',
+				["the state directory $self->{state_dir} could not be created: $made_why"]), %raw);
+	}
 	my $wrote = $self->{rollback}->write_atomic($path, $text, mode => 0600);
 	unless ($wrote->{ok}) {
 		return $self->_page_wizard($request, $args,
@@ -1398,7 +1546,9 @@ sub save_state {
 		$value =~ s/["\n\r]//g;
 		$text .= uc($key) . qq{="$value"\n};
 	}
-	_make_state_dir($self->{state_dir});
+	my ($made, $why) = _make_state_dir($self->{state_dir});
+	return { ok => 0, reason => "the state directory $self->{state_dir} could not be created: $why" }
+		unless $made;
 	return $self->{rollback}->write_atomic($self->state_path, $text, mode => 0600);
 }
 
@@ -1416,15 +1566,18 @@ sub load_state {
 	return \%spec;
 }
 
+# The state directory itself is private (0700: it holds the record of an
+# open firewall rule), but ITS PARENTS ARE NOT ITS TO NARROW.
+# /var/lib/csf-ui is frozen at 0755 by docs/WEBUI-RPC.md section 2.3 because
+# csfui has to traverse it to reach its own session store, and creating
+# /var/lib/csf-ui/setup at 0700 all the way down would have put a wall in
+# front of a directory this program does not own (task-8-review.md C6).
+# ConfigServer::UI::Rollback::make_path() is the one implementation of that
+# distinction; there is no second copy of it here.
 sub _make_state_dir {
 	my ($dir) = @_;
-	my $so_far = '';
-	for my $part (split(m{/}, $dir)) {
-		next if $part eq '';
-		$so_far .= "/$part";
-		mkdir($so_far, 0700) unless -d $so_far;
-	}
-	return -d $dir ? 1 : 0;
+	my $why = ConfigServer::UI::Rollback::make_path($dir, mode => 0700, parent_mode => 0755);
+	return defined $why ? (0, $why) : (1, undef);
 }
 
 ###############################################################################
@@ -1448,7 +1601,12 @@ sub cleanup {
 			push @done, $closed->{removed}
 				? 'the temporary firewall rule was removed'
 				: 'the temporary firewall rule was already gone';
-			unlink $self->state_path;
+			# Checked: a record that outlives the rule is harmless (the next
+			# --cleanup reads it, finds nothing, and says so) but claiming to
+			# have tidied up when the file is still there is how the next
+			# session inherits a puzzle.
+			push @done, 'the record at ' . $self->state_path . " could not be removed: $!"
+				unless unlink $self->state_path;
 		}
 		else {
 			push @done, 'the temporary firewall rule could NOT be removed: ' . $closed->{reason}
@@ -1629,7 +1787,10 @@ sub cmd_web {
 
 	my $address = $self->operator_address;
 	my $offer = $self->offer_port(address => $address);
-	$self->save_state($offer->{spec}) if $offer->{ok};
+
+	my $offer_recorded = $self->record_offer($offer);
+	print STDERR "csf-ui-setup: $offer_recorded->{note}\n" if $offer_recorded->{note};
+	$offer = $offer_recorded;
 
 	my $plan = $self->listen_plan($offer);
 	$self->{tls_in_use} = $plan->{tls};

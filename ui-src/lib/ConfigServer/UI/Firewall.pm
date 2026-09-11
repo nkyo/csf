@@ -250,9 +250,25 @@ sub _run_argv {
 		if (length($output) > $MAX_CHILD_OUTPUT) { $overflow = 1; last }
 	}
 
+	# kill's result is deliberately unread: the only reason it fails is ESRCH,
+	# meaning the child is already dead, which is the state being asked for.
 	if ($timeout || $overflow) { kill('KILL', $pid) }
 	close $reader;
-	waitpid($pid, 0);
+
+	# waitpid IS read. $? is a global, and if waitpid did not actually reap
+	# THIS child (-1: no such process, because a stray SIGCHLD handler got
+	# there first) then $? still holds whatever the last reaped child left
+	# in it - which would be read here as an exit status for a command whose
+	# outcome is in fact unknown. On this path that would mean believing an
+	# iptables mutation succeeded on the strength of some other process's
+	# exit code.
+	my $reaped = waitpid($pid, 0);
+	return {
+		exit => -1, signal => 0, output => $output,
+		timeout => $timeout, overflow => $overflow,
+		error => 'the child could not be reaped, so its exit status is unknown',
+	} if $reaped != $pid;
+
 	my $raw = $?;
 
 	return {
@@ -359,33 +375,81 @@ sub _detect_firewalld {
 	my ($self, $log) = @_;
 
 	my $cmd = $self->locate('firewall-cmd');
+	my $systemd_says = $self->_firewalld_per_systemctl($log);
+
 	if ($cmd) {
 		my $state = $self->_probe($log, $cmd, '--state');
-		# --state exits non-zero when firewalld is not running, which is a
-		# perfectly ordinary answer and not a failure of the probe.
-		if (_ok($state) && $state->{output} =~ /^\s*running\b/m) {
+
+		return {
+			backend => 'firewalld',
+			reason  => "firewall-cmd --state reports firewalld running (via $cmd)",
+			tool    => $cmd,
+		} if _ok($state) && $state->{output} =~ /^\s*running\b/m;
+
+		# EVERY OTHER ANSWER IS NOT "not running" (task-8-review.md C5).
+		# firewall-cmd exits 252 - NOT_RUNNING - and says so when firewalld
+		# is simply stopped. A different failure means the question was not
+		# answered: the daemon is unreachable, dbus is not there, the
+		# binary is wedged. Treating that as "not running" and falling
+		# through hands back iptables-nft with certain => 1 on a host
+		# where firewalld may well be holding the ruleset - a confident
+		# wrong answer, which is strictly worse than unknown, because
+		# unknown is the safe path and this one writes a rule.
+		my $says_not_running = ($state->{exit} == 252)
+			|| ($state->{output} =~ /not\s+running/i) ? 1 : 0;
+
+		unless ($says_not_running) {
 			return {
-				backend => 'firewalld',
-				reason  => "firewall-cmd --state reports firewalld running (via $cmd)",
-				tool    => $cmd,
+				backend => 'unknown',
+				reason  => "firewall-cmd --state neither confirmed nor denied that firewalld is running (exit $state->{exit}: "
+					. _first_line($state->{output}) . '), so whether firewalld holds this ruleset is unanswered',
 			};
 		}
-		return undef;   # firewalld is installed but not running; keep looking
-	}
 
-	my $systemctl = $self->locate('systemctl');
-	return undef unless $systemctl;
-	my $active = $self->_probe($log, $systemctl, 'is-active', 'firewalld');
-	# is-active exits non-zero for anything but "active", so read the word,
-	# not the status: "activating" is firewalld coming up and is exactly as
-	# unsafe to write underneath as "active".
-	if ($active->{output} =~ /^\s*(?:active|activating)\s*$/m) {
+		# firewall-cmd says stopped and systemd says running. One of them
+		# is wrong and this code cannot tell which, which is the definition
+		# of the case it must decline.
 		return {
 			backend => 'unknown',
-			reason  => 'firewalld is running but firewall-cmd is not installed, so a rule could be added but not read back or removed',
-		};
+			reason  => 'firewall-cmd --state says firewalld is not running but systemctl says it is; the two disagree and this cannot tell which is right',
+		} if $systemd_says eq 'running';
+
+		return undef;   # genuinely not running; keep looking
 	}
+
+	# No firewall-cmd at all. Now systemd is the only witness, and two of
+	# its three answers are refusals: a firewalld that is running cannot be
+	# read back from or removed from without its client tool, and a
+	# firewalld whose state could not be read is the same unanswered
+	# question as above.
+	return {
+		backend => 'unknown',
+		reason  => 'firewalld is running but firewall-cmd is not installed, so a rule could be added but not read back or removed',
+	} if $systemd_says eq 'running';
+
+	return {
+		backend => 'unknown',
+		reason  => 'whether firewalld is running could not be determined, and firewall-cmd is not installed to ask it directly',
+	} if $systemd_says eq 'unclear';
+
 	return undef;
+}
+
+# 'running' | 'stopped' | 'unclear' | 'absent'
+#
+# The WORD is what is read, not the exit status: systemctl is-active exits
+# non-zero for anything but "active", including "activating" - and a
+# firewalld in the middle of starting is exactly as unsafe to write
+# underneath as one that has finished.
+sub _firewalld_per_systemctl {
+	my ($self, $log) = @_;
+
+	my $systemctl = $self->locate('systemctl') or return 'absent';
+	my $active = $self->_probe($log, $systemctl, 'is-active', 'firewalld');
+
+	return 'running' if $active->{output} =~ /^\s*(?:active|activating|reloading)\s*$/m;
+	return 'stopped' if $active->{output} =~ /^\s*(?:inactive|deactivating|failed|unknown)\s*$/m;
+	return 'unclear';
 }
 
 ###############################################################################
@@ -601,6 +665,20 @@ sub _decline {
 	return { ok => 0, code => $code, reason => $reason };
 }
 
+# The best-effort undo, after a rule was added and could not be read back.
+# Its RESULT is not ignored, even though the outcome is a refusal either way
+# - because the two refusals mean different things to the operator. "Added
+# something and took it back out" needs nothing from them. "Added something,
+# cannot see it, and could not take it back out" is a rule installed on their
+# machine that nothing is tracking and nothing will ever remove, and it has
+# to be said out loud with the command to run.
+sub _undo_note {
+	my ($undone, $command) = @_;
+	return '; the rule that was added has been removed again' if $undone;
+	return '; WORSE, it could not be removed again either - a rule may be installed that nothing is tracking. Remove it by hand: '
+		. $command;
+}
+
 # A port the wizard could actually be listening on. Below 1024 is refused
 # for the same reason docs/WEBUI-RPC.md S10 refuses it for UI_PORT, and
 # because a temporary hole in a privileged port is a different conversation
@@ -704,8 +782,8 @@ sub _open_iptables {
 		my @undo = ($binary, @wait, '-D', 'INPUT',
 			'-s', $address, '-p', 'tcp', '--dport', $port,
 			'-m', 'comment', '--comment', $RULE_COMMENT, '-j', 'ACCEPT');
-		$self->run(@undo);
-		return _decline('E_READBACK', $problem);
+		my $undone = $self->run(@undo);
+		return _decline('E_READBACK', $problem . _undo_note(_ok($undone), join(' ', @undo)));
 	}
 
 	return { ok => 1, spec => {
@@ -773,8 +851,8 @@ sub _open_firewalld {
 
 	my ($canonical, $problem) = $self->_firewalld_find($cmd, $port, $address);
 	unless (defined $canonical) {
-		$self->run($cmd, '--remove-rich-rule=' . $rule);
-		return _decline('E_READBACK', $problem);
+		my $undone = $self->run($cmd, '--remove-rich-rule=' . $rule);
+		return _decline('E_READBACK', $problem . _undo_note(_ok($undone), "$cmd --remove-rich-rule='$rule'"));
 	}
 
 	return { ok => 1, spec => {
@@ -831,9 +909,10 @@ sub _open_ufw {
 
 	my ($canonical, $problem) = $self->_ufw_find($ufw, $port, $address);
 	unless (defined $canonical) {
-		$self->run($ufw, '--force', 'delete', 'allow', 'from', $address,
+		my @undo = ($ufw, '--force', 'delete', 'allow', 'from', $address,
 			'to', 'any', 'port', $port, 'proto', 'tcp');
-		return _decline('E_READBACK', $problem);
+		my $undone = $self->run(@undo);
+		return _decline('E_READBACK', $problem . _undo_note(_ok($undone), join(' ', @undo)));
 	}
 
 	return { ok => 1, spec => {
@@ -951,38 +1030,125 @@ sub _argv_from_canonical {
 	return ([ '-D', $chain, @argument ], undef);
 }
 
+###############################################################################
+# _current($self, \%spec) - the single read-back.
+#
+#   { ok => 1, found => 0|1, line => '...', index => N, ambiguous => N }
+#   { ok => 0, reason => '...' }
+#
+# Factored out because THREE callers need the same fact from the backend and
+# three copies of "look for the stored canonical in a fresh listing" is three
+# places for the rule to drift. close_port() needs the line (or the index) to
+# act on; rule_present() needs only whether it is there; and the temporary
+# port's re-assertion after csf -r needs the same answer again. One
+# implementation, one set of failure messages.
+###############################################################################
+sub _current {
+	my ($self, $spec) = @_;
+
+	my $kind = defined $spec->{kind} ? $spec->{kind} : '';
+	return $self->_current_iptables($spec)  if $kind eq 'iptables';
+	return $self->_current_firewalld($spec) if $kind eq 'firewalld';
+	return $self->_current_ufw($spec)       if $kind eq 'ufw';
+	return { ok => 0, code => 'E_SPEC',
+		reason => "the stored rule specification names backend kind '$kind', which this code cannot read back" };
+}
+
+sub _current_iptables {
+	my ($self, $spec) = @_;
+
+	my $binary = $spec->{binary};
+	return { ok => 0, code => 'E_SPEC', reason => 'the stored rule specification names no iptables binary' }
+		unless defined $binary && length $binary;
+
+	my @wait = (ref($spec->{wait}) eq 'ARRAY') ? @{ $spec->{wait} } : ();
+	my $list = $self->run($binary, @wait, '-S', $spec->{chain} || 'INPUT');
+	return { ok => 0, reason => 'iptables -S would not run, so the rule this session added can be neither confirmed present nor removed' }
+		unless _ok($list);
+
+	my ($line) = grep { $_ eq $spec->{canonical} }
+		map { my $l = $_; $l =~ s/\s+\z//; $l } split(/\n/, $list->{output});
+
+	return { ok => 1, found => (defined $line ? 1 : 0), line => $line };
+}
+
+sub _current_firewalld {
+	my ($self, $spec) = @_;
+
+	my $cmd = $spec->{binary};
+	return { ok => 0, code => 'E_SPEC', reason => 'the stored rule specification names no firewall-cmd binary' }
+		unless defined $cmd && length $cmd;
+
+	my $list = $self->run($cmd, '--list-rich-rules');
+	return { ok => 0, reason => 'firewall-cmd --list-rich-rules would not run, so the rule this session added can be neither confirmed present nor removed' }
+		unless _ok($list);
+
+	my ($line) = grep { $_ eq $spec->{canonical} }
+		map { my $l = $_; $l =~ s/^\s+//; $l =~ s/\s+\z//; $l } split(/\n/, $list->{output});
+
+	return { ok => 1, found => (defined $line ? 1 : 0), line => $line };
+}
+
+sub _current_ufw {
+	my ($self, $spec) = @_;
+
+	my $ufw = $spec->{binary};
+	return { ok => 0, code => 'E_SPEC', reason => 'the stored rule specification names no ufw binary' }
+		unless defined $ufw && length $ufw;
+
+	my $list = $self->run($ufw, 'status', 'numbered');
+	return { ok => 0, reason => 'ufw status numbered would not run, so the rule this session added can be neither confirmed present nor removed' }
+		unless _ok($list);
+
+	my @match = grep { $_->{canonical} eq $spec->{canonical} }
+		@{ _ufw_parse_numbered($list->{output}) };
+
+	return { ok => 1, found => 0 } unless @match;
+	return { ok => 1, found => 1, ambiguous => scalar(@match) } if @match > 1;
+	return { ok => 1, found => 1, line => $match[0]{canonical}, index => $match[0]{index} };
+}
+
+###############################################################################
+# rule_present($self, \%spec) -> (1 | 0 | undef, $why_undef)
+#
+# 1 the backend is showing this exact rule right now; 0 it is not; undef the
+# backend could not be asked. undef is NOT 0: "there is no rule" and "I could
+# not find out whether there is a rule" lead to opposite actions, and
+# collapsing them is how a caller adds a second copy of a rule it already has.
+###############################################################################
+sub rule_present {
+	my ($self, $spec) = @_;
+
+	return (undef, 'no rule specification was given')
+		unless ref($spec) eq 'HASH' && defined $spec->{canonical} && length $spec->{canonical};
+
+	my $current = $self->_current($spec);
+	return (undef, $current->{reason}) unless $current->{ok};
+	return ($current->{found} ? 1 : 0, undef);
+}
+
 sub _close_iptables {
 	my ($self, $spec) = @_;
 
 	my $binary = $spec->{binary};
 	my @wait = (ref($spec->{wait}) eq 'ARRAY') ? @{ $spec->{wait} } : ();
 
-	return _decline('E_SPEC', 'the stored rule specification names no iptables binary')
-		unless defined $binary && length $binary;
+	my $current = $self->_current($spec);
+	return { ok => 0, code => ($current->{code} || 'E_READBACK'), reason => $current->{reason} }
+		unless $current->{ok};
 
-	my $list = $self->run($binary, @wait, '-S', $spec->{chain} || 'INPUT');
-	return _decline('E_READBACK',
-		'iptables -S would not run, so the rule this session added cannot be confirmed present or removed',
-		)
-		unless _ok($list);
-
-	# The line is taken from THIS listing, not from $spec. $spec->{canonical}
-	# is only the key used to find it. If they are byte-identical, which is
-	# what the equality test below establishes, the distinction costs
-	# nothing; if the backend has re-rendered the rule since, taking the
-	# current line is the only one of the two that can still be deleted.
-	my ($current) = grep { $_ eq $spec->{canonical} }
-		map { my $l = $_; $l =~ s/\s+\z//; $l } split(/\n/, $list->{output});
-
-	unless (defined $current) {
+	unless ($current->{found}) {
 		return { ok => 1, removed => 0,
 			reason => 'the rule this session added is no longer present in iptables -S; nothing was removed' };
 	}
 
-	my ($argv, $problem) = _argv_from_canonical($current);
+	# The line acted on is the one THIS listing produced, never $spec's copy
+	# of it - see close_port()'s header for why that distinction is the
+	# whole point of this module.
+	my ($argv, $problem) = _argv_from_canonical($current->{line});
 	unless ($argv) {
 		return { ok => 0, code => 'E_UNREMOVABLE', reason => $problem,
-			manual => "$binary -D " . ($spec->{chain} || 'INPUT') . ' ... (see: ' . $current . ')' };
+			manual => "$binary -D " . ($spec->{chain} || 'INPUT') . ' ... (see: ' . $current->{line} . ')' };
 	}
 
 	my $removed = $self->run($binary, @wait, @$argv);
@@ -994,9 +1160,8 @@ sub _close_iptables {
 
 	# Confirmed by reading back again, because "the command exited 0" and
 	# "the rule is gone" are not the same claim.
-	my $after = $self->run($binary, @wait, '-S', $spec->{chain} || 'INPUT');
-	if (_ok($after) && grep { $_ eq $spec->{canonical} }
-			map { my $l = $_; $l =~ s/\s+\z//; $l } split(/\n/, $after->{output})) {
+	my $after = $self->_current($spec);
+	if ($after->{ok} && $after->{found}) {
 		return { ok => 0, code => 'E_REMOVE_FAILED',
 			reason => 'iptables reported success but the rule is still present',
 			manual => join(' ', $binary, @wait, @$argv) };
@@ -1009,29 +1174,22 @@ sub _close_firewalld {
 	my ($self, $spec) = @_;
 
 	my $cmd = $spec->{binary};
-	return _decline('E_SPEC', 'the stored rule specification names no firewall-cmd binary')
-		unless defined $cmd && length $cmd;
+	my $current = $self->_current($spec);
+	return { ok => 0, code => ($current->{code} || 'E_READBACK'), reason => $current->{reason} }
+		unless $current->{ok};
 
-	my $list = $self->run($cmd, '--list-rich-rules');
-	return _decline('E_READBACK',
-		'firewall-cmd --list-rich-rules would not run, so the rule this session added cannot be confirmed present or removed')
-		unless _ok($list);
-
-	my ($current) = grep { $_ eq $spec->{canonical} }
-		map { my $l = $_; $l =~ s/^\s+//; $l =~ s/\s+\z//; $l } split(/\n/, $list->{output});
-
-	unless (defined $current) {
+	unless ($current->{found}) {
 		return { ok => 1, removed => 0,
 			reason => 'the rich rule this session added is no longer present; nothing was removed' };
 	}
 
 	# One argv element, verbatim as firewalld printed it. No re-quoting, no
 	# reassembly from $spec->{address}/$spec->{port}.
-	my $removed = $self->run($cmd, '--remove-rich-rule=' . $current);
+	my $removed = $self->run($cmd, '--remove-rich-rule=' . $current->{line});
 	unless (_ok($removed)) {
 		return { ok => 0, code => 'E_REMOVE_FAILED',
 			reason => 'firewall-cmd refused to remove the temporary rich rule: ' . _first_line($removed->{output}),
-			manual => "$cmd --remove-rich-rule='$current'" };
+			manual => "$cmd --remove-rich-rule='$current->{line}'" };
 	}
 	return { ok => 1, removed => 1 };
 }
@@ -1040,34 +1198,27 @@ sub _close_ufw {
 	my ($self, $spec) = @_;
 
 	my $ufw = $spec->{binary};
-	return _decline('E_SPEC', 'the stored rule specification names no ufw binary')
-		unless defined $ufw && length $ufw;
+	my $current = $self->_current($spec);
+	return { ok => 0, code => ($current->{code} || 'E_READBACK'), reason => $current->{reason} }
+		unless $current->{ok};
 
-	my $list = $self->run($ufw, 'status', 'numbered');
-	return _decline('E_READBACK',
-		'ufw status numbered would not run, so the rule this session added cannot be confirmed present or removed')
-		unless _ok($list);
-
-	my @match = grep { $_->{canonical} eq $spec->{canonical} }
-		@{ _ufw_parse_numbered($list->{output}) };
-
-	unless (@match) {
+	unless ($current->{found}) {
 		return { ok => 1, removed => 0,
 			reason => 'the rule this session added is no longer present in ufw status numbered; nothing was removed' };
 	}
-	if (@match > 1) {
+	if ($current->{ambiguous}) {
 		return { ok => 0, code => 'E_UNREMOVABLE',
-			reason => scalar(@match) . ' ufw rules now render identically to the one this session added; refusing to guess which index to delete',
+			reason => $current->{ambiguous} . ' ufw rules now render identically to the one this session added; refusing to guess which index to delete',
 			manual => "$ufw status numbered" };
 	}
 
 	# The index comes from the listing just read, never from open time -
 	# ufw renumbers on every change.
-	my $removed = $self->run($ufw, '--force', 'delete', $match[0]{index});
+	my $removed = $self->run($ufw, '--force', 'delete', $current->{index});
 	unless (_ok($removed)) {
 		return { ok => 0, code => 'E_REMOVE_FAILED',
 			reason => 'ufw refused to delete the temporary rule: ' . _first_line($removed->{output}),
-			manual => "$ufw --force delete $match[0]{index}" };
+			manual => "$ufw --force delete $current->{index}" };
 	}
 	return { ok => 1, removed => 1 };
 }

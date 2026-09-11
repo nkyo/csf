@@ -36,7 +36,7 @@ use FindBin ();
 use lib "$FindBin::Bin/..", "$FindBin::Bin/../ui-src/lib";
 
 use File::Temp qw(tempdir);
-use Test::More tests => 272;
+use Test::More tests => 361;
 
 use ConfigServer::UI::Rollback ();
 use ConfigServer::UI::Firewall ();
@@ -100,6 +100,10 @@ sub spew {
 	return $path;
 }
 
+# A stand-in for the csfui group's gid. Nothing in this workspace has one,
+# which is exactly why it is injected.
+my $CSFUI_GID = 143;
+
 my $CSF_CONF_FIXTURE = <<'CONF';
 # /etc/csf/csf.conf - a very small stand-in for the real 1,500-line file.
 TESTING = "0"
@@ -139,6 +143,14 @@ sub world {
 	);
 	$runner->on(qr{^/sbin/iptables-save\z}, { output => "*filter\n-A INPUT -j ACCEPT\nCOMMIT\n" });
 
+	# chown and the group lookup are injected, because this test runs as an
+	# ordinary user: a real chown to root:csfui would fail and a real
+	# getgrnam('csfui') would find nothing. Injecting them is what lets the
+	# OWNERSHIP be asserted as a value - which is the whole finding
+	# (task-8-review.md C1): the previous round proved ui.conf was valid by
+	# reading it AS ROOT, which says nothing at all about the csfui the web
+	# tier execs as.
+	my @chown;
 	my $rollback = ConfigServer::UI::Rollback->new(
 		dir            => "$root/rollback",
 		unit_dir       => "$root/units",
@@ -147,9 +159,34 @@ sub world {
 		setup_bin      => '/usr/local/csf-ui/bin/csf-ui-setup',
 		systemd_marker => "$root/run-systemd",
 		firewall       => $firewall,
+		gid_for        => sub {
+			my ($name) = @_;
+			return undef if $opt{no_csfui_group};
+			return ($name eq 'csfui') ? $CSFUI_GID : undef;
+		},
+		chown          => sub {
+			my ($uid, $gid, $path) = @_;
+			push @chown, { uid => $uid, gid => $gid, path => $path, existed => (-e $path ? 1 : 0) };
+			return $opt{chown_fails} ? 0 : 1;
+		},
+		# chmod is injected for the same reason: its FAILURE is what the
+		# check around it is for, and a chmod on a file this process owns
+		# does not fail on demand.
+		chmod          => sub {
+			my ($mode, $path) = @_;
+			return 0 if $opt{chmod_fails};
+			return chmod($mode, $path);
+		},
 		(defined $opt{window} ? (window => $opt{window}) : ()),
 	);
-	return { root => $root, runner => $runner, firewall => $firewall, rollback => $rollback };
+	return { root => $root, runner => $runner, firewall => $firewall,
+		rollback => $rollback, chown => \@chown };
+}
+
+sub mode_of {
+	my ($path) = @_;
+	return undef unless -e $path;
+	return sprintf('%04o', (stat($path))[2] & 07777);
 }
 
 ###############################################################################
@@ -815,6 +852,453 @@ sub cookie_from {
 	is($header{'cache-control'}, 'no-store', 'pages are not cached');
 	is($header{'referrer-policy'}, 'no-referrer', 'and send no Referer');
 	like($header{'content-security-policy'}, qr/default-src 'none'/, 'with a restrictive CSP');
+}
+
+###############################################################################
+# THE OPERATOR'S JOURNEY OVER THE TEMPORARY PORT, END TO END
+# (task-8-review.md C2).
+#
+# csf -r is dostop;dostart (csf.pl:125) and dostop FLUSHES. The wizard's own
+# INPUT 1 rule goes with everything else - so the operator who reached the
+# wizard on the temporary port has no route left to POST /confirm, this tier
+# having no keep-alive, and the rollback fires every time. The confirmation
+# route is destroyed by the very apply it exists to confirm.
+#
+# The fixture below models the flush: csf -r empties the rule list. The test
+# walks the whole journey - open the port, record it, apply, and then ask the
+# question that actually matters, which is whether the operator can still get
+# back in.
+###############################################################################
+sub flushing_world {
+	my (%opt) = @_;
+	my $w = world(systemd => 1);
+
+	my @rules;
+	my $runner = FakeRunner->new;
+	# systemctl answers plainly that firewalld is not running: this test is
+	# about iptables, and leaving that probe to the permissive default would
+	# make detect() decline for a reason that has nothing to do with it.
+	$runner->on(qr{is-active firewalld}, { exit => 3, output => "inactive\n" })
+	       ->on(qr{^/sbin/iptables --version\z}, { output => "iptables v1.8.7 (nf_tables)\n" })
+	       ->on(qr{ -I INPUT 1 }, sub {
+			push @rules, '-A INPUT -s 203.0.113.5/32 -p tcp -m comment --comment csf-ui-setup -m tcp --dport 8444 -j ACCEPT';
+			return { exit => 0, output => '' };
+		})
+	       ->on(qr{ -D INPUT }, sub { @rules = (); return { exit => 0, output => '' } })
+	       ->on(qr{ -S INPUT\z}, sub {
+			return { exit => 0, output => join("\n", '-P INPUT ACCEPT', @rules) . "\n" };
+		})
+	       # csf -r == dostop;dostart. dostop flushes.
+	       ->on(qr{^/usr/sbin/csf -r\z}, sub { @rules = (); return { exit => 0, output => "csf restarted\n" } });
+
+	my $firewall = ConfigServer::UI::Firewall->new(
+		runner => $runner->runner,
+		locate => sub {
+			my ($name) = @_;
+			return '/sbin/iptables' if $name eq 'iptables';
+			return '/usr/sbin/csf'  if $name eq 'csf';
+			return '/bin/systemctl' if $name eq 'systemctl';
+			return undef;
+		});
+
+	# The rollback's own runner must see the same systemctl.
+	$w->{rollback}{firewall} = $firewall;
+	$w->{runner} = $runner;
+	$w->{firewall} = $firewall;
+	$w->{rules} = \@rules;
+	return $w;
+}
+
+{
+	my $w = flushing_world();
+	my $setup = setup_for($w, tls => 1, port => 8444);
+
+	# 1. The operator is on SSH; the wizard opens one port to their address.
+	my $offer = $setup->offer_port(address => '203.0.113.5');
+	is($offer->{ok}, 1, 'the wizard opens the temporary port');
+
+	# 2. ...and records it, which is what makes it closable later.
+	my $recorded = $setup->record_offer($offer);
+	is($recorded->{ok}, 1, 'and records it');
+	my ($open_now) = $w->{firewall}->rule_present($setup->load_state);
+	is($open_now, 1, 'the operator can reach the wizard');
+
+	# 3. They fill the form in and apply.
+	my ($answer) = $S->can('parse_answers')->(qq{TCP_IN="22,443"\n});
+	my $result = $setup->apply(answers => $answer);
+	is($result->{ok}, 1, 'the apply succeeds');
+	is($w->{runner}->ran(qr{^/usr/sbin/csf -r\z}), 1, 'csf was restarted, which flushed every rule');
+
+	# 4. THE QUESTION THAT MATTERS: can they get back in to confirm?
+	my ($still_open) = $w->{firewall}->rule_present($setup->load_state);
+	is($still_open, 1,
+		'THE PORT IS STILL OPEN AFTER THE APPLY - the operator can make the new connection /confirm needs');
+	is($w->{runner}->ran(qr{ -I INPUT 1 }), 2, 'because the rule was put back after the flush');
+	like(join("\n", @{ $result->{steps} }), qr/csf -r flushed the wizard rule; it has been put back/,
+		'and the operator is told that happened');
+
+	# The record follows the new rule, read back from the backend, so the
+	# rule that now exists is the rule cleanup will remove.
+	my $spec = $setup->load_state;
+	like($spec->{canonical}, qr/^-A INPUT /, 'the recorded canonical is the backend\'s own rendering');
+	my $done = $setup->cleanup;
+	like(join("\n", @$done), qr/temporary firewall rule was removed/, 'and cleanup closes it');
+	is(scalar @{ $w->{rules} }, 0, 'leaving nothing behind');
+}
+{
+	# Idempotent: when csf did NOT flush the rule, nothing is added, because
+	# a second copy would be a rule only one close_port() ever removes.
+	my $w = flushing_world();
+	my $setup = setup_for($w, tls => 1, port => 8444);
+	$setup->record_offer($setup->offer_port(address => '203.0.113.5'));
+	my $before = $w->{runner}->ran(qr{ -I INPUT 1 });
+
+	my $again = $setup->reassert_temporary_port;
+	is($again->{ok}, 1, 're-asserting an intact rule succeeds');
+	is($again->{restored}, 0, 'without restoring anything');
+	is($w->{runner}->ran(qr{ -I INPUT 1 }), $before, 'and without adding a second copy');
+}
+{
+	# Nothing to re-assert when there was never a temporary port.
+	my $w = flushing_world();
+	my $setup = setup_for($w, tls => 1, port => 8444);
+	is($setup->reassert_temporary_port, undef, 'with no state file there is nothing to re-assert');
+}
+{
+	# A backend that will not answer must not be read as "the rule is gone",
+	# because that would add a second copy of a rule that is still there.
+	my $w = world(systemd => 1);
+	my $runner = FakeRunner->new->on(qr{ -S INPUT\z}, { exit => 1, output => "cannot read\n" });
+	my $firewall = firewall_for($runner, iptables => '/sbin/iptables');
+	my $setup = $S->new(firewall => $firewall, rollback => $w->{rollback},
+		state_dir => "$w->{root}/state", token => 't');
+	$setup->save_state({ kind => 'iptables', binary => '/sbin/iptables', chain => 'INPUT',
+		port => 8444, address => '203.0.113.5',
+		canonical => '-A INPUT -s 203.0.113.5/32 -j ACCEPT' });
+
+	my $again = $setup->reassert_temporary_port;
+	is($again->{ok}, 0, 'an unanswerable backend fails the re-assertion');
+	like($again->{reason}, qr/could not be determined/, 'saying so');
+	is($runner->ran(qr{ -I INPUT 1 }), 0, 'and adds nothing');
+}
+
+###############################################################################
+# C3: the record is part of opening the port, not a note about it.
+###############################################################################
+{
+	my $w = world();
+	my $runner = FakeRunner->new
+		->on(qr{ -S INPUT\z}, { output =>
+			"-P INPUT ACCEPT\n-A INPUT -s 203.0.113.5/32 -j ACCEPT\n" })
+		->on(qr{ -D INPUT }, { exit => 0, output => '' });
+	my $firewall = firewall_for($runner, iptables => '/sbin/iptables');
+	# A state directory that cannot be created, because its parent is a FILE.
+	spew("$w->{root}/blocked", "not a directory\n");
+	my $setup = $S->new(firewall => $firewall, rollback => $w->{rollback},
+		state_dir => "$w->{root}/blocked/state", token => 't');
+
+	my $offer = { ok => 1, spec => { kind => 'iptables', binary => '/sbin/iptables',
+		chain => 'INPUT', port => 8444, address => '203.0.113.5',
+		canonical => '-A INPUT -s 203.0.113.5/32 -j ACCEPT' } };
+
+	my $recorded = $setup->record_offer($offer);
+	is($recorded->{ok}, 0, 'an offer whose record cannot be written is not an offer');
+	is($recorded->{code}, 'E_NO_STATE', 'with its own code');
+	is($runner->ran(qr{ -D INPUT }), 1,
+		'AND THE PORT WAS CLOSED AGAIN - a rule nothing is tracking is a rule nothing will ever close');
+	is($setup->listen_plan($recorded)->{bind}, '127.0.0.1',
+		'so the wizard falls back to the tunnel, which costs the operator nothing');
+}
+{
+	my $w = world();
+	my $setup = setup_for($w);
+	my $unchanged = $setup->record_offer({ ok => 0, reason => 'declined earlier' });
+	is($unchanged->{ok}, 0, 'a refusal passes through record_offer untouched');
+}
+
+###############################################################################
+# C4: "the timer has been cancelled" is a claim, and it has to be true.
+###############################################################################
+{
+	my $w = world(systemd => 1);
+	my $snap = $w->{rollback}->snapshot;
+	$w->{rollback}->arm($snap->{dir});
+	$w->{runner}->on(qr{systemctl stop csf-ui-rollback\.timer}, { exit => 1, output => "Failed to stop unit.\n" });
+
+	my $confirmed = $w->{rollback}->confirm;
+	is($confirmed->{cancelled}, 0, 'a stop that failed is NOT a cancellation');
+	is($confirmed->{ok}, 0, 'and the whole result says so');
+	like(join(' ', @{ $confirmed->{problems} }), qr/could not stop/, 'naming what failed');
+	like($confirmed->{reason}, qr/could not stop/, 'in the reason too');
+}
+{
+	my $w = world(systemd => 1);
+	my $snap = $w->{rollback}->snapshot;
+	$w->{rollback}->arm($snap->{dir});
+	$w->{runner}->on(qr{systemctl disable csf-ui-rollback\.timer}, { exit => 1, output => "Failed to disable unit.\n" });
+	my $confirmed = $w->{rollback}->confirm;
+	is($confirmed->{cancelled}, 0, 'a disable that failed is not a cancellation either');
+	like(join(' ', @{ $confirmed->{problems} }), qr/could not disable/, 'naming it');
+}
+{
+	# The unit files will not delete. Everything else "worked"; the timer is
+	# still installed, and that is the only fact the operator cares about.
+	my $w = world(systemd => 1);
+	my $snap = $w->{rollback}->snapshot;
+	$w->{rollback}->arm($snap->{dir});
+	chmod 0500, "$w->{root}/units";
+
+	my $confirmed = $w->{rollback}->confirm;
+	chmod 0755, "$w->{root}/units";
+	SKIP: {
+		skip 'running as root, where a read-only directory is no obstacle', 4 if $> == 0;
+		is($confirmed->{cancelled}, 0, 'unit files that will not delete is not a cancellation');
+		is($confirmed->{ok}, 0, 'and not an ok');
+		like(join(' ', @{ $confirmed->{problems} }), qr/could not be removed/, 'naming the file');
+		is($w->{rollback}->armed, 1, 'and armed() still says the timer is there, which is the truth');
+	}
+}
+{
+	my $w = world(systemd => 1);
+	my $snap = $w->{rollback}->snapshot;
+	$w->{rollback}->arm($snap->{dir});
+	$w->{runner}->on(qr{systemctl daemon-reload}, sub {
+		# The reload during arm() must succeed or there is nothing to cancel;
+		# this one is the reload AFTER the units are removed.
+		return { exit => (-e "$_[0]{root_marker}" ? 1 : 1), output => "Failed to reload.\n" };
+	});
+	my $confirmed = $w->{rollback}->confirm;
+	is($confirmed->{cancelled}, 0, 'a daemon-reload that failed after removal is reported, not swallowed');
+	like(join(' ', @{ $confirmed->{problems} }), qr/daemon-reload failed/, 'naming it');
+	is($w->{rollback}->armed, 0, 'though the unit files really are gone');
+}
+{
+	my $w = world(systemd => 1);
+	my $snap = $w->{rollback}->snapshot;
+	$w->{rollback}->arm($snap->{dir});
+	my $confirmed = $w->{rollback}->confirm;
+	is($confirmed->{cancelled}, 1, 'and on the happy path it really was cancelled');
+	is_deeply($confirmed->{problems}, [], 'with nothing to report');
+}
+{
+	# restore() checks disarm the same way: a rollback unit left installed
+	# fires again on the next boot.
+	my $w = world(systemd => 1);
+	my $snap = $w->{rollback}->snapshot;
+	$w->{rollback}->arm($snap->{dir});
+	chmod 0500, "$w->{root}/units";
+	my $restored = $w->{rollback}->restore($snap->{dir});
+	chmod 0755, "$w->{root}/units";
+	SKIP: {
+		skip 'running as root', 2 if $> == 0;
+		is($restored->{ok}, 0, 'a restore that could not disarm is not a success');
+		like(join("\n", @{ $restored->{steps} }), qr/NOT DISARMED/,
+			'and says so loudly, because it will otherwise fire again on the next boot');
+	}
+}
+
+###############################################################################
+# MODE AND OWNERSHIP, ASSERTED AS VALUES (task-8-review.md C1).
+#
+# The previous round's evidence that ui.conf was good was that csf-ui's own
+# startup gate accepted it - but that gate ran as ROOT in this test, and root
+# reads a root:root 0640 file perfectly well. It proved nothing whatsoever
+# about the csfui the web tier actually execs as. So: the numbers, read back
+# off the filesystem, and the chown, recorded as arguments.
+###############################################################################
+{
+	my $w = world(systemd => 1);
+	my $setup = setup_for($w);
+	my ($answer) = $S->can('parse_answers')->(<<'ANSWERS');
+TCP_IN="22,443"
+UI_MODE="a"
+UI_ALLOW="203.0.113.5"
+ANSWERS
+	my $result = $setup->apply(answers => $answer);
+	is($result->{ok}, 1, 'the answers apply');
+
+	is(mode_of("$w->{root}/etc/ui.conf"), '0640',
+		'ui.conf ends up 0640 - the value docs/WEBUI-RPC.md S2.3 freezes, read back off the disk');
+	is(mode_of("$w->{root}/etc/csf.conf"), '0600', 'and csf.conf 0600');
+
+	my @ui_chown = grep { $_->{gid} == $CSFUI_GID } @{ $w->{chown} };
+	ok(scalar(@ui_chown) >= 1, 'ui.conf was chowned to the csfui group');
+	is($ui_chown[-1]{uid}, 0, 'owner root');
+	is($ui_chown[-1]{gid}, $CSFUI_GID, 'group csfui - the group csf-ui execs as, not root');
+	isnt($ui_chown[-1]{path}, "$w->{root}/etc/ui.conf",
+		'and the chown happened on the TEMP file, so the file is never visible at its real path owned wrongly');
+	is($ui_chown[-1]{existed}, 1, 'on a file that existed at the time');
+}
+{
+	# No csfui group: refused, and refused BEFORE csf.conf is committed,
+	# because a missing group is as foreseeable as a read-only /etc.
+	my $w = world(systemd => 1, no_csfui_group => 1);
+	my $setup = setup_for($w);
+	my ($answer) = $S->can('parse_answers')->(qq{TCP_IN="22,443"\nUI_MODE="a"\nUI_ALLOW="203.0.113.5"\n});
+	my $result = $setup->apply(answers => $answer);
+	is($result->{ok}, 0, 'with no csfui group on the system, nothing is applied');
+	like(join(' ', @{ $result->{problems} }), qr/no "csfui" group/,
+		'and the refusal names the group rather than writing a file csf-ui could not read');
+	ok(!-e "$w->{root}/etc/ui.conf", 'no ui.conf was written');
+	is(slurp("$w->{root}/etc/csf.conf"), $CSF_CONF_FIXTURE, 'and csf.conf is untouched');
+}
+{
+	my $w = world(systemd => 1, chown_fails => 1);
+	my $setup = setup_for($w);
+	my ($answer) = $S->can('parse_answers')->(qq{TCP_IN="22,443"\nUI_MODE="a"\nUI_ALLOW="203.0.113.5"\n});
+	my $result = $setup->apply(answers => $answer);
+	is($result->{ok}, 0, 'a chown that fails fails the write');
+	ok(!-e "$w->{root}/etc/ui.conf", 'and leaves no file behind at all');
+	is(slurp("$w->{root}/etc/csf.conf"), $CSF_CONF_FIXTURE, 'csf.conf untouched');
+}
+{
+	# The restore path writes ui.conf too, and it is the same file with the
+	# same requirement - a rollback that hands back a ui.conf csf-ui cannot
+	# read is a rollback that leaves the UI broken.
+	my $w = world(systemd => 1);
+	spew("$w->{root}/etc/ui.conf", qq{UI_MODE="a"\nUI_ALLOW="203.0.113.5"\n});
+	my $snap = $w->{rollback}->snapshot;
+	spew("$w->{root}/etc/ui.conf", qq{UI_MODE="b"\n});
+	@{ $w->{chown} } = ();
+	$w->{rollback}->restore($snap->{dir});
+	is(mode_of("$w->{root}/etc/ui.conf"), '0640', 'the restored ui.conf is 0640');
+	my @ui_chown = grep { $_->{gid} == $CSFUI_GID } @{ $w->{chown} };
+	is(scalar(@ui_chown), 1, 'and was chowned to csfui on the way back too');
+}
+{
+	# write_atomic's own checks, directly.
+	my $w = world();
+	my $target = "$w->{root}/etc/grouped.conf";
+	spew($target, "ORIGINAL\n");
+	my $out = $w->{rollback}->write_atomic($target, "NEW\n", mode => 0640, group => 'nosuchgroup');
+	is($out->{ok}, 0, 'an unresolvable group is a refusal');
+	like($out->{reason}, qr/no "nosuchgroup" group/, 'naming it');
+	is(slurp($target), "ORIGINAL\n", 'and the original is untouched');
+
+	$out = $w->{rollback}->write_atomic($target, "NEW\n", mode => 0640);
+	is($out->{ok}, 1, 'without a group, no chown is attempted');
+	is(scalar(@{ $w->{chown} }), 0, 'literally none');
+	is(mode_of($target), '0640', 'and the mode is still set as a value');
+}
+{
+	# A chmod that fails. sysopen's mode is masked by the umask, so the
+	# explicit chmod is the ONLY thing that puts the frozen mode on the
+	# file - and an unchecked one is how a config file ships with
+	# permissions nobody chose.
+	my $w = world(chmod_fails => 1);
+	my $target = "$w->{root}/etc/moded.conf";
+	spew($target, "ORIGINAL\n");
+	my $out = $w->{rollback}->write_atomic($target, "NEW\n", mode => 0640);
+	is($out->{ok}, 0, 'a chmod that fails fails the write');
+	like($out->{reason}, qr/could not be given mode 0640/, 'naming the mode it could not set');
+	is(slurp($target), "ORIGINAL\n", 'and the original is untouched');
+	is(scalar(my @stray = glob("$w->{root}/etc/.csf-ui-setup.*")), 0, 'with no temp file left behind');
+}
+
+###############################################################################
+# C10: WRITABILITY IS PROVED BEFORE ANYTHING IS COMMITTED.
+#
+# The residual window between the two renames is acceptable because the timer
+# covers it. A read-only /etc is not in that category: it is foreseeable, and
+# a foreseeable failure deserves a check rather than a net.
+###############################################################################
+{
+	my $w = world();
+	my $probe = $w->{rollback}->writable_probe("$w->{root}/etc/anything.conf");
+	is($probe->{ok}, 1, 'a writable directory probes clean');
+	is(scalar(my @stray = glob("$w->{root}/etc/.csf-ui-setup.probe*")), 0,
+		'and the probe leaves nothing behind');
+
+	my $nowhere = $w->{rollback}->writable_probe("$w->{root}/no-such-dir/x.conf");
+	is($nowhere->{ok}, 0, 'a directory that does not exist does not probe clean');
+
+	SKIP: {
+		skip 'running as root, where a read-only directory is no obstacle', 2 if $> == 0;
+		mkdir "$w->{root}/readonly";
+		chmod 0500, "$w->{root}/readonly";
+		my $ro = $w->{rollback}->writable_probe("$w->{root}/readonly/x.conf");
+		chmod 0755, "$w->{root}/readonly";
+		is($ro->{ok}, 0, 'a read-only directory does not probe clean');
+		like($ro->{reason}, qr/cannot be written to/, 'saying so');
+	}
+}
+{
+	SKIP: {
+		skip 'running as root, where a read-only directory is no obstacle', 4 if $> == 0;
+		my $w = world(systemd => 1);
+		my $setup = setup_for($w);
+		my ($answer) = $S->can('parse_answers')->(qq{TCP_IN="22,443"\nUI_MODE="a"\nUI_ALLOW="203.0.113.5"\n});
+
+		# ui.conf's directory is writable; csf.conf's is not. Under the old
+		# order this would have been found only after ui.conf had already
+		# been committed.
+		chmod 0500, "$w->{root}/etc";
+		my $result = $setup->apply(answers => $answer);
+		chmod 0755, "$w->{root}/etc";
+
+		is($result->{ok}, 0, 'a read-only configuration directory stops the apply');
+		like($result->{reason}, qr/nothing was applied/, 'before anything is committed');
+		is(slurp("$w->{root}/etc/csf.conf"), $CSF_CONF_FIXTURE, 'csf.conf is untouched');
+		ok(!-e "$w->{root}/etc/ui.conf", 'and no ui.conf was written');
+	}
+}
+{
+	# THE CASE THE PROBE IS ACTUALLY FOR: the FIRST file is perfectly
+	# writable and the SECOND is not. Without a probe, csf.conf is committed
+	# and then ui.conf fails - the machine half-configured, inside the one
+	# window this design cannot close. With it, neither is touched.
+	SKIP: {
+		skip 'running as root, where a read-only directory is no obstacle', 3 if $> == 0;
+		my $w = world(systemd => 1);
+		mkdir "$w->{root}/etcui";
+		my $setup = setup_for($w, ui_conf => "$w->{root}/etcui/ui.conf");
+		$w->{rollback}{ui_conf} = "$w->{root}/etcui/ui.conf";
+		my ($answer) = $S->can('parse_answers')->(qq{TCP_IN="22,443"\nUI_MODE="a"\nUI_ALLOW="203.0.113.5"\n});
+
+		chmod 0500, "$w->{root}/etcui";
+		my $result = $setup->apply(answers => $answer);
+		chmod 0755, "$w->{root}/etcui";
+
+		is($result->{ok}, 0, 'an unwritable ui.conf directory stops the apply');
+		is(slurp("$w->{root}/etc/csf.conf"), $CSF_CONF_FIXTURE,
+			'AND CSF.CONF - which was perfectly writable - IS STILL UNTOUCHED');
+		ok(!-e "$w->{root}/etcui/ui.conf", 'with no ui.conf either');
+	}
+}
+
+###############################################################################
+# DIRECTORY MODES (task-8-review.md C6). A 0700 directory is not a stricter
+# 0700 file - it is a wall in front of everything beneath it, including for
+# csfui traversing /var/lib/csf-ui to reach its own session store.
+###############################################################################
+{
+	my $w = world();
+	my $snap = $w->{rollback}->snapshot;
+	is(mode_of($snap->{dir}), '0700', 'the snapshot directory itself is private');
+	is(mode_of("$w->{root}/rollback"), '0755',
+		'but the directory above it, which this code created on the way, is TRAVERSABLE');
+}
+{
+	my $w = world();
+	my $setup = setup_for($w, state_dir => "$w->{root}/var/csf-ui/setup");
+	$setup->save_state({ kind => 'iptables', binary => '/sbin/iptables',
+		canonical => '-A INPUT -j ACCEPT' });
+	is(mode_of("$w->{root}/var/csf-ui/setup"), '0700', 'the state directory is private');
+	is(mode_of("$w->{root}/var/csf-ui"), '0755', 'its parent is not private on its behalf');
+	is(mode_of("$w->{root}/var"), '0755', 'nor is its grandparent');
+	is(mode_of($setup->state_path), '0600', 'and the state file itself is root-only');
+}
+{
+	my $w = world();
+	is(ConfigServer::UI::Rollback::make_path("$w->{root}/a/b/c", mode => 0700, parent_mode => 0755),
+		undef, 'make_path succeeds');
+	is(mode_of("$w->{root}/a/b/c"), '0700', 'leaf gets its mode');
+	is(mode_of("$w->{root}/a/b"), '0755', 'parents get theirs');
+	# A directory somebody else made is left exactly as it is.
+	mkdir "$w->{root}/theirs", 0711;
+	ConfigServer::UI::Rollback::make_path("$w->{root}/theirs/mine", mode => 0700);
+	is(mode_of("$w->{root}/theirs"), '0711',
+		'an existing directory is left alone - this creates directories, it does not have opinions about them');
 }
 
 ###############################################################################

@@ -39,9 +39,10 @@ use strict;
 use warnings;
 
 use FindBin ();
+use POSIX ();
 use lib "$FindBin::Bin/..", "$FindBin::Bin/../ui-src/lib";
 
-use Test::More tests => 177;
+use Test::More tests => 206;
 
 use ConfigServer::UI::Firewall ();
 my $F = 'ConfigServer::UI::Firewall';
@@ -289,6 +290,111 @@ sub firewall {
 		'iptables-nft'    => '/sbin/iptables-nft')->detect;
 	is($d->{backend}, 'iptables-legacy',
 		'a policy-only second table is not a live ruleset and does not create ambiguity');
+}
+
+###############################################################################
+# firewall-cmd --state: EVERY NON-ZERO EXIT IS NOT "not running"
+# (task-8-review.md C5).
+#
+# The confident-wrong-answer case. firewall-cmd exits 252 (NOT_RUNNING) and
+# says so when firewalld is merely stopped. Any OTHER failure means the
+# question was not answered - and answering it "iptables-nft, certain" on a
+# host where firewalld may well hold the ruleset is strictly worse than
+# `unknown`, because `unknown` is the safe path and this one writes a rule.
+###############################################################################
+{
+	my @case = (
+		[252, "firewalld is not running\n", 'iptables-nft',
+			'exit 252 with "not running" is firewalld genuinely stopped'],
+		[1, "Failed to connect to bus: No such file or directory\n", 'unknown',
+			'a dbus failure is unanswered, not "not running"'],
+		[1, "Authorization failed.\n", 'unknown',
+			'an authorization failure is unanswered too'],
+		[127, "", 'unknown',
+			'a firewall-cmd that will not run at all is unanswered'],
+		[0, "something unexpected\n", 'unknown',
+			'exit 0 with an answer this code does not recognise is unanswered'],
+	);
+	for my $case (@case) {
+		my ($exit, $output, $expected, $label) = @$case;
+		my $r = FakeRunner->new
+			->on(qr{^/usr/bin/firewall-cmd --state\z}, { exit => $exit, output => $output })
+			->on(qr{^/bin/systemctl is-active firewalld\z}, { exit => 3, output => "inactive\n" })
+			->on(qr{^/sbin/iptables --version\z}, { output => "iptables v1.8.7 (nf_tables)\n" })
+			->on(qr{^/sbin/iptables -S INPUT\z},  { output => "-P INPUT ACCEPT\n" });
+		my $d = firewall($r, 'firewall-cmd' => '/usr/bin/firewall-cmd',
+			systemctl => '/bin/systemctl', iptables => '/sbin/iptables')->detect;
+		is($d->{backend}, $expected, $label);
+	}
+}
+{
+	# The two witnesses disagree. This code cannot tell which is right, and
+	# that is the definition of the case it declines.
+	my $r = FakeRunner->new
+		->on(qr{^/usr/bin/firewall-cmd --state\z}, { exit => 252, output => "not running\n" })
+		->on(qr{^/bin/systemctl is-active firewalld\z}, { exit => 0, output => "active\n" })
+		->on(qr{^/sbin/iptables --version\z}, { output => "iptables v1.8.7 (nf_tables)\n" })
+		->on(qr{^/sbin/iptables -S INPUT\z},  { output => "-P INPUT ACCEPT\n" });
+	my $d = firewall($r, 'firewall-cmd' => '/usr/bin/firewall-cmd',
+		systemctl => '/bin/systemctl', iptables => '/sbin/iptables')->detect;
+	is($d->{backend}, 'unknown',
+		'firewall-cmd saying stopped while systemctl says active is unknown, not a choice between them');
+	like($d->{reason}, qr/the two disagree/, 'and says exactly that');
+}
+{
+	# No firewall-cmd, and systemctl's answer is not one of the words this
+	# code knows: unanswered again, and there is no client tool to ask.
+	my $r = FakeRunner->new
+		->on(qr{^/bin/systemctl is-active firewalld\z}, { exit => 1, output => "Failed to get properties\n" })
+		->on(qr{^/sbin/iptables --version\z}, { output => "iptables v1.8.7 (nf_tables)\n" })
+		->on(qr{^/sbin/iptables -S INPUT\z},  { output => "-P INPUT ACCEPT\n" });
+	my $d = firewall($r, systemctl => '/bin/systemctl', iptables => '/sbin/iptables')->detect;
+	is($d->{backend}, 'unknown', 'an unreadable systemctl answer with no firewall-cmd is unknown');
+	like($d->{reason}, qr/could not be determined/, 'saying so');
+}
+{
+	# And the ordinary host: no firewalld anywhere, systemctl says so plainly.
+	for my $word (qw(inactive failed unknown deactivating)) {
+		my $r = FakeRunner->new
+			->on(qr{^/bin/systemctl is-active firewalld\z}, { exit => 3, output => "$word\n" })
+			->on(qr{^/sbin/iptables --version\z}, { output => "iptables v1.8.7 (nf_tables)\n" })
+			->on(qr{^/sbin/iptables -S INPUT\z},  { output => "-P INPUT ACCEPT\n" });
+		my $d = firewall($r, systemctl => '/bin/systemctl', iptables => '/sbin/iptables')->detect;
+		is($d->{backend}, 'iptables-nft', "systemctl saying \"$word\" is firewalld not running");
+	}
+	for my $word (qw(active activating reloading)) {
+		my $r = FakeRunner->new
+			->on(qr{^/bin/systemctl is-active firewalld\z}, { exit => 3, output => "$word\n" });
+		my $d = firewall($r, systemctl => '/bin/systemctl')->detect;
+		is($d->{backend}, 'unknown', "systemctl saying \"$word\" with no firewall-cmd is unknown");
+	}
+}
+
+###############################################################################
+# rule_present() - the read-back the temporary port's re-assertion depends on.
+# 1, 0 and undef are three answers, not two: "there is no rule" and "I could
+# not find out" lead to opposite actions.
+###############################################################################
+{
+	my $spec = { kind => 'iptables', binary => '/sbin/iptables', chain => 'INPUT', wait => [],
+		canonical => '-A INPUT -s 203.0.113.5/32 -j ACCEPT' };
+
+	my $there = firewall(FakeRunner->new->on(qr{ -S INPUT\z},
+		{ output => "-P INPUT ACCEPT\n-A INPUT -s 203.0.113.5/32 -j ACCEPT\n" }));
+	my ($is_there) = $there->rule_present($spec);
+	is($is_there, 1, 'a rule the backend is showing is present');
+
+	my $gone = firewall(FakeRunner->new->on(qr{ -S INPUT\z}, { output => "-P INPUT ACCEPT\n" }));
+	my ($is_gone) = $gone->rule_present($spec);
+	is($is_gone, 0, 'a rule it is not showing is absent');
+
+	my $mute = firewall(FakeRunner->new->on(qr{ -S INPUT\z}, { exit => 1, output => "cannot read\n" }));
+	my ($answer, $why) = $mute->rule_present($spec);
+	is($answer, undef, 'a backend that will not answer gives undef, NOT 0');
+	like($why, qr/neither confirmed present nor removed/, 'with a reason');
+
+	my ($no_spec) = firewall(FakeRunner->new)->rule_present(undef);
+	is($no_spec, undef, 'and no spec is undef too');
 }
 
 ###############################################################################
@@ -551,12 +657,73 @@ sub iptables_fixture {
 	my $r = FakeRunner->new
 		->on(qr{^/sbin/iptables --version\z}, { output => "iptables v1.8.7 (nf_tables)\n" })
 		->on(qr{ -I INPUT 1 }, { exit => 0, output => '' })
+		->on(qr{ -D INPUT },   { exit => 0, output => '' })
 		->on(qr{ -S INPUT\z},  { output => "-P INPUT ACCEPT\n" });    # our rule is not there
 	my $fw = firewall($r, iptables => '/sbin/iptables');
 	my $out = $fw->open_port(port => 8443, address => '203.0.113.5');
 	is($out->{ok}, 0, 'a rule that cannot be read back is not a successfully opened port');
 	is($out->{code}, 'E_READBACK', 'reported as E_READBACK');
 	is($r->ran(qr/ -D INPUT /), 1, 'and a best-effort undo was attempted');
+	like($out->{reason}, qr/has been removed again/,
+		'whose OUTCOME is reported - "took it back out" is a different situation from the next case');
+}
+{
+	# The undo itself fails. Both refusals are refusals, but this one means
+	# a rule is installed on the operator's machine that nothing is tracking
+	# and nothing will ever remove - so it says so, with the command.
+	my $r = FakeRunner->new
+		->on(qr{^/sbin/iptables --version\z}, { output => "iptables v1.8.7 (nf_tables)\n" })
+		->on(qr{ -I INPUT 1 }, { exit => 0, output => '' })
+		->on(qr{ -D INPUT },   { exit => 1, output => "Bad rule\n" })
+		->on(qr{ -S INPUT\z},  { output => "-P INPUT ACCEPT\n" });
+	my $fw = firewall($r, iptables => '/sbin/iptables');
+	my $out = $fw->open_port(port => 8443, address => '203.0.113.5');
+	is($out->{ok}, 0, 'still a refusal');
+	like($out->{reason}, qr/WORSE, it could not be removed again/,
+		'but a LOUDER one - a rule nothing is tracking is the worst outcome this module has');
+	like($out->{reason}, qr/-D INPUT/, 'and the operator is handed the command to run');
+}
+{
+	# waitpid's own result. $? is a GLOBAL: if waitpid did not reap this
+	# child, $? still holds whatever the last reaped child left there, and
+	# reading it would mean reporting some other process's exit status as
+	# this iptables mutation's.
+	my $r = ConfigServer::UI::Firewall::_run_argv('/bin/true', 1);
+	ok(!$r->{error}, 'the real runner reaps its own child and reports no error');
+	is($r->{exit}, 0, 'and reads the exit status it actually waited for');
+
+	# The hazard, reproduced: with SIGCHLD set to IGNORE the kernel reaps
+	# children itself and waitpid returns -1 (ECHILD) having waited for
+	# nothing. $? is then stale - here, deliberately poisoned with a
+	# success - and a runner that read it would report exit 0 for a command
+	# whose outcome it does not know.
+	{
+		local $SIG{CHLD} = 'IGNORE';
+
+		# Whether this platform auto-reaps is established INDEPENDENTLY,
+		# with a child of this test's own - not from the result under test.
+		# Skipping on that result would make this block skip itself into a
+		# pass the moment the guard it exists for was removed, which is
+		# exactly the shape of test this project keeps finding.
+		my $auto_reaps = do {
+			my $pid = fork();
+			if (defined $pid && !$pid) { POSIX::_exit(0) }
+			if (defined $pid) {
+				select(undef, undef, undef, 0.2);
+				(waitpid($pid, 0) == -1) ? 1 : 0;
+			}
+			else { 0 }
+		};
+
+		SKIP: {
+			skip 'this platform does not auto-reap under SIGCHLD=IGNORE', 2 unless $auto_reaps;
+			$? = 0;   # the stale "success" a credulous reader would find
+			my $orphan = ConfigServer::UI::Firewall::_run_argv('/bin/false', 2);
+			like($orphan->{error}, qr/could not be reaped/,
+				'a child that could not be reaped is an error, not an exit status');
+			isnt($orphan->{exit}, 0, 'and never reports the stale success left in $?');
+		}
+	}
 }
 {
 	my $r = FakeRunner->new

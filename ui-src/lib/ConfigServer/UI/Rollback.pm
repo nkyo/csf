@@ -96,6 +96,9 @@ our $DEFAULT_SETUP_BIN = '/usr/local/csf-ui/bin/csf-ui-setup';
 # will ever run a timer.
 our $SYSTEMD_MARKER = '/run/systemd/system';
 
+# docs/WEBUI-RPC.md section 2.3: /etc/csf-ui/ui.conf is 0640 root:csfui.
+our $UI_CONF_GROUP = 'csfui';
+
 our $SERVICE_UNIT = 'csf-ui-rollback.service';
 our $TIMER_UNIT   = 'csf-ui-rollback.timer';
 
@@ -131,6 +134,15 @@ sub new {
 		setup_bin => $opt{setup_bin} || $DEFAULT_SETUP_BIN,
 		window    => defined $opt{window} ? $opt{window} : $DEFAULT_WINDOW,
 		firewall  => $opt{firewall},        # a ConfigServer::UI::Firewall, for run()/locate()
+		# chown and the group lookup are injection seams for the same reason
+		# the runner is: t/71-rollback.t runs as an ordinary user, where a
+		# real chown to root:csfui would fail and a real getgrnam('csfui')
+		# would find nothing - and the OWNERSHIP of ui.conf is exactly what
+		# has to be asserted as a value rather than inferred from whether
+		# something downstream happened to work.
+		chown     => $opt{chown}   || sub { my ($uid, $gid, $path) = @_; return chown($uid, $gid, $path) },
+		chmod     => $opt{chmod}   || sub { my ($mode, $path) = @_; return chmod($mode, $path) },
+		gid_for   => $opt{gid_for} || \&_gid_for,
 		systemd_marker => defined $opt{systemd_marker} ? $opt{systemd_marker} : $SYSTEMD_MARKER,
 		now       => $opt{now} || sub { time() },
 	}, $class;
@@ -205,16 +217,45 @@ sub write_atomic {
 		unlink $temp;
 		return { ok => 0, reason => "the temporary file was not written in full ($why)" };
 	}
-	eval { $fh->sync; 1 };   # not fatal where the platform has no fsync
+	# The file's own fsync. Its failure is recorded, not fatal: what it buys
+	# is durability across a crash, and refusing to install a correct file
+	# because the kernel would not promise it had hit the platter would be
+	# trading a certain failure for an unlikely one.
+	my $synced = eval { $fh->sync; 1 } ? 1 : 0;
 	unless (close $fh) {
 		unlink $temp;
 		return { ok => 0, reason => "the temporary file could not be closed cleanly: $!" };
 	}
 
-	# chmod explicitly: sysopen's mode is masked by the process umask, and a
-	# config file that ends up 0644 because root's umask was 0022 is a
-	# different file from the one this asked for.
-	chmod($mode, $temp);
+	# chmod explicitly, AND CHECKED: sysopen's mode is masked by the process
+	# umask, so a config file can end up 0644 because root's umask was 0022.
+	# An unchecked chmod is how a file ships with permissions nobody chose -
+	# and for ui.conf the permissions are frozen in docs/WEBUI-RPC.md S2.3,
+	# which means they are a correctness property and not a preference.
+	unless ($self->{chmod}->($mode, $temp) == 1) {
+		my $why = "$!";
+		unlink $temp;
+		return { ok => 0, reason => sprintf('the new file could not be given mode %04o: %s', $mode, $why) };
+	}
+
+	# Ownership, before the rename, so the file is never visible at its real
+	# path owned by the wrong group even for an instant. /etc/csf-ui/ui.conf
+	# is 0640 root:csfui (S2.3): root writes it and the csfui the web tier
+	# execs as READS it, so a file left root:root is a csf-ui that cannot
+	# read its own configuration - and a startup gate run as root proves
+	# nothing at all about that.
+	if (defined $opt{group}) {
+		my $gid = $self->{gid_for}->($opt{group});
+		unless (defined $gid) {
+			unlink $temp;
+			return { ok => 0, reason => "there is no \"$opt{group}\" group on this system, so $path cannot be given the ownership docs/WEBUI-RPC.md section 2.3 freezes for it" };
+		}
+		unless ($self->{chown}->(0, $gid, $temp)) {
+			my $why = "$!";
+			unlink $temp;
+			return { ok => 0, reason => "the new file could not be given root:$opt{group} ownership: $why" };
+		}
+	}
 
 	if ($opt{validate}) {
 		my ($ok, $problems) = eval { $opt{validate}->($temp) };
@@ -238,13 +279,60 @@ sub write_atomic {
 		return { ok => 0, reason => "the validated file could not be renamed into place: $why" };
 	}
 
-	# fsync the directory so the rename itself survives a crash.
+	# fsync the directory so the rename itself survives a crash. Recorded,
+	# not fatal, for the same reason as the file's own fsync above: the
+	# rename has already happened and the file is already correct.
+	my $dir_synced = 0;
 	if (opendir(my $dh, $dir)) {
-		eval { IO::Handle::sync($dh); 1 };
+		$dir_synced = eval { IO::Handle::sync($dh); 1 } ? 1 : 0;
 		closedir $dh;
 	}
 
-	return { ok => 1, path => $path };
+	return { ok => 1, path => $path, synced => $synced, dir_synced => $dir_synced };
+}
+
+###############################################################################
+# writable_probe($path) -> { ok => 1 } | { ok => 0, reason => ... }
+#
+# Proves that a file could be created, and renamed over, AT $path - before
+# anything irreversible is done elsewhere. Not the same question as "is the
+# content valid": a read-only /etc, a full filesystem or a directory this
+# process cannot write are all foreseeable, and finding out about them after
+# csf.conf has already been committed puts a predictable failure inside the
+# one window this design cannot close (task-8-review.md C10).
+#
+# It creates and renames a real file, because the failure being ruled out is
+# a failed create or a failed rename, and -w on the directory answers a
+# weaker question than either.
+###############################################################################
+sub writable_probe {
+	my ($self, $path) = @_;
+
+	my ($dir) = $path =~ m{^(.*)/[^/]+\z};
+	$dir = '.' unless defined $dir && length $dir;
+	return { ok => 0, reason => "$dir is not a directory, so $path cannot be written" } unless -d $dir;
+
+	my $probe  = sprintf('%s/.csf-ui-setup.probe.%d', $dir, $$);
+	my $target = sprintf('%s/.csf-ui-setup.probe.%d.renamed', $dir, $$);
+	unlink $probe, $target;
+
+	my $fh;
+	unless (sysopen($fh, $probe, O_WRONLY | O_CREAT | O_EXCL, 0600)) {
+		return { ok => 0, reason => "$dir cannot be written to ($!), so $path could not be replaced" };
+	}
+	my $wrote = syswrite($fh, "probe\n");
+	close $fh;
+	unless (defined $wrote) {
+		unlink $probe;
+		return { ok => 0, reason => "$dir accepted a file but would not take its contents ($!)" };
+	}
+	unless (rename($probe, $target)) {
+		my $why = "$!";
+		unlink $probe;
+		return { ok => 0, reason => "a file in $dir could not be renamed ($why), which is how every write here is committed" };
+	}
+	unlink $target;
+	return { ok => 1 };
 }
 
 ###############################################################################
@@ -266,7 +354,7 @@ sub snapshot {
 	my $id = sprintf('%d-%d', $self->{now}->(), $$);
 	my $dir = "$self->{dir}/$id";
 
-	my $made = _make_path($dir, 0700);
+	my $made = make_path($dir, mode => 0700, parent_mode => 0755);
 	return { ok => 0, reason => "the snapshot directory $dir could not be created: $made" }
 		if defined $made;
 
@@ -434,13 +522,15 @@ TIMER
 sub arm {
 	my ($self, $snapshot_dir) = @_;
 
+	# systemd_available() returns (1, $systemctl_path) or (0, $reason) - the
+	# second value is only a path when the first is true.
 	my ($available, $systemctl) = $self->systemd_available;
 	return { ok => 0, reason => $systemctl, code => 'E_NO_SYSTEMD' } unless $available;
 
 	my ($service, $timer) = $self->unit_text($snapshot_dir);
 	return { ok => 0, reason => $timer, code => 'E_UNIT' } unless defined $service;
 
-	my $made = _make_path($self->{unit_dir}, 0755);
+	my $made = make_path($self->{unit_dir}, mode => 0755, parent_mode => 0755);
 	return { ok => 0, reason => "the unit directory $self->{unit_dir} could not be created: $made", code => 'E_UNIT' }
 		if defined $made;
 
@@ -453,20 +543,33 @@ sub arm {
 
 	$wrote = $self->write_atomic($timer_path, $timer, mode => 0644);
 	unless ($wrote->{ok}) {
-		unlink $service_path;
-		return { ok => 0, reason => "the rollback timer unit could not be written: $wrote->{reason}", code => 'E_UNIT' };
+		# The service unit is already on disk and the timer is not. Take the
+		# service back out, and CHECK that it went: armed() requires both
+		# files, so a stray service unit does not make anything claim to be
+		# armed - but it is a unit file this program put in
+		# /etc/systemd/system and then walked away from, and leaving one
+		# behind silently is how the next person finds a rollback service
+		# nobody can account for.
+		my $stray = (-e $service_path && !unlink($service_path))
+			? " (and $service_path could not be removed again: $!)" : '';
+		return { ok => 0, code => 'E_UNIT',
+			reason => "the rollback timer unit could not be written: $wrote->{reason}$stray" };
 	}
 
 	my $reload = $self->_run($systemctl, 'daemon-reload');
 	unless (_ran_ok($reload)) {
-		$self->_remove_units($systemctl);
-		return { ok => 0, reason => 'systemctl daemon-reload failed, so the rollback timer was removed again rather than left unloaded', code => 'E_SYSTEMCTL' };
+		my $swept = $self->_remove_units($systemctl);
+		return { ok => 0, code => 'E_SYSTEMCTL',
+			reason => 'systemctl daemon-reload failed, so the rollback timer was removed again rather than left unloaded: '
+				. _said($reload) . (@{ $swept->{problems} } ? ' (and ' . join('; ', @{ $swept->{problems} }) . ')' : '') };
 	}
 
 	my $enable = $self->_run($systemctl, 'enable', '--now', $TIMER_UNIT);
 	unless (_ran_ok($enable)) {
-		$self->_remove_units($systemctl);
-		return { ok => 0, reason => 'systemctl could not enable and start the rollback timer, so nothing was left armed', code => 'E_SYSTEMCTL' };
+		my $swept = $self->_remove_units($systemctl);
+		return { ok => 0, code => 'E_SYSTEMCTL',
+			reason => 'systemctl could not enable and start the rollback timer, so nothing was left armed: '
+				. _said($enable) . (@{ $swept->{problems} } ? ' (and ' . join('; ', @{ $swept->{problems} }) . ')' : '') };
 	}
 
 	return { ok => 1, units => [$service_path, $timer_path], window => $self->{window} };
@@ -487,34 +590,84 @@ sub armed {
 ###############################################################################
 sub confirm {
 	my ($self) = @_;
-	my ($available, $systemctl) = $self->systemd_available;
+	my ($available, $systemctl_or_why) = $self->systemd_available;
 
 	unless ($available) {
 		# No systemd: there was never a timer to cancel (arm() refused).
 		# Remove any unit files anyway - they may be left over from a host
 		# that HAD systemd when they were written - and report honestly.
-		my $removed = $self->_remove_units(undef);
-		return { ok => 1, cancelled => 0, removed => $removed,
-			reason => $systemctl };
+		my $swept = $self->_remove_units(undef);
+		return { ok => $swept->{ok}, cancelled => 0, removed => $swept->{removed},
+			problems => $swept->{problems}, reason => $systemctl_or_why };
 	}
 
-	$self->_run($systemctl, 'stop', $TIMER_UNIT);
-	$self->_run($systemctl, 'disable', $TIMER_UNIT);
-	my $removed = $self->_remove_units($systemctl);
+	# EVERY ONE OF THESE RESULTS IS CHECKED, and cancelled is the AND of
+	# all of them (task-8-review.md R66/C4). This is the mechanism whose
+	# entire job is to be trustworthy when everything else on the machine is
+	# wrong; reporting "the rollback timer has been cancelled" because three
+	# commands were issued, rather than because they worked, is the one
+	# sentence in this program that must never be a guess. An operator who
+	# believes it and walks away comes back to a machine that reverted
+	# itself; one who is told the truth can run systemctl stop by hand.
+	my @problem;
+	my $stopped = $self->_run($systemctl_or_why, 'stop', $TIMER_UNIT);
+	push @problem, 'systemctl could not stop ' . $TIMER_UNIT . ': ' . _said($stopped)
+		unless _ran_ok($stopped);
 
-	return { ok => 1, cancelled => 1, removed => $removed };
+	my $disabled = $self->_run($systemctl_or_why, 'disable', $TIMER_UNIT);
+	push @problem, 'systemctl could not disable ' . $TIMER_UNIT . ': ' . _said($disabled)
+		unless _ran_ok($disabled);
+
+	my $swept = $self->_remove_units($systemctl_or_why);
+	push @problem, @{ $swept->{problems} };
+
+	# Belt and braces, and the check that matters most: whatever the three
+	# commands said, is the timer actually gone? armed() is a file test, so
+	# it is answerable even when systemd is not talking.
+	push @problem, 'the rollback unit files are still present after removing them'
+		if $self->armed;
+
+	return {
+		ok        => (@problem ? 0 : 1),
+		cancelled => (@problem ? 0 : 1),
+		removed   => $swept->{removed},
+		problems  => \@problem,
+		(@problem ? (reason => join('; ', @problem)) : ()),
+	};
 }
 
+# What a failed child said, for a message. Never interpolated into a command.
+sub _said {
+	my ($result) = @_;
+	return 'it could not be started' if $result->{error};
+	return 'it exceeded its deadline' if $result->{timeout};
+	return 'it was killed by a signal' if $result->{signal};
+	my $text = defined $result->{output} ? $result->{output} : '';
+	$text =~ s/\s+/ /g;
+	$text =~ s/^\s+|\s+\z//g;
+	return length($text) ? substr($text, 0, 200) : "exit $result->{exit}";
+}
+
+# -> { ok, removed => \@paths, problems => \@problems }
+#
+# unlink's result is checked, and so is daemon-reload's: a unit file that
+# would not delete is a timer that still fires, which is the opposite of
+# what every caller of this is trying to achieve.
 sub _remove_units {
 	my ($self, $systemctl) = @_;
-	my @removed;
+	my (@removed, @problem);
 	for my $unit ($SERVICE_UNIT, $TIMER_UNIT) {
 		my $path = "$self->{unit_dir}/$unit";
 		next unless -e $path;
-		push @removed, $path if unlink $path;
+		if (unlink $path) { push @removed, $path }
+		else { push @problem, "$path could not be removed: $!" }
 	}
-	$self->_run($systemctl, 'daemon-reload') if $systemctl && @removed;
-	return \@removed;
+	if ($systemctl && @removed) {
+		my $reload = $self->_run($systemctl, 'daemon-reload');
+		push @problem, 'systemctl daemon-reload failed after removing the rollback units: ' . _said($reload)
+			unless _ran_ok($reload);
+	}
+	return { ok => (@problem ? 0 : 1), removed => \@removed, problems => \@problem };
 }
 
 ###############################################################################
@@ -544,7 +697,8 @@ sub restore {
 
 	my $meta = $self->read_meta($snapshot_dir);
 	unless ($meta) {
-		$self->disarm;
+		my $disarmed = $self->disarm;
+		push @step, "NOT DISARMED: $_" for @{ $disarmed->{problems} };
 		return { ok => 0, reason => "no snapshot metadata under $snapshot_dir; refusing to restore from a directory this code did not write", steps => \@step };
 	}
 
@@ -559,7 +713,8 @@ sub restore {
 			$failed = 1;
 			next;
 		}
-		my $write = $self->write_atomic($target, $content, mode => ($name eq 'ui.conf' ? 0640 : 0600));
+		my $write = $self->write_atomic($target, $content,
+			($name eq 'ui.conf') ? (mode => 0640, group => $UI_CONF_GROUP) : (mode => 0600));
 		if ($write->{ok}) { push @step, "$name: restored to $target" }
 		else { push @step, "$name: $write->{reason}"; $failed = 1 }
 	}
@@ -591,8 +746,18 @@ sub restore {
 		}
 	}
 
-	$self->disarm;
-	push @step, 'disarmed: the rollback units were removed so this cannot fire again';
+	my $disarmed = $self->disarm;
+	if ($disarmed->{ok}) {
+		push @step, 'disarmed: the rollback units were removed so this cannot fire again';
+	}
+	else {
+		# Loud, and fatal to the verdict: a rollback unit left installed
+		# fires again on the next boot and restores a snapshot the operator
+		# may by then have deliberately moved on from.
+		push @step, "NOT DISARMED - this will fire again unless the units are removed by hand: $_"
+			for @{ $disarmed->{problems} };
+		$failed = 1;
+	}
 
 	return { ok => ($failed ? 0 : 1), steps => \@step };
 }
@@ -601,13 +766,20 @@ sub restore {
 # restore() and by --cleanup.
 sub disarm {
 	my ($self) = @_;
-	my ($available, $systemctl) = $self->systemd_available;
-	if ($available) {
-		$self->_run($systemctl, 'stop', $TIMER_UNIT);
-		$self->_run($systemctl, 'disable', $TIMER_UNIT);
-		return $self->_remove_units($systemctl);
+	my ($available, $systemctl_or_why) = $self->systemd_available;
+	return $self->_remove_units(undef) unless $available;
+
+	my @problem;
+	for my $verb ('stop', 'disable') {
+		my $result = $self->_run($systemctl_or_why, $verb, $TIMER_UNIT);
+		push @problem, "systemctl could not $verb $TIMER_UNIT: " . _said($result)
+			unless _ran_ok($result);
 	}
-	return $self->_remove_units(undef);
+	my $swept = $self->_remove_units($systemctl_or_why);
+	push @problem, @{ $swept->{problems} };
+	push @problem, 'the rollback unit files are still present after removing them' if $self->armed;
+
+	return { ok => (@problem ? 0 : 1), removed => $swept->{removed}, problems => \@problem };
 }
 
 ###############################################################################
@@ -616,20 +788,61 @@ sub disarm {
 # has changed shape more than once; three lines of mkdir are easier to be
 # sure about than a dependency whose failure mode varies by Perl version.
 ###############################################################################
-sub _make_path {
-	my ($path, $mode) = @_;
+###############################################################################
+# make_path($path, %opt) -> undef on success, or a reason
+#
+#   mode        the mode of the LAST component (default 0755)
+#   parent_mode the mode of any intermediate directory this has to create
+#               (default 0755)
+#
+# THE TWO MODES ARE SEPARATE BECAUSE CONFLATING THEM IS A WALL. Creating
+# /var/lib/csf-ui/rollback/<id> at 0700 all the way down leaves
+# /var/lib/csf-ui itself at 0700 - and docs/WEBUI-RPC.md section 2.3 freezes
+# that directory at 0755 precisely because csfui has to TRAVERSE it to reach
+# its own session store. Section 2.3 says it in as many words: a 0700
+# directory is not a stricter version of a 0700 file, it is a wall in front
+# of every file beneath it. The leaf may be as private as it likes; what is
+# above it may not be private on the leaf's behalf.
+#
+# An intermediate that already exists is left exactly as it is: this creates
+# directories, it does not have opinions about directories somebody else
+# made.
+###############################################################################
+sub make_path {
+	my ($path, %opt) = @_;
+	my $mode        = defined $opt{mode}        ? $opt{mode}        : 0755;
+	my $parent_mode = defined $opt{parent_mode} ? $opt{parent_mode} : 0755;
+
 	return undef if -d $path;
-	my @part = split(m{/}, $path);
+	my @part = grep { length } split(m{/}, $path);
 	my $so_far = '';
-	for my $part (@part) {
-		next if $part eq '';
-		$so_far .= "/$part";
+	for my $index (0 .. $#part) {
+		$so_far .= "/$part[$index]";
 		next if -d $so_far;
-		unless (mkdir($so_far, $mode)) {
+		my $this_mode = ($index == $#part) ? $mode : $parent_mode;
+		unless (mkdir($so_far, $this_mode)) {
 			return "$!" unless -d $so_far;   # lost a race with another mkdir: fine
+		}
+		# mkdir's mode is masked by the umask exactly as sysopen's is, and
+		# 0755 under a 0027 umask is 0750 - which is the wall again, one
+		# permission bit narrower. Set it explicitly and check.
+		unless (chmod($this_mode, $so_far) == 1) {
+			return sprintf('%s could not be given mode %04o: %s', $so_far, $this_mode, $!);
 		}
 	}
 	return -d $path ? undef : 'the directory does not exist after creating it';
+}
+
+# getgrnam, wrapped so that the one place this program asks "what is the
+# csfui group" is replaceable in a test. Returns undef when the group does
+# not exist, which write_atomic() treats as a refusal rather than a reason
+# to write the file with whatever ownership it happens to get.
+sub _gid_for {
+	my ($name) = @_;
+	return undef unless defined $name && length $name;
+	my @entry = getgrnam($name);
+	return undef unless @entry;
+	return $entry[2];
 }
 
 sub _slurp {

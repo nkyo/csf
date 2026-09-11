@@ -37,6 +37,74 @@ line is added below the original notice; the original stays intact.
 
 ### Unreleased
 
+#### Task 8 fix round 1 — a gate that ran as the wrong user, and a confirmation route the apply destroyed
+
+**2026-09-11** — Six findings, two of which mean the feature did not work at all.
+
+- **C1 — `ui.conf` was written `root:root`, so `csf-ui` could not read its own
+  configuration.** `rename` leaves the new file owned by root's group; `csf-ui` execs as
+  `csfui`. The previous round's evidence that the file was good was that `csf-ui`'s own
+  startup gate accepted it — but that gate ran **as root** in the test, and root reads a
+  `root:root` file perfectly well. It proved nothing whatever about the process that will
+  actually run. `write_atomic` now takes a `group`, resolves it, and chowns the **temp
+  file** before the rename (so the file is never visible at its real path owned wrongly);
+  `chmod`'s result is checked, which it was not; and mode and owner are now asserted as
+  **values** read back off the filesystem and as recorded `chown` arguments. A missing
+  `csfui` group is a refusal, not a file written with whatever ownership it happened to get.
+
+- **C2 — the confirmation route was destroyed by the apply it exists to confirm.** `csf -r`
+  is `dostop;dostart` (`csf.pl:125`) and `dostop` flushes — including the wizard's own
+  `INPUT 1` rule. With no keep-alive, `POST /confirm` is a new connection to a port that is
+  no longer open, so the rollback fired every time and setup over the temporary port could
+  never succeed. The rule is now re-asserted after `csf -r`, in the child that ran it, via
+  the state file the two processes share. It **asks before it acts** — a rule still present
+  is left alone rather than duplicated — stores the new read-back rather than the old
+  string, and takes the rule straight back out if it cannot be recorded. `t/71` walks the
+  operator's whole journey and ends on the only question that matters: after the apply, can
+  they still get back in?
+
+- **C3/C4 (R66) — two more discarded results, on the two mechanisms that exist to be
+  trustworthy.** `save_state`'s result was thrown away, so a failed write left the port open
+  with nothing on the system that knew it existed; recording is now part of opening the
+  port, and a failure closes it again and falls back to the tunnel. `Rollback::confirm`
+  returned `cancelled => 1` regardless of what `stop`, `disable` and the unlinks did; it now
+  checks every one of them, re-tests `armed()` afterwards, and reports `cancelled` only when
+  that is true. An operator who believes "the timer has been cancelled" and walks away comes
+  back to a machine that reverted itself.
+
+  The sweep this prompted found three more in the same family: `waitpid`'s result was
+  unread, so a child reaped by anything else would have had some **other** process's exit
+  status read out of `$?` as its own; the best-effort undo after a failed read-back had its
+  result discarded, which is the difference between "added something and took it back out"
+  and "a rule is installed that nothing is tracking"; and a failed timer-unit write left the
+  service unit behind unnoticed. All three now checked. Every remaining ignored return in
+  these files is enumerated and justified in the task report.
+
+- **C5 — `firewall-cmd --state` failing for any reason was read as "not running".** So a
+  host where firewalld could not be reached was answered `iptables-nft` with
+  `certain => 1` — a confident wrong answer, which is worse than `unknown` because
+  `unknown` is the safe path and this one writes a rule. Only exit 252 (firewall-cmd's own
+  NOT_RUNNING) or an explicit "not running" now counts; everything else is `unknown`. And
+  when firewall-cmd says stopped while `systemctl` says active, the two witnesses disagree
+  and this code declines rather than picking one.
+
+- **C6 — directories were created at the leaf's mode all the way down**, so
+  `/var/lib/csf-ui` could become `0700` and a wall in front of `csfui`'s own session store.
+  `make_path` now takes a separate `parent_mode` (default `0755`), chmods what it creates,
+  and leaves directories it did not create alone. `/etc/csf-ui/ui.conf` is written `0640
+  root:csfui` and `/var/lib/csf-ui` left `0755`, which is what `docs/WEBUI-RPC.md` §2.3
+  freezes and what Task 9 installs against.
+
+- **C10 — the pre-check proved content, not writability.** A read-only `/etc`, a full
+  filesystem or a missing `csfui` group are all foreseeable, and finding out about any of
+  them after `csf.conf` had been committed put a predictable failure inside the one window
+  this design cannot close. Both targets are now probed by actually creating and renaming a
+  file, and the ui.conf dry run is written with the same mode and group the real file gets,
+  so the gid lookup and the chown are exercised too — all before anything is committed.
+
+`t/70-firewall-detect.t`: 177 → 206. `t/71-rollback.t`: 272 → 361. Whole suite: **2408
+tests** (was 2290), `prove -I. t/`.
+
 #### Task 8 — the setup wizard, and the two independent ways it refuses to lock you out
 
 **2026-09-11** — The setup wizard: `ui-src/bin/csf-ui-setup`, plus
