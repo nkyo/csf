@@ -37,6 +37,47 @@ line is added below the original notice; the original stays intact.
 
 ### Unreleased
 
+#### Task 6 fix round 2 — the fix for R38 itself had a hole: unquoted attributes bypassed it entirely
+
+- **2026-09-11** — Re-review of fix round 1's context-boundary scanner (R38) verified it by doing
+  real work rather than reading the diff: created a temp file under `ui-src/web/screens/` to
+  confirm the `File::Find` walk actually reaches a directory that does not exist yet, checked that
+  the positive/negative controls call the real `_find_unsafe_placeholders()` rather than a
+  reimplemented copy of its regexes (the failure mode that would have made the whole thing
+  theatre), and confirmed 44px is genuine total height under `box-sizing: border-box`. It then
+  found R40: both the event-handler and the URL-bearing-attribute regexes required a captured
+  quote character (`(["'])(.*?)\2`), so an unquoted value - `<a href={{evil}}>`, legal HTML5 -
+  bypassed detection completely. Confirmed live: took a violation the scanner correctly caught,
+  removed the quotes, watched 81/82 become 82/82. This was not merely a scanner gap:
+  `escape_html()` does not escape spaces, so an unquoted value containing one does not just break
+  out of the attribute, it injects a whole new one - `onmouseover` is one space away.
+
+  Enumerating "the dangerous attributes" was the wrong shape for the unquoted case, because
+  without quotes *every* attribute is injectable, not only `on*`/`href`/`src`/`action`. Fixed by
+  adding a fifth check to `_find_unsafe_placeholders()` (`t/50-render.t`) that flags `{{` in an
+  unquoted attribute value regardless of the attribute's name, as an addition alongside the
+  existing quoted checks, not a replacement for them - a negative lookahead right after `=\s*`
+  keeps it from double-counting a value the quoted checks already caught.
+
+  The same review named five other evasion candidates to check individually rather than assume:
+  single-quoted attributes, uppercase `ONCLICK`/`HREF`, a `<script>` tag carrying its own
+  attributes or a `type`, a `<script>` body split across lines, and whitespace around an
+  attribute's `=`. All five were already handled by the existing regexes (quote-character
+  backreference, the `/i` flag, `[^>]*` before a script tag's `>`, `/s` dotall on the script-body
+  capture, and `\s*=\s*` respectively) - now proven with explicit tests rather than left as an
+  unverified claim. One further candidate, `{{` itself split by a newline (a `{` then a line break
+  then `{key}}`), turned out not to be reachable at all: `ConfigServer::UI::Render`'s own
+  `$PLACEHOLDER_RE` requires the two braces strictly adjacent, so that text is not a placeholder
+  to `render()` either - proven directly by running it through the real module rather than only
+  reasoning about the regex, rather than silently leaving it uncovered.
+
+  A guard written specifically to protect the next task, shipped with a hole that task could walk
+  through unknowingly, is worse than no guard, because it would be trusted - which is why this
+  was a round rather than a deferred minor.
+
+  `t/50-render.t`: 82 → 97 assertions. Whole suite: 1504 tests (was 1489), `prove -I. t/`.
+  (`t/50-render.t`)
+
 #### Task 6 fix round 1 — the escaping-context boundary was a comment, not a guard; a stated touch-target guarantee was 8px short
 
 - **2026-09-11** — Spec review (R38) found that `Render.pm`'s and

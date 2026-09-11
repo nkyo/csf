@@ -47,7 +47,7 @@ use lib "$FindBin::Bin/..", "$FindBin::Bin/../ui-src/lib";
 
 use File::Find ();
 use File::Temp qw(tempdir);
-use Test::More tests => 82;
+use Test::More tests => 97;
 
 require_ok('ConfigServer::UI::Render');
 
@@ -345,19 +345,48 @@ ok($@, 'escape_html: a coderef dies');
 # description.
 #
 # _find_unsafe_placeholders() is a text scan, not an HTML parser: <script>/
-# <style> bodies and on*=/href=/src=/action= attribute values are located
-# with regexes, and each is checked only for the literal substring "{{" -
-# deliberately not distinguishing the escaped {{key}} marker from the raw
-# {{{key}}} one, because neither is safe in any of these four positions and
-# a value that only ever needs the raw marker should not have been
-# attacker-reachable text to begin with. This can be fooled by sufficiently
-# contrived markup the way any regex-based scan can (a <script> tag split
-# by an HTML comment, for instance); it is a trip-wire for the ordinary way
-# this gets broken - a screen author reaching for the nearest placeholder
-# while wiring up an onclick - not a proof that the rule can never be
-# violated. Said here plainly rather than left for a re-review to notice:
-# this test's advertised scope is "the ordinary mistake", not "every
-# mistake".
+# <style> bodies, on*=/href=/src=/action= attribute values, and (R40,
+# below) ANY unquoted attribute value are located with regexes, and each
+# is checked only for the literal substring "{{" - deliberately not
+# distinguishing the escaped {{key}} marker from the raw {{{key}}} one,
+# because neither is safe in any of these positions and a value that only
+# ever needs the raw marker should not have been attacker-reachable text
+# to begin with. This can be fooled by sufficiently contrived markup the
+# way any regex-based scan can (a <script> tag split by an HTML comment,
+# for instance); it is a trip-wire for the ordinary way this gets broken -
+# a screen author reaching for the nearest placeholder while wiring up an
+# onclick - not a proof that the rule can never be violated. Said here
+# plainly rather than left for a re-review to notice: this test's
+# advertised scope is "the ordinary mistake", not "every mistake".
+#
+# R40 (fix round 2, live-verified by the reviewer): the on*/href/src/action
+# check above only matches a QUOTED value ((["'])(.*?)\2) - an unquoted
+# attribute, legal HTML5 (<a href={{evil}}>), bypassed detection entirely.
+# This is not merely a scanner gap: escape_html() does not escape spaces,
+# so an unquoted value containing one does not just break out of the
+# value, it injects a whole new attribute - onmouseover is one space away.
+# Enumerating "the dangerous attributes" is the wrong shape for the
+# unquoted case, because without quotes EVERY attribute is injectable, not
+# only on*/href/src/action - so the fix below flags {{ in an unquoted
+# value regardless of the attribute's name, as an addition alongside the
+# quoted checks above, not a replacement for them.
+#
+# Other evasion candidates raised in the same review, checked individually
+# rather than assumed (see t/50-render.t's positive/negative controls
+# immediately below this sub, and task-6-report.md for the reachability
+# argument on the one that turned out not to be live):
+#   - single-quoted attributes: already handled - (["'])(.*?)\2 matches
+#     either quote character via backreference, not only ".
+#   - uppercase ONCLICK/HREF: already handled - every while loop below
+#     carries /i.
+#   - <script> carrying attributes or a type: already handled -
+#     <script\b[^>]*> consumes any attributes before the opening tag's >.
+#   - whitespace around an attribute's =: already handled - \s*=\s*
+#     already allows it on both sides.
+#   - {{ split across a line inside a script body: already handled for
+#     the ordinary case (dotall /s lets (.*?) cross the newline) - but see
+#     the "split across a literal {{" negative control below for the one
+#     sub-case that is NOT live, and why.
 ###############################################################################
 sub _find_unsafe_placeholders {
 	my ($html) = @_;
@@ -379,6 +408,15 @@ sub _find_unsafe_placeholders {
 	}
 	while ($html =~ m{\s(href|src|action)\s*=\s*(["'])(.*?)\2}gis) {
 		push @findings, "URL-bearing attribute '$1'" if index($3, '{{') >= 0;
+	}
+	# R40: any attribute at all, unquoted. The negative lookahead
+	# (?!["']) is what keeps this from double-counting the quoted cases
+	# already caught above - it only matches when the character right
+	# after = (and any whitespace) is neither quote, i.e. genuinely
+	# unquoted. The value itself is captured up to the next whitespace or
+	# '>', which is where HTML5 ends an unquoted attribute value.
+	while ($html =~ m{\s([a-zA-Z][a-zA-Z0-9:_-]*)\s*=\s*(?!["'])([^\s>]+)}gis) {
+		push @findings, "unquoted attribute '$1'" if index($2, '{{') >= 0;
 	}
 
 	return @findings;
@@ -409,9 +447,50 @@ sub _find_unsafe_placeholders {
 	ok((grep { /action/ } @f), 'context scan: {{ inside an action attribute is flagged');
 }
 
+# R40 positive controls: the unquoted case the reviewer found live
+# (<a href={{evil}}>), an unquoted attribute with a name outside the
+# on*/href/src/action enumeration entirely (proving the fix really is
+# "any attribute", not a fifth name added to the list), and the other
+# evasion candidates the same review raised - single vs. double quotes,
+# case, a <script> tag carrying its own attributes, a script body split
+# across lines, and whitespace around =.
+{
+	my %case = (
+		'the exact R40 example: unquoted href'
+			=> ['<a href={{evil}}>x</a>',                                qr/unquoted attribute 'href'/],
+		'unquoted attribute outside the href/src/action/on* enumeration'
+			=> ['<div data-id={{v}}>x</div>',                            qr/unquoted attribute 'data-id'/],
+		'single-quoted href (not only double-quoted)'
+			=> [q{<a href='{{evil}}'>x</a>},                             qr/URL-bearing attribute 'href'/],
+		"single-quoted onclick (not only double-quoted)"
+			=> [q{<button onclick='alert({{v}})'>go</button>},           qr/event-handler attribute 'onclick'/],
+		'uppercase HREF'
+			=> ['<A HREF="{{evil}}">x</A>',                              qr/URL-bearing attribute 'HREF'/],
+		'uppercase ONCLICK'
+			=> ['<BUTTON ONCLICK="{{v}}">go</BUTTON>',                   qr/event-handler attribute 'ONCLICK'/],
+		'a <script> tag carrying its own attributes (type=)'
+			=> ['<script type="text/javascript">var x = "{{v}}";</script>', qr/script/],
+		'a <script> body split across multiple lines'
+			=> ["<script>\nvar x = \"{{v}}\";\n</script>",               qr/script/],
+		'whitespace around = on a quoted attribute'
+			=> ['<a href = "{{evil}}">x</a>',                            qr/URL-bearing attribute 'href'/],
+		'whitespace around = on an unquoted attribute'
+			=> ['<a href = {{evil}}>x</a>',                              qr/unquoted attribute 'href'/],
+	);
+
+	for my $name (sort keys %case) {
+		my ($html, $expect) = @{ $case{$name} };
+		my @f = _find_unsafe_placeholders($html);
+		ok((grep { $_ =~ $expect } @f), "context scan: $name is flagged");
+	}
+}
+
 # Negative controls: prove the scanner does not flag the ordinary safe
-# usage this codebase actually writes, or attribute names that merely
-# contain "on"/"action" as a substring rather than being one.
+# usage this codebase actually writes, attribute names that merely
+# contain "on"/"action" as a substring rather than being one, an unquoted
+# attribute with no {{ at all, a quoted attribute not double-counted by
+# the new unquoted check, and the one evasion candidate that turned out
+# not to be reachable.
 {
 	is_deeply([ _find_unsafe_placeholders('<h1>{{title}}</h1>') ], [],
 		'context scan: {{ as plain element content is not flagged');
@@ -421,6 +500,28 @@ sub _find_unsafe_placeholders {
 		'context scan: an href with no {{ at all is not flagged');
 	is_deeply([ _find_unsafe_placeholders('<div data-action="{{v}}" data-onload="{{v}}">x</div>') ], [],
 		q{context scan: "data-action"/"data-onload" are not "action"/"onload" - no attribute-name boundary, not flagged});
+	is_deeply([ _find_unsafe_placeholders('<input type=text>') ], [],
+		'context scan: an unquoted attribute with no {{ at all is not flagged');
+
+	my @dup_check = _find_unsafe_placeholders('<a href="{{evil}}">x</a>');
+	is(scalar(@dup_check), 1,
+		'context scan: a quoted attribute is reported once, not double-counted by the new unquoted-attribute check');
+
+	# NOT reachable, and here is the independent proof rather than a bare
+	# assertion: a { and a { separated by a newline is not "{{" to
+	# Render.pm's own $PLACEHOLDER_RE either (it requires the two braces
+	# strictly adjacent), so this template substitutes nothing and dies
+	# on nothing - it is exactly as inert to render() as to this scanner.
+	# Flagging it would be reporting a danger that cannot occur through
+	# the only code path that ever processes these files.
+	my $split_brace_html = "<a href=\"{\n{v}}\">x</a>";
+	is_deeply([ _find_unsafe_placeholders($split_brace_html) ], [],
+		'context scan: a { and a { separated by a newline (not literal "{{") is not flagged');
+	my $split_brace_out = eval { render($split_brace_html, {}) };
+	ok(!$@, 'that same split-brace template renders through the REAL Render.pm without dying (proving it is inert, not merely unflagged)')
+		or diag("died with: $@");
+	is($split_brace_out, $split_brace_html,
+		'and comes back byte-identical - Render.pm never treated the split braces as a placeholder either');
 }
 
 # The real enforcement: every .html file under ui-src/web, walked
