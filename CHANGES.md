@@ -37,6 +37,59 @@ line is added below the original notice; the original stays intact.
 
 ### Unreleased
 
+#### Task 5 fix round 2 — the fix for R31 could itself kill a slow-but-honest client
+
+- **2026-09-11** — Fixed `Server.pm`'s `_serve_accepted()` charging the TLS
+  handshake against the same watchdog budget the request phase needs
+  (found in the scoped re-review of fix round 1's own R31 change, below).
+  R31 armed one `Time::HiRes::alarm()`, sized to `header_timeout +
+  body_timeout + write_timeout`, *before* `tls_wrap` ran, so a legitimate
+  client with non-trivial handshake latency who then went on to use close
+  to its own real allowance for headers, body and the response write could
+  be killed having violated no single per-phase deadline — a failure mode
+  that did not exist before R31, since before it there was no deadline
+  here at all. `_serve_accepted()` now arms two alarms in sequence: a new
+  `handshake_timeout` (constructor option, default
+  `$DEFAULT_HANDSHAKE_TIMEOUT` = 10s) covers only `tls_wrap`, is cancelled
+  the instant it returns, and only then — if the wrap produced real TLS —
+  is a fresh alarm armed for `header_timeout + body_timeout +
+  write_timeout`, the same sum as before but now starting from zero rather
+  than continuing to run down a clock the handshake already spent from. A
+  peer stuck in either phase is still killed, promptly, by that phase's
+  own budget alone.
+
+  The 10s handshake figure has no precedent in `docs/WEBUI-RPC.md` (§14.4
+  is explicit that Mode B's TLS layer is entirely this task's own problem)
+  and is reasoned from first principles: a TLS handshake is a
+  machine-to-machine negotiation with no human typing or reading in the
+  loop, unlike `HEADER_TIMEOUT`'s 15s, which has to leave room for a
+  client formulating a request — so it does not need that much slack. What
+  it does need is margin for a genuinely slow or lossy network path (a
+  congested mobile link, a slow VPN, a retransmit or two); a real
+  handshake, even a bad one, completes in low single-digit seconds. 10s is
+  an order of magnitude above that normal case while staying under
+  `HEADER_TIMEOUT`, and it is a strict improvement over fix round 1's own
+  number for the attack R31 exists to stop: a child stuck in a silent
+  handshake is now reaped in at most 10s rather than holding its slot for
+  the full combined (header+body+write) budget as it did immediately after
+  R31 first shipped.
+
+  Tested both ends, in `t/40-http-parse.t`: the R31 "silent peer" case now
+  sets `handshake_timeout` explicitly and short, so it is proven by the
+  handshake's own budget rather than (as fix round 1 left it) by
+  coincidentally matching the 10s default against a 10s simulated stall. A
+  new case stages a `tls_wrap` that spends most of a short
+  `handshake_timeout`, then a request that is already fully buffered
+  (so the request phase itself takes negligible time) — total elapsed
+  exceeds what the *removed* single combined budget would ever have
+  allowed, and the connection still succeeds, because each phase now has
+  its own budget. Verified by reverting to the single-budget shape and
+  confirming both cases go red — the R31 case for the wrong reason (killed
+  by the request-phase sum instead of the handshake budget) and the new
+  case for the R36 bug itself (watchdog fires on an honest, merely slow
+  client).
+  (`ui-src/lib/ConfigServer/UI/Server.pm`; `t/40-http-parse.t`)
+
 #### Task 5 fix round 1 — the TLS handshake had no deadline, the accept loop could spin, and three fixes had code but no test proving any of it
 
 This round finishes work a previous session started and could not complete:

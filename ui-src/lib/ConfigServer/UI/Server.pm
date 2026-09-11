@@ -95,6 +95,25 @@ our $DEFAULT_MAX_CHILDREN = 32;
 our $DEFAULT_LISTEN_BACKLOG = 64;
 our $DEFAULT_ACCEPT_BACKOFF = 0.1;
 
+# task-5-review.md R36: the TLS handshake's own watchdog budget, separate
+# from HTTP.pm's header/body/write timeouts (see _serve_accepted() below
+# for why they must not share a pool). No row in docs/WEBUI-RPC.md prices
+# this - the contract is silent on Mode B's TLS layer entirely (S14.4) - so
+# this is reasoned from first principles rather than derived: a TLS
+# handshake is a machine-to-machine negotiation with no human typing or
+# reading in the loop, unlike the 15s HEADER_TIMEOUT HTTP.pm gives a client
+# that has to formulate a request, so it does not need that much slack.
+# What it does need is margin for a genuinely slow or lossy network path -
+# a congested mobile link, a slow VPN, a retransmit or two - and a real
+# handshake, even a bad one, completes in low single-digit seconds. 10s is
+# an order of magnitude above that normal case (room for real network
+# trouble) while staying well under HEADER_TIMEOUT's 15s (a handshake has
+# less excuse to be slow than a human does) and short enough that a child
+# stuck in a hostile silent handshake is reaped quickly - strictly faster
+# than before this fix existed at all, when such a child held its slot for
+# the full combined budget rather than only this one.
+our $DEFAULT_HANDSHAKE_TIMEOUT = 10;
+
 ###############################################################################
 # ui.conf (docs/WEBUI-RPC.md section 10)
 #
@@ -385,29 +404,38 @@ sub _netmask {
 #                  handle_connection(). Nothing in t/40 or t/41 needs this;
 #                  it exists so a future integration test can, without
 #                  needing root or a privileged port.
-#   watchdog_exit  the $SIG{ALRM} handler _serve_accepted() installs around
-#                  the TLS handshake plus request handling (task-5-review.md
-#                  R31). Defaults to POSIX::_exit(1), matching every other
-#                  early exit a forked child takes in this file; a test
-#                  overrides it with something that dies instead, so it can
-#                  prove the watchdog actually fired without killing the
-#                  test process itself.
+#   watchdog_exit      the $SIG{ALRM} handler _serve_accepted() installs -
+#                      twice, once per phase (task-5-review.md R31, R36).
+#                      Defaults to POSIX::_exit(1), matching every other
+#                      early exit a forked child takes in this file; a test
+#                      overrides it with something that dies instead, so it
+#                      can prove the watchdog actually fired without
+#                      killing the test process itself.
+#   handshake_timeout  the TLS handshake's own watchdog budget - separate
+#                      from header_timeout/body_timeout/write_timeout
+#                      below (R36: seconds spent negotiating TLS must not
+#                      be charged against the request's own deadlines, or a
+#                      legitimate client on a slow link that fully uses
+#                      each phase's real allowance can be killed having
+#                      violated none of them). Defaults to
+#                      $DEFAULT_HANDSHAKE_TIMEOUT.
 ###############################################################################
 sub new {
 	my ($class, %opt) = @_;
 	return bless {
-		ui_conf_path   => $opt{ui_conf_path} || $DEFAULT_UI_CONF_PATH,
-		app            => $opt{app},
-		tls_wrap       => $opt{tls_wrap},
-		listener       => $opt{listener},
-		max_children   => defined $opt{max_children} ? $opt{max_children} : $DEFAULT_MAX_CHILDREN,
-		backlog        => defined $opt{backlog} ? $opt{backlog} : $DEFAULT_LISTEN_BACKLOG,
-		accept_backoff => defined $opt{accept_backoff} ? $opt{accept_backoff} : $DEFAULT_ACCEPT_BACKOFF,
-		header_timeout => defined $opt{header_timeout} ? $opt{header_timeout} : $ConfigServer::UI::HTTP::HEADER_TIMEOUT,
-		body_timeout   => defined $opt{body_timeout}   ? $opt{body_timeout}   : $ConfigServer::UI::HTTP::BODY_TIMEOUT,
-		write_timeout  => defined $opt{write_timeout}  ? $opt{write_timeout}  : $ConfigServer::UI::HTTP::WRITE_TIMEOUT,
-		watchdog_exit  => $opt{watchdog_exit} || sub { POSIX::_exit(1) },
-		allow          => $opt{allow} || [],
+		ui_conf_path      => $opt{ui_conf_path} || $DEFAULT_UI_CONF_PATH,
+		app               => $opt{app},
+		tls_wrap          => $opt{tls_wrap},
+		listener          => $opt{listener},
+		max_children      => defined $opt{max_children} ? $opt{max_children} : $DEFAULT_MAX_CHILDREN,
+		backlog           => defined $opt{backlog} ? $opt{backlog} : $DEFAULT_LISTEN_BACKLOG,
+		accept_backoff    => defined $opt{accept_backoff} ? $opt{accept_backoff} : $DEFAULT_ACCEPT_BACKOFF,
+		handshake_timeout => defined $opt{handshake_timeout} ? $opt{handshake_timeout} : $DEFAULT_HANDSHAKE_TIMEOUT,
+		header_timeout    => defined $opt{header_timeout} ? $opt{header_timeout} : $ConfigServer::UI::HTTP::HEADER_TIMEOUT,
+		body_timeout      => defined $opt{body_timeout}   ? $opt{body_timeout}   : $ConfigServer::UI::HTTP::BODY_TIMEOUT,
+		write_timeout     => defined $opt{write_timeout}  ? $opt{write_timeout}  : $ConfigServer::UI::HTTP::WRITE_TIMEOUT,
+		watchdog_exit     => $opt{watchdog_exit} || sub { POSIX::_exit(1) },
+		allow             => $opt{allow} || [],
 	}, $class;
 }
 
@@ -524,22 +552,39 @@ sub _default_tls_wrap {
 # Everything a forked child of run()'s accept loop does with one accepted,
 # already allowlist-checked connection: wrap it in TLS, verify the wrap
 # actually produced TLS, hand it to handle_connection(), close. Extracted
-# from run() so it is callable - and its watchdog provable - without a real
-# fork (task-5-review.md R31/R32).
+# from run() so it is callable - and its watchdogs provable - without a
+# real fork (task-5-review.md R31/R32/R36).
 #
-# BOUNDED, END TO END, BY A WATCHDOG (R31). HTTP.pm's own 15s-headers/15s-
-# body deadlines are excellent, and they do not start until start_SSL()
-# returns - a peer that completes the TCP handshake and then sends nothing,
-# or an SSL handshake that never completes on either side, parks this child
-# forever with nothing of this module's own making to stop it. Thirty-two
-# such connections - $DEFAULT_MAX_CHILDREN, no more - permanently deny the
-# admin UI: every slot is held by a child that will never exit, waitpid()
-# never reaps them because they never exit, and every further peer, however
-# legitimate, is refused at the "busy" check with no attacker having sent a
-# single byte HTTP.pm would ever see. The watchdog covers the handshake
-# AND the header wait AND the body wait AND the response write, because any
-# one of those - not only the handshake - can be the thing that never
-# completes.
+# BOUNDED, END TO END, BY TWO WATCHDOGS, NOT ONE (R31, then R36). HTTP.pm's
+# own 15s-headers/15s-body deadlines are excellent, and they do not start
+# until start_SSL() returns - a peer that completes the TCP handshake and
+# then sends nothing, or an SSL handshake that never completes on either
+# side, parks this child forever with nothing of this module's own making
+# to stop it. Thirty-two such connections - $DEFAULT_MAX_CHILDREN, no more
+# - permanently deny the admin UI: every slot is held by a child that will
+# never exit, waitpid() never reaps them because they never exit, and every
+# further peer, however legitimate, is refused at the "busy" check with no
+# attacker having sent a single byte HTTP.pm would ever see. R31's original
+# fix armed one alarm, sized to header_timeout + body_timeout +
+# write_timeout summed, before the handshake even began - which closed the
+# hang but opened a narrower version of the same problem the review caught
+# as R36: the handshake was drawing from the SAME budget the request phase
+# needs, so a legitimate client with non-trivial handshake latency, who
+# then goes on to use close to its own allowance for headers, body and the
+# response write, can be killed having violated no single per-phase
+# deadline at all - a failure mode that could not exist before R31, because
+# before it there was no deadline of any kind here.
+#
+# The fix is two alarms, each covering only what it is named for, with a
+# clean handoff between them: $handshake_timeout (own reasoning at
+# $DEFAULT_HANDSHAKE_TIMEOUT above) covers ONLY tls_wrap; that alarm is
+# cancelled the instant it returns (success or failure), and only then, if
+# the wrap produced real TLS, is a second alarm armed - the same
+# header_timeout + body_timeout + write_timeout sum as before, now
+# starting fresh rather than continuing to run down a clock the handshake
+# already spent from. A peer stuck in either phase is still killed,
+# promptly, by that phase's own budget; a peer that is merely slow, in
+# either phase, and stays within it, is not.
 #
 # alarm()/$SIG{ALRM}, not this module's usual select()-based style:
 # select() cannot interrupt a blocking call already inside
@@ -554,13 +599,13 @@ sub _default_tls_wrap {
 sub _serve_accepted {
 	my ($self, $connection, $peer_addr) = @_;
 
-	my $budget = $self->{header_timeout} + $self->{body_timeout} + $self->{write_timeout};
 	local $SIG{ALRM} = $self->{watchdog_exit};
-	Time::HiRes::alarm($budget);
 
+	Time::HiRes::alarm($self->{handshake_timeout});
 	my $tls_socket = $self->{tls_wrap}
 		? $self->{tls_wrap}->($connection)
 		: _default_tls_wrap($connection);
+	Time::HiRes::alarm(0); # handshake phase over (however it went); its budget does not carry forward
 
 	# R32: tls_wrap is a constructor injection so tests never need a real
 	# certificate or IO::Socket::SSL installed - but that makes it a seam
@@ -572,7 +617,10 @@ sub _serve_accepted {
 	# something that is not a blessed reference at all, and a method call
 	# on that would die instead of simply failing the check.
 	if ($tls_socket && UNIVERSAL::isa($tls_socket, 'IO::Socket::SSL')) {
+		my $request_budget = $self->{header_timeout} + $self->{body_timeout} + $self->{write_timeout};
+		Time::HiRes::alarm($request_budget); # a fresh budget for this phase alone (R36)
 		$self->handle_connection($tls_socket, $peer_addr);
+		Time::HiRes::alarm(0);
 		close $tls_socket;
 	}
 	else {
@@ -580,7 +628,6 @@ sub _serve_accepted {
 		close $connection;
 	}
 
-	Time::HiRes::alarm(0);
 	return;
 }
 

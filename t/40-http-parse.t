@@ -40,7 +40,7 @@ use lib "$FindBin::Bin/..", "$FindBin::Bin/../ui-src/lib";
 use File::Temp qw(tempdir);
 use Socket ();
 use Time::HiRes ();
-use Test::More tests => 125;
+use Test::More tests => 128;
 
 require_ok('ConfigServer::UI::HTTP');
 require_ok('ConfigServer::UI::Server');
@@ -598,17 +598,27 @@ sub _conf {
 # and watchdog_exit is overridden so the test can observe the watchdog
 # firing rather than being killed by it (the real default is
 # POSIX::_exit(1), which would end this test process too).
+#
+# handshake_timeout is set explicitly and short (task-5-review.md R36):
+# the handshake now has its own budget, separate from
+# header_timeout/body_timeout/write_timeout below, so it is
+# handshake_timeout alone that must bound this case - the fix-round-1
+# version of this test left handshake_timeout at its 10s default and
+# happened to still pass (barely) only because the stuck handshake was
+# staged at exactly 10s too; this version does not depend on that
+# coincidence.
 ###############################################################################
 {
 	my ($near, $far) = _pair();
 	my $app = FakeApp->new;
 	my $server = $S->new(
-		app            => $app,
-		header_timeout => 0.1,
-		body_timeout   => 0.1,
-		write_timeout  => 0.1,
-		tls_wrap       => sub { select(undef, undef, undef, 10); return $_[0] },
-		watchdog_exit  => sub { die "R31 watchdog fired\n" },
+		app               => $app,
+		handshake_timeout => 0.1,
+		header_timeout    => 1,
+		body_timeout      => 1,
+		write_timeout     => 1,
+		tls_wrap          => sub { select(undef, undef, undef, 10); return $_[0] },
+		watchdog_exit     => sub { die "R31 watchdog fired\n" },
 	);
 
 	my $t0 = Time::HiRes::time();
@@ -619,8 +629,65 @@ sub _conf {
 	like($died, qr/R31 watchdog fired/,
 		'R31: a tls_wrap that never returns is killed by the watchdog, not left to hang the child forever');
 	cmp_ok($elapsed, '<', 2,
-		"R31: and it is killed within the configured budget ($elapsed s), not the 10s the stuck handshake simulated");
+		"R31: and it is killed within the handshake's own budget ($elapsed s), not the 10s the stuck handshake simulated");
 	is(scalar(@{ $app->{calls} }), 0, 'R31: dispatch() is never reached by a connection stuck in the handshake');
+}
+
+###############################################################################
+# ConfigServer::UI::Server->_serve_accepted() - task-5-review.md R36
+# (Important, found in the re-review of R31's own fix): R31's watchdog
+# originally armed ONE alarm, sized to header_timeout + body_timeout +
+# write_timeout, before the handshake even began - so the handshake spent
+# from the SAME pool the request phase needed, and a legitimate client
+# that used a meaningful slice of each phase's real allowance, without
+# ever exceeding any one of them, could still be killed. This failure mode
+# did not exist before R31 - there was no deadline at all to blow through
+# before it.
+#
+# Proven both ends in one case: tls_wrap deliberately uses most (not all)
+# of a short handshake_timeout before returning a real-enough TLS socket,
+# and the total time this takes is already MORE than a since-removed
+# single combined budget would have allowed (0.2s handshake against what
+# would have been a 0.15s combined pool) - the exact shape of the bug.
+# Under the two-budget fix, the handshake's own 0.3s budget comfortably
+# covers the 0.2s spent, a fresh budget is armed for the request phase
+# alone, and the already-buffered request (written before _serve_accepted
+# is even called, so no further wait is needed) completes in a fraction of
+# that fresh budget - the watchdog never fires, and a real response
+# reaches the wire.
+###############################################################################
+{
+	my ($near, $far) = _pair();
+	syswrite($far, "GET /api/status HTTP/1.1\r\nHost: x\r\n\r\n");
+	my $app = FakeApp->new;
+	my $server = $S->new(
+		app               => $app,
+		handshake_timeout => 0.3,
+		header_timeout    => 0.05,
+		body_timeout      => 0.05,
+		write_timeout     => 0.05,
+		tls_wrap          => sub {
+			select(undef, undef, undef, 0.2); # most of the 0.3s handshake budget, none of the 0.15s a combined pool would have given
+			# A blessed stand-in, not a real IO::Socket::SSL (not installed
+			# in this workspace) - Server.pm's own header comment on
+			# tls_wrap promises exactly this is enough for a test: the
+			# isa() check R32 added only cares that ref() names the class.
+			bless $_[0], 'IO::Socket::SSL';
+			return $_[0];
+		},
+		watchdog_exit => sub { die "R36 watchdog fired (should not have)\n" },
+	);
+
+	my $t0 = Time::HiRes::time();
+	my $died = eval { $server->_serve_accepted($near, '203.0.113.9'); 1 } ? '' : $@;
+	my $elapsed = Time::HiRes::time() - $t0;
+	close $far;
+
+	is($died, '', 'R36: a client slow in the handshake but within its own budget is not killed by the watchdog')
+		or diag("died with: $died");
+	cmp_ok($elapsed, '<', 0.4,
+		"R36: total elapsed ($elapsed s) exceeds what a combined 0.15s budget would ever have allowed, and it still succeeded");
+	is(scalar(@{ $app->{calls} }), 1, 'R36: and the request the client sent was actually served');
 }
 
 ###############################################################################
