@@ -37,7 +37,8 @@ use lib "$FindBin::Bin/..", "$FindBin::Bin/../ui-src/lib";
 
 use File::Temp qw(tempdir);
 use Socket ();
-use Test::More tests => 474;
+use POSIX ();
+use Test::More tests => 498;
 
 use ConfigServer::UI::Rollback ();
 use ConfigServer::UI::Firewall ();
@@ -1571,16 +1572,14 @@ ANSWERS
 	# A socket whose peer has gone. write_response() returns 0 here; it does
 	# not die, which is the whole point of the finding.
 	SKIP: {
-		local $SIG{PIPE} = 'IGNORE';
-
-		# Whether this platform refuses a large write to a socket whose peer
-		# has gone is established INDEPENDENTLY, on a socketpair of this
-		# test's own - never from write_response_to()'s answer. Skipping on
-		# that answer would make this block skip itself into a pass the
-		# moment the guard it exists for was removed, which is the second
-		# time this suite has caught that shape and the reason it is spelled
-		# out here.
+		# NOTE: SIGPIPE is NOT ignored around the assertions below - only
+		# around this test's own probe, which needs it to survive staging the
+		# condition. write_response_to() has to protect ITSELF (R79); if it
+		# does not, this test dies of SIGPIPE rather than failing politely,
+		# which is a red either way and is the behavioural evidence the
+		# previous round could only assert about the source.
 		my $refuses = do {
+			local $SIG{PIPE} = 'IGNORE';
 			socketpair(my $p, my $q, Socket::AF_UNIX(), Socket::SOCK_STREAM(), 0)
 				or last;
 			close $q;
@@ -1618,8 +1617,10 @@ ANSWERS
 	local $/;
 	my $source = <$fh>;
 	close $fh;
-	like($source, qr/\$SIG\{PIPE\}\s*=\s*'IGNORE'/,
-		'serve() ignores SIGPIPE, as ConfigServer::UI::Server::run() already does');
+	like($source, qr/local \$SIG\{PIPE\}\s*=\s*'IGNORE'/,
+		'the SIGPIPE ignore is local - scoped to the write, so it is not inherited across exec (R80)');
+	unlike($source, qr/^\s*\$SIG\{PIPE\}\s*=\s*'IGNORE'/m,
+		'and never set unscoped, which is how it would reach a child');
 }
 
 ###############################################################################
@@ -1668,23 +1669,160 @@ ANSWERS
 	my @after_comm = ('S', 1, 1000, 1000, 0, -1, 4194560,
 		100, 200, 0, 0, 10, 20, 5, 5, 20, 0, 1, 0, 9876543, 12345678, 999);
 	my $ordinary = "4242 (perl) " . join(' ', @after_comm) . "\n";
-	is($P->can('_parse_proc_stat')->($ordinary), '9876543', 'an ordinary stat line parses');
+	is($P->can('_parse_proc_stat')->($ordinary)->{started}, '9876543', 'an ordinary stat line parses');
+	is($P->can('_parse_proc_stat')->($ordinary)->{state}, 'S', 'and yields the process state too');
 
 	# The same process, named so that its comm contains ") " - which is
 	# legal, and is what an attacker who can name a process would choose.
 	my $hostile = "4242 (evil) 1 2 3 4) " . join(' ', @after_comm) . "\n";
-	is($P->can('_parse_proc_stat')->($hostile), '9876543',
+	is($P->can('_parse_proc_stat')->($hostile)->{started}, '9876543',
 		'and so does one whose executable name contains ") " - the LAST paren is the landmark');
+	is($P->can('_parse_proc_stat')->($hostile)->{state}, 'S',
+		'with the state still read from the right field');
 
 	# Spaces alone, without a paren, were never the problem but must survive.
 	my $spaced = "4242 (my program) " . join(' ', @after_comm) . "\n";
-	is($P->can('_parse_proc_stat')->($spaced), '9876543', 'a name with spaces parses');
+	is($P->can('_parse_proc_stat')->($spaced)->{started}, '9876543', 'a name with spaces parses');
 
-	is($P->can('_parse_proc_stat')->('4242 perl S 1 2 3'), '',
+	# R78: the state that matters.
+	my @zombie_fields = @after_comm;
+	$zombie_fields[0] = 'Z';
+	my $zombie = "4242 (perl) " . join(' ', @zombie_fields) . "\n";
+	is($P->can('_parse_proc_stat')->($zombie)->{state}, 'Z', 'a zombie is read as Z');
+	is($P->can('_parse_proc_stat')->($zombie)->{started}, '9876543',
+		'and keeps its start time - which is exactly why the state has to be checked separately');
+
+	is_deeply($P->can('_parse_proc_stat')->('4242 perl S 1 2 3'), {},
 		'a line with no parenthesis at all yields nothing, rather than a wrong number');
-	is($P->can('_parse_proc_stat')->("4242 (perl) S 1 2\n"), '',
+	is_deeply($P->can('_parse_proc_stat')->("4242 (perl) S 1 2\n"), {},
 		'and so does a line too short to hold field 22');
-	is($P->can('_parse_proc_stat')->(undef), '', 'undef yields nothing');
+	is_deeply($P->can('_parse_proc_stat')->(undef), {}, 'undef yields nothing');
+}
+{
+	# R78 END TO END: a ZOMBIE owner must not be treated as confirmed-live.
+	#
+	# kill(0) succeeds on a zombie, its pid is still there and its start time
+	# still matches - so before this check it satisfied every test
+	# _state_is_live() applied, and R74's "a confirmed live owner outranks
+	# the clock" then honoured the record of a wizard that had EXITED. That
+	# re-opens a firewall port inside a process that will not close it, which
+	# is R71's hole reached through R74's fix.
+	#
+	# A real zombie is forked here rather than simulated: the whole finding is
+	# that kill(0) and the start time cannot tell one apart, so a fake would
+	# be testing the wrong thing.
+	SKIP: {
+		skip 'no /proc, so a zombie cannot be told from a live process here', 4
+			unless -r "/proc/$$/stat";
+
+		my $child = fork();
+		defined $child or skip 'fork unavailable', 4;
+		if (!$child) { POSIX::_exit(0) }          # exits at once; never reaped below
+		select(undef, undef, undef, 0.3);
+
+		my $stat = ConfigServer::UI::Setup::_proc_stat($child);
+		skip 'the child was reaped before it could be observed as a zombie', 4
+			unless ($stat->{state} || '') eq 'Z';
+
+		ok(kill(0, $child), 'kill(0) succeeds on the zombie - which is why it fooled the old check');
+
+		my $w = world(systemd => 1);
+		# Stateful, so that WITHOUT the zombie check this re-assertion would
+		# SUCCEED - otherwise it would fail on E_READBACK instead and the
+		# assertion below would pass for entirely the wrong reason.
+		my $RENDERED = '-A INPUT -s 203.0.113.5/32 -p tcp -m comment --comment csf-ui-setup -m tcp --dport 8444 -j ACCEPT';
+		my @rules;
+		my $runner = FakeRunner->new
+			->on(qr{is-active firewalld}, { exit => 3, output => "inactive\n" })
+			->on(qr{^/sbin/iptables --version\z}, { output => "iptables v1.8.7 (nf_tables)\n" })
+			->on(qr{ -I INPUT 1 }, sub { push @rules, $RENDERED; return { exit => 0, output => '' } })
+			->on(qr{ -S INPUT\z}, sub {
+				return { exit => 0, output => join("\n", '-P INPUT ACCEPT', @rules) . "\n" };
+			});
+		my $firewall = firewall_for($runner, iptables => '/sbin/iptables');
+		my $setup = $S->new(firewall => $firewall, rollback => $w->{rollback},
+			state_dir => "$w->{root}/state", token => 't');
+
+		$setup->save_state({ kind => 'iptables', binary => '/sbin/iptables', chain => 'INPUT',
+			port => 8444, address => '203.0.113.5', canonical => $RENDERED },
+			owner => { pid => $child, started => $stat->{started}, created => time() });
+
+		my $out = $setup->reassert_temporary_port;
+		is($out->{ok}, 0, 'a record owned by a zombie is NOT acted on');
+		like($out->{reason}, qr/waiting to be reaped/, 'and says the session it belonged to is over');
+		is($runner->ran(qr{ -I INPUT 1 }), 0,
+			'AND NO PORT WAS RE-OPENED - the hole R71 closed stays closed');
+
+		waitpid($child, 0);
+	}
+}
+
+###############################################################################
+# Message quality: text that asserts no more than the code established, and
+# advice for every refusal rather than only the first one that got written.
+###############################################################################
+{
+	# E_EXEC blocks the SHELL path exactly as it blocks the browser path, so
+	# "apply from a shell instead" is not advice to somebody who already is.
+	# A refusal that leaves the operator nowhere to go is one they work
+	# around, and the way around this one is applying with no rollback.
+	my $w = world(systemd => 1, setup_bin => "$FindBin::Bin/../no-such-binary");
+	my $setup = setup_for($w);
+	my ($answer) = $S->can('parse_answers')->(qq{TCP_IN="22,443"\n});
+	my $result = $setup->apply(answers => $answer);
+
+	is($result->{code}, 'E_EXEC', 'an unexecutable rollback binary stops the apply');
+	like($result->{reason}, qr/installation fault/,
+		'and the operator is told what kind of problem it is');
+	like($result->{reason}, qr/0750 root:csfui/, 'with the mode and owner to restore');
+	unlike($result->{reason}, qr/Apply from a shell you can watch instead/,
+		'and NOT advice that is useless to the shell operator who just hit this');
+	like($result->{reason}, qr/nothing will undo a mistake for you/,
+		'though they are still told what applying without a rollback means');
+}
+{
+	my $w = world(systemd => 0);
+	my $setup = setup_for($w);
+	my ($answer) = $S->can('parse_answers')->(qq{TCP_IN="22,443"\n});
+	my $result = $setup->apply(answers => $answer);
+	is($result->{code}, 'E_NO_SYSTEMD', 'the systemd refusal still has its own advice');
+	like($result->{reason}, qr/Apply from a shell you can watch instead/, 'which is this one');
+}
+{
+	# R76's headline must be true in the case that branch is actually
+	# reached: _remove_units unlinks TWO files and either can fail on its
+	# own, and armed() is true only when BOTH are present - so this branch
+	# is also reached with one unit file still sitting on disk.
+	my $w = world(systemd => 1);
+	my $setup = setup_for($w);
+	my $snap = $w->{rollback}->snapshot;
+	$w->{rollback}->arm($snap->{dir});
+	$w->{runner}->on(qr{systemctl (?:stop|disable|daemon-reload)}, { exit => 1, output => "Failed.\n" });
+	unlink "$w->{root}/units/csf-ui-rollback.timer";   # half-removed by hand
+
+	my ($headline, $detail, $needs_action) = $setup->confirm_outcome($setup->confirm);
+	is($needs_action, 1, 'a half-removal that did not go cleanly needs action');
+	unlike($headline, qr/unit files are gone/,
+		'and the headline does NOT claim the files are gone - one of them may still be there');
+	like($detail, qr/rm -f /, 'the advice includes the rm -f a half-removal needs');
+	like($detail, qr/systemctl daemon-reload/, 'and the reload that makes systemd forget it');
+}
+{
+	# Both failure branches hand out the same complete sequence.
+	my $w = world(systemd => 1);
+	my $setup = setup_for($w);
+	my $snap = $w->{rollback}->snapshot;
+	$w->{rollback}->arm($snap->{dir});
+	$w->{runner}->on(qr{systemctl stop}, { exit => 1, output => "Failed.\n" });
+	chmod 0500, "$w->{root}/units";
+	my (undef, $armed_detail) = $setup->confirm_outcome($setup->confirm);
+	chmod 0755, "$w->{root}/units";
+	SKIP: {
+		skip 'running as root, where a read-only directory is no obstacle', 3 if $> == 0;
+		like($armed_detail, qr/systemctl stop csf-ui-rollback\.timer/, 'stop');
+		like($armed_detail, qr/rm -f .*csf-ui-rollback\.timer .*csf-ui-rollback\.service/, 'both unit files');
+		like($armed_detail, qr/systemctl daemon-reload/, 'and the reload');
+	}
 }
 
 ###############################################################################
@@ -1886,15 +2024,16 @@ ANSWERS
 	ok(!-e $setup->state_path, 'and clears the record');
 }
 {
-	# _proc_started, on this very process: the check has to actually work,
-	# not merely be called.
-	my $mine = ConfigServer::UI::Setup::_proc_started($$);
+	# _proc_stat, on this very process: the check has to actually work, not
+	# merely be called.
+	my $mine = ConfigServer::UI::Setup::_proc_stat($$);
 	SKIP: {
-		skip 'no /proc on this platform', 3 unless -r "/proc/$$/stat";
-		like($mine, qr/^[0-9]+\z/, 'a start time is read for a live process');
-		is(ConfigServer::UI::Setup::_proc_started(999999), '',
+		skip 'no /proc on this platform', 4 unless -r "/proc/$$/stat";
+		like($mine->{started}, qr/^[0-9]+\z/, 'a start time is read for a live process');
+		like($mine->{state}, qr/^[A-Za-z]\z/, 'and its state');
+		is_deeply(ConfigServer::UI::Setup::_proc_stat(999999), {},
 			'and nothing for a pid that is not there');
-		is(ConfigServer::UI::Setup::_proc_started('not-a-pid'), '', 'or for a non-pid');
+		is_deeply(ConfigServer::UI::Setup::_proc_stat('not-a-pid'), {}, 'or for a non-pid');
 	}
 }
 

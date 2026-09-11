@@ -42,7 +42,7 @@ use FindBin ();
 use POSIX ();
 use lib "$FindBin::Bin/..", "$FindBin::Bin/../ui-src/lib";
 
-use Test::More tests => 206;
+use Test::More tests => 210;
 
 use ConfigServer::UI::Firewall ();
 my $F = 'ConfigServer::UI::Firewall';
@@ -937,6 +937,51 @@ sub iptables_fixture {
 	my $result = ConfigServer::UI::Firewall::_run_argv('iptables', '-L', 1);
 	is($result->{error}, 'argv[0] is not an absolute path',
 		'the default runner refuses a relative argv[0]');
+}
+
+###############################################################################
+# R80: AN IGNORED SIGNAL IS INHERITED ACROSS exec, AND MUST NOT BE.
+#
+# A signal HANDLER is reset by the kernel across exec - its address means
+# nothing in the new image - but SIG_IGN survives, and an inherited ignore is
+# a silent, lasting change to a program this code did not write. csf installs
+# its own handling and is entitled to start from the default; a child that
+# never notices a broken pipe, or cannot be killed by SIGTERM, is a child
+# debugged by somebody with no idea this program touched it.
+#
+# Read from the child's own /proc/self/status rather than asserted about the
+# source, because the question is what the KERNEL did, not what the code says.
+###############################################################################
+{
+	my $cat = ConfigServer::UI::Firewall::_locate('cat');
+	SKIP: {
+		skip 'no cat on this system, or no /proc/self/status', 4
+			unless $cat && -r '/proc/self/status';
+
+		my $fw = $F->new;   # the real runner: a real fork and a real exec
+
+		# Every disposition this program is capable of setting, set here, so
+		# the test is not proving something narrower than the code claims.
+		my %ignored;
+		{
+			local $SIG{PIPE} = 'IGNORE';
+			local $SIG{HUP}  = 'IGNORE';
+			local $SIG{INT}  = 'IGNORE';
+			local $SIG{TERM} = 'IGNORE';
+
+			my $result = $fw->run($cat, '/proc/self/status');
+			my ($mask) = $result->{output} =~ /^SigIgn:\s*([0-9A-Fa-f]+)/m;
+			skip 'this kernel does not report SigIgn', 4 unless defined $mask;
+			my $bits = hex(substr($mask, -8));
+			%ignored = map { $_->[0] => (($bits & (1 << ($_->[1] - 1))) ? 1 : 0) }
+				(['PIPE', 13], ['HUP', 1], ['INT', 2], ['TERM', 15]);
+		}
+
+		is($ignored{PIPE}, 0, 'a child does not inherit an ignored SIGPIPE');
+		is($ignored{HUP},  0, 'nor SIGHUP');
+		is($ignored{INT},  0, 'nor SIGINT');
+		is($ignored{TERM}, 0, 'nor SIGTERM - csf is entitled to start from the default');
+	}
 }
 
 ###############################################################################

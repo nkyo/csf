@@ -671,11 +671,7 @@ sub apply {
 			ok       => 0,
 			code     => $armed->{code},
 			reason   => 'the independent rollback timer could not be armed, so nothing was applied: '
-				. $armed->{reason}
-				. ($armed->{code} && $armed->{code} eq 'E_NO_SYSTEMD'
-					? '. Apply from a shell you can watch instead (csf-ui-setup --answers FILE --yes), '
-					. 'with a second session already open, so a mistake can be undone by hand.'
-					: ''),
+				. $armed->{reason} . _arm_advice($armed->{code}),
 			snapshot => $snapshot->{dir},
 			problems => [],
 		};
@@ -936,6 +932,33 @@ sub _precheck_ui_conf {
 	return ($ok, $problems);
 }
 
+# WHAT TO DO NEXT, for every reason arming can fail - not only the first one
+# that got written.
+#
+# E_EXEC blocks the shell path exactly as it blocks the browser path, so an
+# operator running csf-ui-setup --answers FILE --yes hit a hard stop with no
+# guidance at all: "apply from a shell instead" is not advice to somebody who
+# already is. A refusal that leaves the operator with nowhere to go is a
+# refusal they will work around, and the way they work around this one is by
+# applying with no rollback at all.
+sub _arm_advice {
+	my ($code) = @_;
+	$code = '' unless defined $code;
+
+	return '. Apply from a shell you can watch instead (csf-ui-setup --answers FILE --yes), '
+		. 'with a second session already open, so a mistake can be undone by hand.'
+		if $code eq 'E_NO_SYSTEMD';
+
+	return '. This is an installation fault, not a configuration one: the file systemd would '
+		. 'run is not there or cannot be executed. Reinstall or repair csf-ui (the setup binary '
+		. 'should be 0750 root:csfui), then apply again. Until then, apply only from a shell you '
+		. 'can watch, with a second session already open, because nothing will undo a mistake for you.'
+		if $code eq 'E_EXEC';
+
+	return '. Apply only from a shell you can watch, with a second session already open, '
+		. 'because nothing will undo a mistake for you.';
+}
+
 sub confirm {
 	my ($self) = @_;
 	my $result = $self->{rollback}->confirm;
@@ -966,6 +989,18 @@ sub confirm {
 # is not talking - which is exactly the situation where the first two are in
 # doubt.
 ###############################################################################
+# The one sequence that definitely cancels a rollback, whatever state the
+# half-finished one is in: stop it, stop it starting again, delete both unit
+# files, and make systemd forget what it loaded. Written once because both
+# failure branches need it and they must not drift apart.
+sub _cancel_by_hand {
+	my $timer   = $ConfigServer::UI::Rollback::TIMER_UNIT;
+	my $service = $ConfigServer::UI::Rollback::SERVICE_UNIT;
+	return "systemctl stop $timer && systemctl disable $timer"
+		. " && rm -f /etc/systemd/system/$timer /etc/systemd/system/$service"
+		. ' && systemctl daemon-reload';
+}
+
 sub confirm_outcome {
 	my ($self, $result) = @_;
 
@@ -978,12 +1013,7 @@ sub confirm_outcome {
 	return ('THE ROLLBACK TIMER IS STILL ARMED - it will restore the previous configuration.',
 		'Cancelling it failed'
 			. (length $detail ? ": $detail" : '')
-			. '. Remove it by hand now: systemctl stop '
-			. $ConfigServer::UI::Rollback::TIMER_UNIT
-			. ' && systemctl disable ' . $ConfigServer::UI::Rollback::TIMER_UNIT
-			. ' && rm -f /etc/systemd/system/' . $ConfigServer::UI::Rollback::TIMER_UNIT
-			. ' /etc/systemd/system/' . $ConfigServer::UI::Rollback::SERVICE_UNIT
-			. ' && systemctl daemon-reload',
+			. '. Remove it by hand now: ' . _cancel_by_hand(),
 		1)
 		if $armed;
 
@@ -993,10 +1023,15 @@ sub confirm_outcome {
 	# systemd holding a timer it has already loaded, which can still fire
 	# with no file on disk to explain it. armed() cannot see that; only
 	# confirm()'s own result can, so both are consulted.
-	return ('THE ROLLBACK MAY STILL FIRE - its unit files are gone, but systemd was not told cleanly.',
+	# NOT "its unit files are gone": _remove_units() unlinks two files and
+	# either can fail on its own, and armed() is true only when BOTH are
+	# present - so this branch is also reached with one unit file still
+	# sitting there. The old wording asserted more than had been
+	# established, which is the fault this project keeps finding, and it
+	# left out the rm -f that a half-removal is exactly the case for.
+	return ('THE ROLLBACK MAY STILL FIRE - cancelling it did not complete cleanly.',
 		'Cancelling reported: ' . (length $detail ? $detail : 'an unspecified failure')
-			. '. Make sure by running: systemctl stop ' . $ConfigServer::UI::Rollback::TIMER_UNIT
-			. ' && systemctl daemon-reload',
+			. '. Make sure of it by running: ' . _cancel_by_hand(),
 		1)
 		unless $result->{ok};
 
@@ -1558,6 +1593,25 @@ sub _tls_wrap {
 sub write_response_to {
 	my ($self, $socket, $response, $request) = @_;
 
+	# R79/R80: SIGPIPE is ignored HERE, around the one syscall that can
+	# raise it, rather than across the whole accept loop.
+	#
+	# Two things follow, and both are the point. Behaviourally this function
+	# is now self-protecting: writing to a socket the browser has closed
+	# returns a reportable failure instead of killing the process - which
+	# would take the wizard down mid-session and skip the cleanup that
+	# removes the temporary firewall rule. And a test can now stage exactly
+	# that without ignoring the signal on this function's behalf, which is
+	# what turns the previous round's source assertion into a behavioural
+	# one.
+	#
+	# The narrow scope also closes R80 from the other end: SIG_IGN survives
+	# exec (unlike a handler, which the kernel resets because its address
+	# means nothing in the new image), so a loop-wide ignore was inherited
+	# by csf -r and by the re-exec'd CLI. This program has no business
+	# changing the signal disposition of programs it did not write.
+	local $SIG{PIPE} = 'IGNORE';
+
 	my $written = eval {
 		$H->can('write_response')->($socket, $response,
 			timeout => $ConfigServer::UI::HTTP::WRITE_TIMEOUT);
@@ -1590,15 +1644,11 @@ sub serve {
 
 	my $plan = ref($opt{plan}) eq 'HASH' ? $opt{plan} : $self->listen_plan(undef);
 
-	# Without this, writing to a socket the browser has already closed
-	# raises SIGPIPE and the default disposition KILLS THIS PROCESS - which
-	# would take the wizard down mid-session and, worse, skip the cleanup
-	# that removes the temporary firewall rule. The same line, for the same
-	# reason, is in ConfigServer::UI::Server::run(). It also has to come
-	# before any of the reporting above can matter: a signal that kills the
-	# process gets there first (task-8-review.md R75).
-	local $SIG{PIPE} = 'IGNORE';
-
+	# NOTE: SIGPIPE is NOT ignored across this loop. It is ignored inside
+	# write_response_to(), around the one call that can raise it - see there
+	# for why the narrow scope is deliberate (R80: SIG_IGN is inherited
+	# across exec, and this loop forks and execs csf and this program's own
+	# CLI in the middle of handling a request).
 	my $listener = $self->_listen_on($plan->{bind});
 	my $deadline = $self->{now}->() + $ABSOLUTE_LIFETIME;
 	my $idle_since = $self->{now}->();
@@ -1728,7 +1778,7 @@ sub save_state {
 	my %record = (
 		%$spec,
 		pid     => (defined $owner->{pid}     ? $owner->{pid}     : $$),
-		started => (defined $owner->{started} ? $owner->{started} : _proc_started($$)),
+		started => (defined $owner->{started} ? $owner->{started} : (_proc_stat($$)->{started} || '')),
 		created => (defined $owner->{created} ? $owner->{created} : $self->{now}->()),
 	);
 	$spec = \%record;
@@ -1776,46 +1826,55 @@ sub load_state {
 # reused, and on a busy machine they are reused quickly. Returns '' where
 # there is no /proc, in which case the age cap in _state_is_live() is the
 # only defence left and is applied just the same.
-sub _proc_started {
+sub _proc_stat {
 	my ($pid) = @_;
-	return '' unless defined $pid && $pid =~ /^[1-9][0-9]*\z/;
-	open(my $fh, '<', "/proc/$pid/stat") or return '';
+	return {} unless defined $pid && $pid =~ /^[1-9][0-9]*\z/;
+	open(my $fh, '<', "/proc/$pid/stat") or return {};
 	my $line = <$fh>;
 	close $fh;
 	return _parse_proc_stat($line);
 }
 
 ###############################################################################
-# _parse_proc_stat($line) -> the start time, or ''
+# _parse_proc_stat($line) -> { started => ..., state => ... }, or {}
 #
 # Split out so it is testable without a process whose name contains a
-# parenthesis, which is the case this exists to survive and which no test can
-# conveniently create.
+# parenthesis and without a zombie - the two cases this exists to survive,
+# neither of which a test can conveniently create.
 #
 # Field 2 of /proc/<pid>/stat is the executable name in parentheses, and it
 # is NOT escaped: a process can be called "evil) 1 2 3 4" and every field
 # after it will appear to move. The only reliable landmark is the LAST ')'
 # in the line, because everything after it is fixed-format numbers.
 #
-# The previous version used a regex whose comment claimed exactly this and
-# whose behaviour was the opposite (task-8-review.md R77): /\)\s+(.*)\z/
-# with a greedy .* still matches at the FIRST ') ' the engine reaches, since
+# The version before task-8-review.md R77 used a regex whose comment claimed
+# exactly this and whose behaviour was the opposite: /\)\s+(.*)\z/ with a
+# greedy .* still matches at the FIRST ') ' the engine reaches, since
 # (.*)\z succeeds from anywhere. Harmless for a paren-free name and wrong
 # precisely for the crafted one - a guard at its weakest exactly where it is
 # needed, which is not a guard.
+#
+# TWO fields are read, not one. Field 3 is the process STATE, and R78 is why
+# it matters: a zombie satisfies kill(0) and keeps its start time, so without
+# it an exited-but-unreaped wizard reads as a confirmed-live owner.
 ###############################################################################
 sub _parse_proc_stat {
 	my ($line) = @_;
-	return '' unless defined $line;
+	return {} unless defined $line;
 
 	my $close = rindex($line, ')');
-	return '' if $close < 0;
+	return {} if $close < 0;
 
 	my $tail = substr($line, $close + 1);
 	$tail =~ s/^\s+//;
 	my @field = split(/\s+/, $tail);
-	# $tail begins at field 3 (state), so field 22 (starttime) is index 19.
-	return (defined $field[19] && $field[19] =~ /^[0-9]+\z/) ? $field[19] : '';
+	# $tail begins at field 3 (state), so state is index 0 and field 22
+	# (starttime) is index 19.
+	return {} unless defined $field[19] && $field[19] =~ /^[0-9]+\z/;
+	return {
+		state   => (defined $field[0] && $field[0] =~ /^[A-Za-z]\z/) ? $field[0] : '',
+		started => $field[19],
+	};
 }
 
 ###############################################################################
@@ -1857,10 +1916,23 @@ sub _state_is_live {
 	return (0, "the process that made the record (pid $spec->{pid}) is no longer running")
 		unless kill(0, $spec->{pid});
 
-	# The pid is alive. Is it the SAME process? /proc's start time answers
-	# that exactly, and when it does, that answer OUTRANKS THE CLOCK - see
-	# the age cap below for why that ordering is not a nicety.
-	my $started_now = _proc_started($spec->{pid});
+	# "Alive" and "not yet reaped" are not the same thing, and R78 is exactly
+	# that gap. A ZOMBIE satisfies kill(0), keeps its pid and keeps its start
+	# time, so it passes the identity check below perfectly - and R74 then
+	# says a confirmed-live owner outranks the clock at any age. The record
+	# of a wizard that EXITED, possibly hours ago, waiting for a parent that
+	# never reaped it, would re-open a firewall port inside a process that
+	# will not close it: R71's hole, arrived at through R74's fix rather than
+	# around it. The age cap used to bound this; R74 removed that bound for
+	# confirmed-live owners, so the state character has to carry it instead.
+	my $stat = _proc_stat($spec->{pid});
+	return (0, "the process that made the record (pid $spec->{pid}) has exited and is waiting to be reaped, so the session it belonged to is over")
+		if ($stat->{state} || '') eq 'Z';
+
+	# Is it the SAME process? /proc's start time answers that exactly, and
+	# when it does, that answer OUTRANKS THE CLOCK - see the age cap below
+	# for why that ordering is not a nicety.
+	my $started_now = defined $stat->{started} ? $stat->{started} : '';
 	my $identity_confirmed = 0;
 	if (defined $spec->{started} && length $spec->{started} && length $started_now) {
 		return (0, "pid $spec->{pid} is running but is not the process that made the record; the number has been reused")

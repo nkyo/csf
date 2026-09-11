@@ -211,7 +211,18 @@ sub _run_argv {
 		open(STDOUT, '>&', $writer) or POSIX::_exit(127);
 		open(STDERR, '>&', $writer) or POSIX::_exit(127);
 		close $writer;
-		$SIG{CHLD} = 'DEFAULT';
+
+		# EVERY disposition this process may have changed is put back before
+		# exec (task-8-review.md R80). A signal HANDLER is reset by the
+		# kernel across exec on its own - its address means nothing in the
+		# new image - but SIG_IGN is INHERITED, and an inherited ignore is a
+		# silent, lasting change to a program this code did not write. csf
+		# in particular installs its own handling and is entitled to start
+		# from the default; a child that cannot be killed by SIGTERM, or
+		# that never notices a broken pipe, is a child debugged by somebody
+		# who has no idea this program touched it.
+		$SIG{$_} = 'DEFAULT' for qw(CHLD PIPE HUP INT TERM ALRM);
+
 		{
 			no warnings 'exec';
 			exec { $argv[0] } @argv;

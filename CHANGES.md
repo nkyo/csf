@@ -37,6 +37,54 @@ line is added below the original notice; the original stays intact.
 
 ### Unreleased
 
+#### Task 8 fix round 4 — a zombie that read as a living wizard, and an ignored signal that outlived the process that ignored it
+
+**2026-09-11** — Three findings and two message-quality items.
+
+- **R78 — a ZOMBIE owner read as confirmed-live, reopening R71 through R74's own fix.**
+  `kill(0)` succeeds on a zombie, its pid is still there and its start time still matches, so
+  it satisfied every test the staleness check applied. Fix round 3 then established that a
+  confirmed-live owner outranks the clock at any age — correctly, for a living wizard — and
+  the record of a wizard that had **exited**, possibly hours earlier, waiting for a parent
+  that never reaped it, would re-open a firewall port inside a process that will not close
+  it. That is exactly the hole R71 existed to stop, arrived at through the fix for R74
+  rather than around it. The age cap used to bound it; R74 removed that bound for
+  confirmed-live owners, so the process state has to carry it instead. `/proc`'s state
+  character is now read alongside the start time and a `Z` is a refusal. The test forks a
+  real zombie rather than simulating one, because the whole finding is that `kill(0)` and
+  the start time cannot tell one apart.
+
+- **R79 — the `SIGPIPE` gap, closed behaviourally.** The previous round declared this covered
+  by a source assertion rather than a behavioural test. It was reachable and cheap: the R75
+  block already stages an unguarded write to a closed peer and was masking the signal *in
+  the test*. The ignore now lives inside `write_response_to`, scoped to the one call that can
+  raise it, so the function protects itself and the existing assertion became behavioural —
+  removing the guard now kills the test run with signal 13 rather than failing quietly.
+
+- **R80 — an ignored signal is inherited across `exec`.** A signal *handler* is reset by the
+  kernel across `exec` — its address means nothing in the new image — but `SIG_IGN` survives,
+  and a loop-wide ignore was being inherited by `csf -r` and by the re-exec'd CLI. This
+  program has no business changing the signal disposition of programs it did not write; csf
+  installs its own handling and is entitled to start from the default. Every disposition is
+  now reset in the child before `exec`, and the test reads the child's own
+  `/proc/self/status` rather than asserting about source text, because the question is what
+  the kernel did.
+
+- `E_EXEC` blocks the shell path exactly as it blocks the browser path, so an operator
+  running `csf-ui-setup --answers FILE --yes` hit a hard stop whose only advice was "apply
+  from a shell instead" — useless to somebody who already is. Each refusal now carries advice
+  of its own, and a refusal that leaves the operator nowhere to go is one they work around by
+  applying with no rollback at all.
+
+- R76's headline claimed "its unit files are gone", which that branch cannot establish:
+  `_remove_units` unlinks two files, either can fail alone, and `armed()` is true only when
+  both are present — so the branch is also reached with one unit file still on disk. Reworded
+  to what is actually known, and the `rm -f` a half-removal needs is now in the advice, which
+  both failure branches share so they cannot drift apart.
+
+`t/70-firewall-detect.t`: 206 → 210. `t/71-rollback.t`: 474 → 498. Whole suite: **2549
+tests** (was 2521), `prove -I. t/`.
+
 #### Task 8 fix round 3 — the class left open at the only path that matters, and a live operator the staleness check could lock out
 
 **2026-09-11** — Five findings. The first is a boundary drawn in the wrong place; the second
