@@ -582,14 +582,19 @@ my $IPTABLES_OUT = join("\n",
 # 5.14 authenticate
 ###############################################################################
 {
-	# R17: the credential check is Task 3's. Until it exists the seam fails
-	# closed, and - this is the part that matters - it must not burn the
-	# per-username failure counter.
-	my $fx = fixture(users => "alice:6:\$6\$salt\$hash:admin:1757548800\n");
+	# R17's placeholder (E_UNAVAILABLE, "verifier is not installed") only made
+	# sense before Task 3 existed; it is gone now that
+	# ConfigServer::UI::Auth ships beside this file, so this exercises the
+	# seam for real instead: a genuine Auth-minted hash, verified through the
+	# helper's own default auth_verify (not the mock every other case in this
+	# file installs), with nothing overridden in $fx->{ctx}.
+	require ConfigServer::UI::Auth;
+	my $real_hash = ConfigServer::UI::Auth::hash_password('whatever', 5000);
+	my $fx = fixture(users => "alice:6:$real_hash:admin:1757548800\n");
 	my $response = req($fx, 'authenticate', { user => 'alice', pass => 'whatever' });
-	is($response->{error}, 'E_UNAVAILABLE', 'with no verifier installed authenticate fails closed');
-	like($response->{message}, qr/verifier is not installed/, 'and says what is missing');
-	is(_authfail_count($fx, 'alice'), 0, 'and the failure counter is untouched, so nobody is locked out by a missing module');
+	ok(${ $response->{ok} }, 'now that Auth.pm exists the seam answers instead of failing closed');
+	ok(${ $response->{data}{ok} }, 'and verifies a password it actually hashed, through the real crypt() path');
+	is(_authfail_count($fx, 'alice'), 0, 'a correct password leaves the failure counter at zero');
 
 	$fx = fixture(users => "alice:6:\$6\$salt\$hash:admin:1757548800\nbob:6:\$6\$salt\$other:support:1757548800\n");
 	my @seen;

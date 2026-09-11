@@ -1,0 +1,269 @@
+#!/usr/bin/perl
+###############################################################################
+# Copyright (C) 2006-2025 Jonathan Michaelson
+#
+# https://github.com/waytotheweb/scripts
+#
+# This program is free software; you can redistribute it and/or modify it under
+# the terms of the GNU General Public License as published by the Free Software
+# Foundation; either version 3 of the License, or (at your option) any later
+# version.
+#
+# This program is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+# FOR A PARTICULAR PURPOSE. See the GNU General Public License for more
+# details.
+#
+# You should have received a copy of the GNU General Public License along with
+# this program; if not, see <https://www.gnu.org/licenses>.
+###############################################################################
+# Added 2026-09-11 in https://github.com/nkyo/csf - see CHANGES.md.
+#
+# csf-ui-passwd - the only way an account for the replacement WebUI is ever
+# created. Run as root, on the machine, over a shell an administrator already
+# has - never over the network and never by csf-ui.
+#
+# There is no default account and no default password: `add` is the sole
+# place a record is ever written for the first time, so until it has been run
+# once the WebUI has no way in at all. This is deliberate (docs/WEBUI-RPC.md
+# S5.14 note "No default account and no default password").
+#
+# This file is the CLI shell around ConfigServer::UI::Auth, which owns the
+# store format, the hashing and the atomic write; nothing here parses a
+# record or opens /etc/csf-ui/users directly.
+###############################################################################
+package ConfigServer::UI::PasswdCLI;
+
+use strict;
+use warnings;
+
+use lib '/usr/local/csf-ui/lib', '/usr/local/csf/lib';
+
+use POSIX ();
+use ConfigServer::UI::Auth ();
+
+our $VERSION = '1.00';
+
+# Overridable only so t/20-auth.t can point this at a temporary file and a
+# temporary ui.conf instead of the real, root-owned paths - no flag, no
+# environment variable and no ui.conf key makes either one configurable in
+# production. That would just be a second way to name the credential store,
+# which is one more thing an attacker could try to point somewhere useful.
+our $USERS_PATH   = '/etc/csf-ui/users';
+our $UI_CONF_PATH = '/etc/csf-ui/ui.conf';
+
+###############################################################################
+# UI_CRYPT_ROUNDS (docs/WEBUI-RPC.md S10) - the one ui.conf key this tool
+# reads, because it is the cost every newly minted hash is given. This does
+# not implement ui.conf's full startup contract (unknown-key and
+# duplicate-key refusal, the other six keys): that belongs to whatever reads
+# this file to start a long-running service, which a one-shot admin CLI is
+# not. A missing file, a missing key, or a value out of range all fall back
+# to the default rather than refuse to run - a password tool that failed
+# closed on a config problem would be one more way to lock an administrator
+# out of the one store nothing else can open.
+###############################################################################
+sub _ui_crypt_rounds {
+	my $path = $UI_CONF_PATH;
+	open(my $fh, '<', $path) or return $ConfigServer::UI::Auth::DEFAULT_ROUNDS;
+	while (my $line = <$fh>) {
+		next unless $line =~ /^\s*UI_CRYPT_ROUNDS\s*=\s*"([^"]*)"\s*$/;
+		my $value = $1;
+		close $fh;
+		return $value + 0
+			if $value =~ /^[0-9]+$/
+			&& $value >= $ConfigServer::UI::Auth::MIN_ROUNDS
+			&& $value <= $ConfigServer::UI::Auth::MAX_ROUNDS;
+		return $ConfigServer::UI::Auth::DEFAULT_ROUNDS;
+	}
+	close $fh;
+	return $ConfigServer::UI::Auth::DEFAULT_ROUNDS;
+}
+
+###############################################################################
+# Password entry: echo off at a terminal, one line from stdin otherwise. Never
+# printed back, never included in an error message, never passed on a command
+# line where `ps` would show it to every other user on the box.
+###############################################################################
+sub _read_line_no_echo {
+	my $fd = fileno(STDIN);
+	my $term = eval { POSIX::Termios->new };
+	my ($restore, $ok) = (undef, 0);
+	if ($term) {
+		$ok = eval {
+			$term->getattr($fd);
+			$restore = $term->getlflag();
+			$term->setlflag($restore & ~(&POSIX::ECHO));
+			$term->setattr($fd, &POSIX::TCSANOW);
+			1;
+		};
+	}
+	my $line = <STDIN>;
+	if ($ok) {
+		eval {
+			$term->setlflag($restore);
+			$term->setattr($fd, &POSIX::TCSANOW);
+		};
+	}
+	return undef unless defined $line;
+	$line =~ s/[\r\n]+\z//;
+	return $line;
+}
+
+sub _prompt_password {
+	my ($prompt) = @_;
+	print STDERR $prompt;
+	my $pass = _read_line_no_echo();
+	print STDERR "\n";
+	return $pass;
+}
+
+# At a terminal: prompt, then prompt again to catch a typo, neither one
+# echoed. Piped: a single line from stdin and nothing more is asked, because a
+# script feeding this has no second line to give and no way to see a prompt
+# asking for one.
+sub read_new_password {
+	if (-t STDIN) {
+		my $first = _prompt_password('New password: ');
+		return (undef, 'could not read a password from the terminal') unless defined $first;
+		return (undef, 'password must not be empty') unless length $first;
+		my $second = _prompt_password('Retype new password: ');
+		return (undef, 'could not read a password from the terminal') unless defined $second;
+		return (undef, 'passwords did not match') unless $first eq $second;
+		return ($first, undef);
+	}
+	my $pass = <STDIN>;
+	return (undef, 'no password was given on stdin') unless defined $pass;
+	$pass =~ s/[\r\n]+\z//;
+	return (undef, 'password must not be empty') unless length $pass;
+	return ($pass, undef);
+}
+
+###############################################################################
+# Commands
+###############################################################################
+sub cmd_add {
+	my (@rest) = @_;
+	my ($user, $role) = @rest;
+	unless (@rest == 2) {
+		print STDERR "usage: csf-ui-passwd add <user> <role>\n";
+		return 2;
+	}
+	unless (ConfigServer::UI::Auth::validate_username($user)) {
+		print STDERR "invalid username: must be 1 to 32 characters of a-z, 0-9, underscore or hyphen\n";
+		return 1;
+	}
+	unless (ConfigServer::UI::Auth::validate_role($role)) {
+		print STDERR "invalid role: must be 'admin' or 'support'\n";
+		return 1;
+	}
+	my ($pass, $read_error) = read_new_password();
+	unless (defined $pass) {
+		print STDERR "$read_error\n";
+		return 1;
+	}
+	my ($ok, $error) = ConfigServer::UI::Auth::add_user(
+		$USERS_PATH, $user, $role, $pass, rounds => _ui_crypt_rounds());
+	undef $pass;
+	unless ($ok) {
+		print STDERR "$error\n";
+		return 1;
+	}
+	print "added '$user' as $role\n";
+	return 0;
+}
+
+sub cmd_passwd {
+	my (@rest) = @_;
+	my ($user) = @rest;
+	unless (@rest == 1) {
+		print STDERR "usage: csf-ui-passwd passwd <user>\n";
+		return 2;
+	}
+	my ($pass, $read_error) = read_new_password();
+	unless (defined $pass) {
+		print STDERR "$read_error\n";
+		return 1;
+	}
+	my ($ok, $error) = ConfigServer::UI::Auth::set_password(
+		$USERS_PATH, $user, $pass, rounds => _ui_crypt_rounds());
+	undef $pass;
+	unless ($ok) {
+		print STDERR "$error\n";
+		return 1;
+	}
+	print "password changed for '$user'\n";
+	return 0;
+}
+
+sub cmd_delete {
+	my (@rest) = @_;
+	my ($user) = @rest;
+	unless (@rest == 1) {
+		print STDERR "usage: csf-ui-passwd delete <user>\n";
+		return 2;
+	}
+	my ($ok, $error) = ConfigServer::UI::Auth::delete_user($USERS_PATH, $user);
+	unless ($ok) {
+		print STDERR "$error\n";
+		return 1;
+	}
+	print "deleted '$user'\n";
+	return 0;
+}
+
+sub cmd_list {
+	my (@rest) = @_;
+	if (@rest) {
+		print STDERR "usage: csf-ui-passwd list\n";
+		return 2;
+	}
+	my ($rows, $error) = ConfigServer::UI::Auth::list_users($USERS_PATH);
+	unless ($rows) {
+		print STDERR "$error\n";
+		return 1;
+	}
+	unless (@$rows) {
+		print "no accounts exist yet; create one with: csf-ui-passwd add <user> <admin|support>\n";
+		return 0;
+	}
+	for my $row (@$rows) {
+		my $warning = ($row->{algo} ne '6')
+			? "  ** algorithm '$row->{algo}' cannot be verified; run 'passwd' to reset it **"
+			: '';
+		print join("\t", $row->{user}, $row->{role}, scalar(localtime($row->{created}))) . "$warning\n";
+	}
+	return 0;
+}
+
+sub _usage {
+	print STDERR <<'USAGE';
+usage: csf-ui-passwd add <user> <role>    create an account (role: admin or support)
+       csf-ui-passwd passwd <user>        change an account's password
+       csf-ui-passwd delete <user>        remove an account
+       csf-ui-passwd list                 list accounts
+
+The password is read from a prompt with echo disabled when run at a
+terminal, or from standard input otherwise. There is no default account and
+no default password: until an account is created with 'add', the WebUI has
+no way in.
+USAGE
+	return;
+}
+
+sub run {
+	my (@argv) = @_;
+	my ($cmd, @rest) = @argv;
+
+	return do { _usage(); 2 } unless defined $cmd;
+	return cmd_add(@rest)    if $cmd eq 'add';
+	return cmd_passwd(@rest) if $cmd eq 'passwd';
+	return cmd_delete(@rest) if $cmd eq 'delete';
+	return cmd_list(@rest)   if $cmd eq 'list';
+	_usage();
+	return 2;
+}
+
+exit(run(@ARGV)) unless caller;
+
+1;

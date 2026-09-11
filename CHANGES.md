@@ -206,6 +206,64 @@ line is added below the original notice; the original stays intact.
   that could only observe the property indirectly. (`docs/WEBUI-RPC.md`,
   `t/12-contract-enum.t` — new file, `t/11-helper-validate.t`)
 
+- **2026-09-11** — Added `ConfigServer::UI::Auth` and `csf-ui-passwd`: the
+  credential store the root helper's `authenticate` operation calls into, and
+  the only way an account for it is ever created. This is what replaces
+  `lfd.pl:9788`'s `$FORM{csfpassword} eq $config{UI_PASS}` — a plaintext
+  password kept in `csf.conf` and compared with `eq`, which returns on the
+  first differing byte and is a plain string anyone with a copy of `csf.conf`
+  already has. Per Ruling R6, this module is loaded and called only by
+  `csf-ui-helper`, in the root process; `csf-ui` never requires it and never
+  opens `/etc/csf-ui/users`.
+
+  Passwords are hashed with `crypt()` using a `$6$` SHA-512 salt — 16 bytes
+  from `/dev/urandom` mapped onto crypt's 64-character alphabet, at a round
+  count read from `ui.conf`'s `UI_CRYPT_ROUNDS` (default 100000, clamped to
+  5000–2000000; `csf-ui-passwd` falls back to the default rather than refuse
+  to run when `ui.conf` does not exist yet or the key is missing or
+  out of range, since a password tool failing closed on a config problem
+  would be one more way to lock an administrator out of the one store nothing
+  else can open). Per Ruling R13, `$6$` is the only algorithm this module can
+  produce or verify; the record format's `algo` field is kept for a future
+  migration, but a record carrying any other value is refused on write and
+  reported, not silently trusted, on read.
+
+  `verify($hash, $pass)` — the exact seam `csf-ui-helper`'s `auth_verify()`
+  already called through a placeholder — never compares the hash with `eq`.
+  Both sides are reduced to a fixed-length digest first and every byte of
+  both digests is visited in a loop that accumulates an OR of the
+  differences rather than returning on the first one, so the comparison's
+  cost never depends on where, or whether, the two inputs differ. It also
+  never dies on a wrong password or a malformed stored hash: a die here is
+  read by the helper as "the verifier could not run", which must never be
+  how an ordinary wrong guess is answered, since that path leaves the
+  per-username failure counter untouched — an unmetered guess is exactly
+  what that counter exists to prevent.
+
+  Writes to `/etc/csf-ui/users` are temp-file-and-`rename`: a new file is
+  created `O_EXCL` at mode 0600 in the same directory, written, `fsync`'d,
+  then renamed over the target — `rename(2)` replaces whatever directory
+  entry is there without ever following it as a symlink, so the failure mode
+  that matters is refusing beforehand, not racing during the replace. Both
+  the reader and the writer refuse outright, before touching the file
+  further, if the target is a symlink, is not a regular file, or (once it
+  exists) is not owned by the process running this code — root, in
+  production; a store already readable or writable by group or other is
+  refused too, naming the mode it requires. There is no default account and
+  no default password: a store that does not exist yet reads back as empty,
+  not as an error, and nothing anywhere seeds one — `csf-ui-passwd add` is
+  the only line of code that ever writes the first record.
+
+  `csf-ui-passwd add <user> <role>`, `passwd <user>`, `delete <user>` and
+  `list` read the password from a prompt with echo disabled (via
+  `POSIX::Termios`, not a spawned `stty`) when run at a terminal, or a single
+  line from standard input otherwise; it is never echoed, written to a
+  command-line argument `ps` could show another user, or included in any
+  error message. (`ui-src/lib/ConfigServer/UI/Auth.pm`,
+  `ui-src/bin/csf-ui-passwd`, `t/20-auth.t` — new files; `t/11-helper-validate.t`
+  — the placeholder-seam case in section 5.14 now exercises the real module
+  instead of its absence)
+
 #### The update mechanism — moved to GitHub, and made verifiable
 
 The original update path fetched a tarball and ran `sh install.sh` from it **as
