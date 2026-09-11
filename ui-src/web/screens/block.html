@@ -1,0 +1,132 @@
+<!--
+Copyright (C) 2006-2025 Jonathan Michaelson
+
+https://github.com/waytotheweb/scripts
+
+This program is free software; you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation; either version 3 of the License, or (at your option) any later
+version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT
+ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+FOR A PARTICULAR PURPOSE. See the GNU General Public License for more
+details.
+
+You should have received a copy of the GNU General Public License along with
+this program; if not, see <https://www.gnu.org/licenses>.
+-->
+<!--
+Added 2026-09-11 in https://github.com/nkyo/csf - see CHANGES.md.
+
+Block / Unblock (Task 7, docs/WEBUI-PLAN.md S2): deny, temp-deny, allow, and
+a quick unblock box, each its own POST form carrying the CSRF nonce - admin
+only (ui-src/bin/csf-ui's routes for all four carry no `support => 1`).
+docs/WEBUI-RPC.md S4.4: `deny`/`allow` REQUIRE a note (no "no note" option
+anywhere in this contract); `tempdeny` accepts none at all (S5.7 - the
+helper sends a fixed literal, "no caller-supplied note is accepted"), which
+is why the temp-deny form below has no note field.
+
+FLASH: the flash-class/flash-text pair - see overview.html's header comment
+for the pattern (a toggled class, never conditional structure).
+
+PREFILL: the prefill-ip value refills every IP field with whatever the
+operator last submitted (successfully or not) after the redirect this
+screen's own POST handlers issue - see ui-src/bin/csf-ui's
+_ui_call_and_redirect(). A convenience, not a security control: it is an
+ordinary escaped value in the inert `value` attribute, same as any other
+form field.
+
+TEMP-DENY TTL: a fixed set of presets within docs/WEBUI-RPC.md S4.2's
+60-604800 second range, not a free-text field - the helper still validates
+whatever is submitted regardless of what this <select> offers, per S1.4
+("validation in the helper is load-bearing, not defence in depth"), but a
+preset list is less error-prone than asking an operator to type seconds.
+-->
+<div class="{{flash_class}}" role="status">{{flash_text}}</div>
+
+<section class="panel">
+	<h2 class="panel-title">Block (permanent)</h2>
+	<form method="POST" action="/ui/block/deny">
+		<input type="hidden" name="_csrf" value="{{csrf}}">
+		<div class="field">
+			<label for="deny-ip">IP address or CIDR</label>
+			<input type="text" id="deny-ip" name="deny_ip" value="{{prefill_ip}}"
+				inputmode="text" autocomplete="off" required>
+		</div>
+		<div class="field">
+			<label for="deny-note">Note (required)</label>
+			<input type="text" id="deny-note" name="deny_note" maxlength="200" required>
+			<span class="field-hint">Recorded against this entry in csf.deny - required, so csf never has to guess one from a reverse DNS lookup.</span>
+		</div>
+		<div class="form-actions">
+			<button type="submit" class="btn btn-danger">Block permanently</button>
+		</div>
+	</form>
+</section>
+
+<section class="panel">
+	<h2 class="panel-title">Block (temporary)</h2>
+	<form method="POST" action="/ui/block/tempdeny">
+		<input type="hidden" name="_csrf" value="{{csrf}}">
+		<div class="field">
+			<label for="tempdeny-ip">IP address or CIDR</label>
+			<input type="text" id="tempdeny-ip" name="tempdeny_ip" value="{{prefill_ip}}"
+				inputmode="text" autocomplete="off" required>
+		</div>
+		<div class="field">
+			<label for="tempdeny-ttl">Duration</label>
+			<select id="tempdeny-ttl" name="tempdeny_ttl">
+				<option value="3600">1 hour</option>
+				<option value="21600">6 hours</option>
+				<option value="86400" selected>1 day</option>
+				<option value="604800">7 days</option>
+			</select>
+		</div>
+		<div class="field">
+			<label for="tempdeny-ports">Ports (optional)</label>
+			<input type="text" id="tempdeny-ports" name="tempdeny_ports"
+				placeholder="e.g. 22,80,443 or 1000-1010" autocomplete="off">
+			<span class="field-hint">Leave blank to block all ports. At most 20 ports/ranges, TCP only when ports are given.</span>
+		</div>
+		<div class="form-actions">
+			<button type="submit" class="btn btn-danger">Block temporarily</button>
+		</div>
+	</form>
+</section>
+
+<section class="panel">
+	<h2 class="panel-title">Allow</h2>
+	<form method="POST" action="/ui/block/allow">
+		<input type="hidden" name="_csrf" value="{{csrf}}">
+		<div class="field">
+			<label for="allow-ip">IP address or CIDR</label>
+			<input type="text" id="allow-ip" name="allow_ip" value="{{prefill_ip}}"
+				inputmode="text" autocomplete="off" required>
+		</div>
+		<div class="field">
+			<label for="allow-note">Note (required)</label>
+			<input type="text" id="allow-note" name="allow_note" maxlength="200" required>
+		</div>
+		<div class="form-actions">
+			<button type="submit" class="btn btn-primary">Allow</button>
+		</div>
+		<p class="field-hint">Allowing exempts an address from the firewall entirely. This is a security decision, not a support action.</p>
+	</form>
+</section>
+
+<section class="panel">
+	<h2 class="panel-title">Unblock</h2>
+	<form method="POST" action="/ui/block/undeny">
+		<input type="hidden" name="_csrf" value="{{csrf}}">
+		<div class="field">
+			<label for="undeny-ip">IP address or CIDR</label>
+			<input type="text" id="undeny-ip" name="undeny_ip" value="{{prefill_ip}}"
+				inputmode="text" autocomplete="off" required>
+		</div>
+		<div class="form-actions">
+			<button type="submit" class="btn">Remove from csf.deny</button>
+		</div>
+		<p class="field-hint">Removes a permanent block. To remove a temporary block or an allow entry, use the Lists screen instead.</p>
+	</form>
+</section>

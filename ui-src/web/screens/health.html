@@ -1,0 +1,82 @@
+<!--
+Copyright (C) 2006-2025 Jonathan Michaelson
+
+https://github.com/waytotheweb/scripts
+
+This program is free software; you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation; either version 3 of the License, or (at your option) any later
+version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT
+ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+FOR A PARTICULAR PURPOSE. See the GNU General Public License for more
+details.
+
+You should have received a copy of the GNU General Public License along with
+this program; if not, see <https://www.gnu.org/licenses>.
+-->
+<!--
+Added 2026-09-11 in https://github.com/nkyo/csf - see CHANGES.md.
+
+Health (Task 7, docs/WEBUI-RPC.md S5.11/S5.12): iptables-vs-csf.deny
+reconciliation, ORPHAN/GHOST/DUP, with cleanup. admin only (`reconcile_fix`
+is not `support => 1` and neither is this screen's own route).
+
+*** NO ONE-CLICK CLEANUP (task-7-brief.md, docs/WEBUI-RPC.md S5.12's own
+*** "The UI requirement ... Health shows the diff and requires a separate
+*** confirmation. There is no one-click cleanup.") ***
+
+This is step 1 of 2, not the whole flow: submitting this form does not call
+`reconcile_fix` - it POSTs to /ui/health/review, which re-runs `reconcile`
+FRESH (nothing here is trusted to still be true a moment later), shows
+EXACTLY what is about to be deleted, and only THAT page's own form
+(health-review.html) can reach /ui/health/apply, which is the only route
+that ever calls `reconcile_fix`. Fixable findings are pre-checked so
+"fix everything shown" is one click away, but that click only reaches a
+confirmation screen, never a mutation.
+
+Per docs/WEBUI-RPC.md S5.11's own words: "Screens must therefore key the fix
+button off `fixable`, never off `kind`: an ORPHAN is not necessarily
+deletable, and this is the case that proves it." health-row-fixable.html /
+health-row-unfixable.html are chosen by ui-src/bin/csf-ui strictly from each
+entry's own `fixable` field, never by switching on `kind`.
+
+Each checkbox below is independently named (fix_id_0, fix_id_1, ...) rather
+than all sharing one `name="ids"` - docs/WEBUI-RPC.md S14.1 says a repeated
+key folds to "last value wins" (the producer's choice, unspecified beyond
+that) for a QUERY string, and ui-src/bin/csf-ui's own _parse_body() does the
+same for a form BODY (a plain hash, last value wins) - neither side of this
+contract promises to preserve a form's multiple same-named values as a list.
+Uniquely-named fields sidestep that entirely: an unchecked box simply never
+appears in the body at all (ordinary HTML checkbox semantics), so
+ui-src/bin/csf-ui recovers exactly the checked set by looking for every key
+matching fix_id_\d+, with no reliance on repeated-key folding either side of
+this contract leaves unspecified.
+-->
+<div class="{{flash_class}}" role="status">{{flash_text}}</div>
+
+<section class="panel">
+	<h2 class="panel-title">Reconciliation</h2>
+	<div class="{{unavailable_class}}" role="alert">{{unavailable_text}}</div>
+	<div class="{{findings_class}}">
+		<p class="text-muted">{{summary_text}}</p>
+		<form method="POST" action="/ui/health/review">
+			<input type="hidden" name="_csrf" value="{{csrf}}">
+			<div class="table-responsive">
+				<table>
+					<thead><tr><th>Kind</th><th>Chain</th><th>Family</th><th>Address</th><th>Rule</th><th>Fix</th></tr></thead>
+					<tbody>
+						{{{rows}}}
+					</tbody>
+				</table>
+			</div>
+			<div class="{{review_form_class}}">
+				<div class="form-actions">
+					<button type="submit" class="btn btn-danger">Review selected fixes</button>
+				</div>
+				<p class="field-hint">Fixable findings are pre-selected. Uncheck any you want to leave alone, then review exactly what will be deleted before anything runs.</p>
+			</div>
+		</form>
+	</div>
+</section>

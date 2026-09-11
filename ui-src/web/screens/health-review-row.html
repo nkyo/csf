@@ -1,0 +1,36 @@
+<!--
+Copyright (C) 2006-2025 Jonathan Michaelson
+
+https://github.com/waytotheweb/scripts
+
+This program is free software; you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation; either version 3 of the License, or (at your option) any later
+version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT
+ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+FOR A PARTICULAR PURPOSE. See the GNU General Public License for more
+details.
+
+You should have received a copy of the GNU General Public License along with
+this program; if not, see <https://www.gnu.org/licenses>.
+-->
+<!--
+Added 2026-09-11 in https://github.com/nkyo/csf - see CHANGES.md.
+
+One row of health-review.html's "about to delete" table (Task 7) - a
+finding confirmed present AND fixable in the fresh reconcile() the review
+step just ran. Its apply-name/id pair carries this finding's id forward to
+POST /ui/health/apply as a hidden field, uniquely named for the same reason
+health-row-fixable.html's checkboxes are (see health.html's header
+comment) - nested inside the last <td> rather than as a bare child of
+<table>, which HTML5's table content model does not permit.
+-->
+<tr>
+	<td data-label="Kind"><span class="badge badge-danger">{{kind}}</span></td>
+	<td data-label="Chain">{{chain}}</td>
+	<td data-label="Family">IPv{{family}}</td>
+	<td data-label="Address">{{ip}}</td>
+	<td data-label="Rule"><code>{{spec}}</code><input type="hidden" name="{{apply_name}}" value="{{id}}"></td>
+</tr>

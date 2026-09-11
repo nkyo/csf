@@ -40,7 +40,7 @@ use lib "$FindBin::Bin/..", "$FindBin::Bin/../ui-src/lib";
 
 use File::Temp qw(tempdir);
 use JSON::Tiny ();
-use Test::More tests => 137;
+use Test::More tests => 140;
 
 my $APP_PATH = "$FindBin::Bin/../ui-src/bin/csf-ui";
 ok(-f $APP_PATH, 'csf-ui is where the brief says it is');
@@ -499,14 +499,23 @@ sub _last_access_line {
 	}
 
 	# Converse: every route that names an `op` names one of the thirteen
-	# real operations, and the only anonymous route is the one that has to
-	# be (S5.14).
+	# real operations, and every anonymous route is one that has to be
+	# (S5.14) - updated by Task 7 to the full, still-closed set: /api/login
+	# (S5.14 - authenticate is pre-session, so it cannot require one),
+	# /ui/login (Task 7's own server-rendered login screen, GET to show the
+	# form and POST to submit it - the identical "no session yet" reason),
+	# and /app.css (a static asset carrying no user data, safe to serve
+	# with no session so an unauthenticated login page can still be
+	# styled). Anything else showing up here would be a route that skips
+	# _gate() by accident, not by one of these three deliberate reasons.
+	my %ANONYMOUS_OK = map { $_ => 1 } ('/api/login', '/ui/login', '/app.css');
 	for my $route (@ConfigServer::UI::App::ROUTES) {
 		if (defined $route->{op}) {
 			ok(exists $SPEC{ $route->{op} }, "route op '$route->{op}' is a real section 5 operation");
 		}
 		if ($route->{anonymous}) {
-			is($route->{path}, '/api/login', "the only anonymous route is /api/login, not '$route->{path}'");
+			ok($ANONYMOUS_OK{ $route->{path} },
+				"anonymous route '$route->{path}' is one of the deliberate, closed set, not an accident");
 		}
 	}
 }

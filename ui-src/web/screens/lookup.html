@@ -1,0 +1,62 @@
+<!--
+Copyright (C) 2006-2025 Jonathan Michaelson
+
+https://github.com/waytotheweb/scripts
+
+This program is free software; you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation; either version 3 of the License, or (at your option) any later
+version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT
+ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+FOR A PARTICULAR PURPOSE. See the GNU General Public License for more
+details.
+
+You should have received a copy of the GNU General Public License along with
+this program; if not, see <https://www.gnu.org/licenses>.
+-->
+<!--
+Added 2026-09-11 in https://github.com/nkyo/csf - see CHANGES.md.
+
+IP lookup (Task 7, docs/WEBUI-PLAN.md S2: "csf -g <ip>"). Reachable by both
+roles (ui-src/bin/csf-ui's GET /ui/lookup carries `support => 1` - the one
+screen support is unambiguously meant to use per docs/WEBUI-RPC.md S5's role
+mapping). Read-only: this is a GET form (docs/WEBUI-RPC.md S5.10 - `grep`
+takes no CSRF, it mutates nothing), so a lookup is bookmarkable/shareable by
+URL, which is also why this needed no R51 treatment despite carrying a query
+parameter - a plain GET <form> submission IS the R51-safe shape already
+(the browser encodes it, not this codebase's string concatenation); R51 is
+specifically about a LINK (href=) built by splicing a value in, which this
+screen never does.
+
+No raw marker needed: the result panel is always present in the markup
+(shown or hidden via its own result-class value, the same toggle pattern as
+every flash banner on every other screen - see overview.html's header
+comment), and its body is one escaped scalar - csf -g's output lines,
+newline-joined in ui-src/bin/csf-ui before being handed to render() as a
+single value. escape_html() does not treat newlines specially, so they pass
+through unescaped inside the <pre>, which is exactly where a literal
+newline belongs.
+-->
+<div class="{{flash_class}}" role="status">{{flash_text}}</div>
+
+<section class="panel">
+	<h2 class="panel-title">Look up an address</h2>
+	<form method="GET" action="/ui/lookup">
+		<div class="field">
+			<label for="lookup-ip">IP address or CIDR</label>
+			<input type="text" id="lookup-ip" name="ip" value="{{prefill_ip}}"
+				inputmode="text" autocomplete="off" required autofocus>
+		</div>
+		<div class="form-actions">
+			<button type="submit" class="btn btn-primary">Look up</button>
+		</div>
+	</form>
+</section>
+
+<section class="{{result_class}}">
+	<h2 class="panel-title">Results for {{queried_ip}}</h2>
+	<p class="text-muted">{{result_count_text}}</p>
+	<pre class="diff-line">{{lines_text}}</pre>
+</section>

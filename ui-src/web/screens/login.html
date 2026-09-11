@@ -1,0 +1,78 @@
+<!--
+Copyright (C) 2006-2025 Jonathan Michaelson
+
+https://github.com/waytotheweb/scripts
+
+This program is free software; you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation; either version 3 of the License, or (at your option) any later
+version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT
+ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+FOR A PARTICULAR PURPOSE. See the GNU General Public License for more
+details.
+
+You should have received a copy of the GNU General Public License along with
+this program; if not, see <https://www.gnu.org/licenses>.
+-->
+<!--
+Added 2026-09-11 in https://github.com/nkyo/csf - see CHANGES.md.
+
+Task 7's login screen. A standalone document, NOT wrapped in layout.html -
+task-6-report.md's own words: "a page with no session has no user or role
+... to put in this header". Rendered by ui-src/bin/csf-ui's
+_route_ui_login_form()/_route_ui_login_submit() via
+ConfigServer::UI::Render::render_file() directly.
+
+No CSRF field on the form: docs/WEBUI-RPC.md S5.14 - authenticate is
+PRE-SESSION, "it is how a role is discovered, so it cannot require one".
+There is no session yet to hold a nonce.
+
+This file's error-class/error-text pair: "visually-hidden" / "" on first
+load, "alert alert-error" / a message on a failed attempt - the same
+always-present-structure-with-a-toggled-class shape used for the flash
+banner on every other screen (see block.html's own header comment), chosen
+so this file needs no raw marker and no conditional block Render.pm cannot
+express (it either substitutes every placeholder it finds or dies - there
+is no conditional-block syntax at all).
+
+(Note for anyone editing any template in this tree: never spell a var name
+as a literal two- or three-brace marker inside a comment - Render.pm scans
+the WHOLE file as text, comments included, so that either silently
+substitutes real data into this prose or, for a name that is not one of
+this file's own vars, dies. Describe a placeholder in prose instead, as
+above.)
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sign in - ConfigServer Firewall</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<main id="main-content" class="login-shell" tabindex="-1">
+	<div class="panel login-panel">
+		<h1 class="page-title">ConfigServer Firewall</h1>
+		<div class="{{error_class}}" role="alert">{{error_text}}</div>
+		<form method="POST" action="/ui/login" novalidate>
+			<div class="field">
+				<label for="login-user">Username</label>
+				<input type="text" id="login-user" name="user" value="{{prefill_user}}"
+					autocomplete="username" required autofocus>
+			</div>
+			<div class="field">
+				<label for="login-pass">Password</label>
+				<input type="password" id="login-pass" name="pass"
+					autocomplete="current-password" required>
+			</div>
+			<div class="form-actions">
+				<button type="submit" class="btn btn-primary">Sign in</button>
+			</div>
+		</form>
+	</div>
+</main>
+</body>
+</html>

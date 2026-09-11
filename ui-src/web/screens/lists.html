@@ -1,0 +1,101 @@
+<!--
+Copyright (C) 2006-2025 Jonathan Michaelson
+
+https://github.com/waytotheweb/scripts
+
+This program is free software; you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation; either version 3 of the License, or (at your option) any later
+version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT
+ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+FOR A PARTICULAR PURPOSE. See the GNU General Public License for more
+details.
+
+You should have received a copy of the GNU General Public License along with
+this program; if not, see <https://www.gnu.org/licenses>.
+-->
+<!--
+Added 2026-09-11 in https://github.com/nkyo/csf - see CHANGES.md.
+
+Lists (Task 7, docs/WEBUI-RPC.md S4.5/S5.9, S11.2): csf.deny, the temp-ban
+store, and csf.allow - NOT csf.ignore, which the frozen contract explicitly
+excludes ("Listing it would put a delete button on rows that nothing can
+delete", S11.2). Reachable by BOTH roles (ui-src/bin/csf-ui's GET /ui/lists
+carries `support => 1`) - support sees every row but no mutating form on it;
+see lists-row-*-ro.html.
+
+*** R51: HOW THIS SCREEN PAGINATES AND SWITCHES LISTS, READ THIS BEFORE
+*** ADDING ANOTHER PARAMETERISED LINK ANYWHERE UNDER ui-src/web/screens/.
+
+t/50-render.t's scanner flags href/src/action the moment ANY {{ }} value
+lands in them - unconditionally, no allowlist rescue, by design (see
+nav-admin.html's header comment for why that rule has no exceptions). A
+naive next-page link built as an anchor whose href= carries the next
+offset spliced in as text is exactly what that guard exists to catch, and
+it WILL catch it (render() itself has no notion of "this is just a code
+comment" either - a literal two-brace mention of a var name that is not
+actually one of THIS file's own vars dies exactly like a real missing one
+would, which is why this comment describes the anti-pattern in prose
+instead of spelling it out). The scanner's own failure message names the
+fix, and this is the worked example:
+
+  Use a GET <form> whose parameters are hidden name=/value= inputs instead
+  of a query string spliced into href=. `value=` is on the inert-attribute
+  allowlist (R47), so escape_html()'s ordinary guarantee - safe as element
+  content and as a QUOTED attribute value - is exactly the guarantee this
+  needs, and the browser does the encoding when it submits the form, not
+  this codebase's own string concatenation. See lists-pagination-prev.html /
+  lists-pagination-next.html: each is a one-button <form method="GET"
+  action="/ui/lists"> carrying which/filter/offset as hidden fields.
+
+The which-tabs below (Denied / Temporary / Allowed) do NOT need this
+treatment and are plain <a href="/ui/lists?which=deny"> links: the three
+hrefs are LITERAL strings this codebase wrote, not a value that varies with
+the request - R51's remedy is for a value that comes from request state
+(an offset, a filter, an id), not for a fixed, enumerated set of links a
+template author is choosing between. Only which tab is CURRENT varies, and
+that goes through the same aria-current technique nav-admin.html documents
+(an aria-* attribute is on the inert allowlist regardless of content).
+
+If a future screen needs a parameterised link this pattern does not cleanly
+cover, STOP and say so rather than reaching for {{{ }}} on an href/src/action
+or dropping the escaped marker into an unquoted one - both are exactly the
+failure this guard exists to prevent (task-7-brief.md).
+-->
+<div class="{{flash_class}}" role="status">{{flash_text}}</div>
+
+<nav class="tabs" aria-label="Which list">
+	<a href="/ui/lists?which=deny" aria-current="{{tab_deny}}">Denied</a>
+	<a href="/ui/lists?which=temp" aria-current="{{tab_temp}}">Temporary</a>
+	<a href="/ui/lists?which=allow" aria-current="{{tab_allow}}">Allowed</a>
+</nav>
+
+<form method="GET" action="/ui/lists" class="panel" role="search">
+	<input type="hidden" name="which" value="{{which}}">
+	<input type="hidden" name="offset" value="0">
+	<div class="field">
+		<label for="lists-filter">Filter</label>
+		<input type="search" id="lists-filter" name="filter" value="{{filter}}"
+			placeholder="Matches an address or a note" maxlength="100">
+	</div>
+	<div class="form-actions">
+		<button type="submit" class="btn">Filter</button>
+	</div>
+</form>
+
+<section class="panel">
+	<p class="text-muted">{{total_text}}</p>
+	<div class="table-responsive">
+		<table>
+			{{{table_head}}}
+			<tbody>
+				{{{rows}}}
+			</tbody>
+		</table>
+	</div>
+	<div class="pagination">
+		{{{pagination}}}
+	</div>
+</section>

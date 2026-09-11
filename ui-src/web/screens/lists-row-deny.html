@@ -1,0 +1,51 @@
+<!--
+Copyright (C) 2006-2025 Jonathan Michaelson
+
+https://github.com/waytotheweb/scripts
+
+This program is free software; you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation; either version 3 of the License, or (at your option) any later
+version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT
+ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+FOR A PARTICULAR PURPOSE. See the GNU General Public License for more
+details.
+
+You should have received a copy of the GNU General Public License along with
+this program; if not, see <https://www.gnu.org/licenses>.
+-->
+<!--
+Added 2026-09-11 in https://github.com/nkyo/csf - see CHANGES.md.
+
+One row of a which=deny Lists page, admin variant (Task 7) - rendered once
+per row by ui-src/bin/csf-ui, joined, and spliced into lists.html's own raw
+"rows" slot: exactly the "canonical case" Render.pm's own header comment
+describes (HTML-escape each cell through {{}}, join the rows, hand the whole
+string to the parent template as a raw var). See lists-row-deny-ro.html for
+the support-role variant with no mutating form on it (a convenience - the
+real enforcement is server-side, POST /ui/lists/undeny has no
+`support => 1`).
+
+action="/ui/lists/undeny" is a LITERAL string, never templated - see
+lists.html's own header comment (R51) for why that is not optional. which/
+filter/offset are carried as hidden fields purely so the POST handler's
+redirect can return the operator to the same page/filter they were on; they
+are NOT read by ui-src/bin/csf-ui's `undeny` RPC call itself, which only
+ever sends `ip` (docs/WEBUI-RPC.md S5.4).
+-->
+<tr>
+	<td data-label="IP">{{ip}}</td>
+	<td data-label="Note">{{note}} <span class="badge {{protected_class}}">{{protected_text}}</span></td>
+	<td data-label="Actions">
+		<form method="POST" action="/ui/lists/undeny" class="row-actions">
+			<input type="hidden" name="_csrf" value="{{csrf}}">
+			<input type="hidden" name="ip" value="{{ip}}">
+			<input type="hidden" name="which" value="{{which}}">
+			<input type="hidden" name="filter" value="{{filter}}">
+			<input type="hidden" name="offset" value="{{offset}}">
+			<button type="submit" class="btn btn-small">Undeny</button>
+		</form>
+	</td>
+</tr>

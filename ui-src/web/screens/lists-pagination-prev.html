@@ -1,0 +1,34 @@
+<!--
+Copyright (C) 2006-2025 Jonathan Michaelson
+
+https://github.com/waytotheweb/scripts
+
+This program is free software; you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation; either version 3 of the License, or (at your option) any later
+version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT
+ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+FOR A PARTICULAR PURPOSE. See the GNU General Public License for more
+details.
+
+You should have received a copy of the GNU General Public License along with
+this program; if not, see <https://www.gnu.org/licenses>.
+-->
+<!--
+Added 2026-09-11 in https://github.com/nkyo/csf - see CHANGES.md.
+
+R51's worked example: a GET <form> carrying pagination state as hidden
+name=/value= inputs, not a query string spliced into href=. See lists.html's
+header comment for the rule this follows. Rendered by ui-src/bin/csf-ui only
+when offset > 0 (there is nothing "previous" to page 1) and spliced,
+already-rendered, into lists.html's own raw "pagination" slot alongside
+lists-pagination-next.html.
+-->
+<form method="GET" action="/ui/lists">
+	<input type="hidden" name="which" value="{{which}}">
+	<input type="hidden" name="filter" value="{{filter}}">
+	<input type="hidden" name="offset" value="{{offset}}">
+	<button type="submit" class="btn btn-small">Previous</button>
+</form>

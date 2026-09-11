@@ -1,0 +1,33 @@
+<!--
+Copyright (C) 2006-2025 Jonathan Michaelson
+
+https://github.com/waytotheweb/scripts
+
+This program is free software; you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation; either version 3 of the License, or (at your option) any later
+version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT
+ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+FOR A PARTICULAR PURPOSE. See the GNU General Public License for more
+details.
+
+You should have received a copy of the GNU General Public License along with
+this program; if not, see <https://www.gnu.org/licenses>.
+-->
+<!--
+Added 2026-09-11 in https://github.com/nkyo/csf - see CHANGES.md.
+
+R51's worked example, the "Next" half - see lists-pagination-prev.html.
+Rendered only when docs/WEBUI-RPC.md S5.9's `next_offset` is defined
+(non-null); this file's own offset value is ALWAYS that next_offset, never
+offset + limit (S3.4/S5.9: the response may return fewer rows than limit,
+so the two can differ).
+-->
+<form method="GET" action="/ui/lists">
+	<input type="hidden" name="which" value="{{which}}">
+	<input type="hidden" name="filter" value="{{filter}}">
+	<input type="hidden" name="offset" value="{{offset}}">
+	<button type="submit" class="btn btn-small">Next</button>
+</form>

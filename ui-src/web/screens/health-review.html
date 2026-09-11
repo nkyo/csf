@@ -1,0 +1,69 @@
+<!--
+Copyright (C) 2006-2025 Jonathan Michaelson
+
+https://github.com/waytotheweb/scripts
+
+This program is free software; you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation; either version 3 of the License, or (at your option) any later
+version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT
+ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+FOR A PARTICULAR PURPOSE. See the GNU General Public License for more
+details.
+
+You should have received a copy of the GNU General Public License along with
+this program; if not, see <https://www.gnu.org/licenses>.
+-->
+<!--
+Added 2026-09-11 in https://github.com/nkyo/csf - see CHANGES.md.
+
+Step 2 of 2 of Health's destructive flow (Task 7) - the "separate
+confirmation with a diff" docs/WEBUI-RPC.md S5.12 requires. Reached only
+from POST /ui/health/review, which re-ran `reconcile` FRESH and cross-
+checked the operator's selection against it before this page was ever
+built - what is listed below is exactly what /ui/health/apply's own
+`reconcile_fix` call will re-verify and act on, not what the operator
+clicked on the PREVIOUS page (which may be stale by the time this renders).
+
+The stale-class/stale-text pair is shown when some of the originally-
+selected findings are no longer present or no longer fixable in the fresh
+scan (the page the operator reviewed a moment ago was already out of
+date) - informational, not blocking: what IS still fixable is still
+offered below.
+
+The empty-class/apply-class pair uses the same toggle-visibility pattern
+used throughout this UI (see overview.html's header comment) to pick
+between "here is what will be deleted, with a Yes button" and "nothing
+survived the fresh check, there is nothing to apply" - never a Yes button
+next to zero rows.
+-->
+<section class="panel">
+	<h2 class="panel-title">Confirm: delete these iptables rules?</h2>
+	<div class="{{stale_class}}" role="alert">{{stale_text}}</div>
+
+	<div class="{{empty_class}}">
+		<p>None of the selected findings are still present and fixable. Nothing will be changed.</p>
+		<p><a href="/ui/health" class="btn">Back to Health</a></p>
+	</div>
+
+	<div class="{{apply_class}}">
+		<p class="text-muted">{{count_text}}</p>
+		<form method="POST" action="/ui/health/apply">
+			<input type="hidden" name="_csrf" value="{{csrf}}">
+			<div class="table-responsive">
+				<table>
+					<thead><tr><th>Kind</th><th>Chain</th><th>Family</th><th>Address</th><th>Rule</th></tr></thead>
+					<tbody>
+						{{{rows}}}
+					</tbody>
+				</table>
+			</div>
+			<div class="form-actions">
+				<button type="submit" class="btn btn-danger">Yes, delete these rules</button>
+				<a href="/ui/health" class="btn btn-quiet">Cancel</a>
+			</div>
+		</form>
+	</div>
+</section>

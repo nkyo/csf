@@ -1,0 +1,37 @@
+<!--
+Copyright (C) 2006-2025 Jonathan Michaelson
+
+https://github.com/waytotheweb/scripts
+
+This program is free software; you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation; either version 3 of the License, or (at your option) any later
+version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT
+ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+FOR A PARTICULAR PURPOSE. See the GNU General Public License for more
+details.
+
+You should have received a copy of the GNU General Public License along with
+this program; if not, see <https://www.gnu.org/licenses>.
+-->
+<!--
+Added 2026-09-11 in https://github.com/nkyo/csf - see CHANGES.md.
+
+A reconcile finding with fixable:false (Task 7) - a GHOST (docs/WEBUI-RPC.md
+S5.11: "the remedy is `restart`") or an unparsable entry. No checkbox at
+all - not merely an unchecked one - so it can never be submitted as a
+fix_id_N field regardless of what a hostile client might try to add
+client-side; ui-src/bin/csf-ui's own POST handlers re-validate against a
+FRESH reconcile()/fixable check regardless (docs/WEBUI-RPC.md S5.12), so
+this is belt-and-braces, not the actual enforcement.
+-->
+<tr>
+	<td data-label="Kind"><span class="badge badge-danger">{{kind}}</span></td>
+	<td data-label="Chain">{{chain}}</td>
+	<td data-label="Family">IPv{{family}}</td>
+	<td data-label="Address">{{ip}}</td>
+	<td data-label="Rule"><code>{{spec}}</code></td>
+	<td data-label="Fix"><span class="findings-fixable">Not fixable: {{reason}}</span></td>
+</tr>

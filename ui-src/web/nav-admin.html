@@ -1,0 +1,56 @@
+<!--
+Copyright (C) 2006-2025 Jonathan Michaelson
+
+https://github.com/waytotheweb/scripts
+
+This program is free software; you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation; either version 3 of the License, or (at your option) any later
+version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT
+ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+FOR A PARTICULAR PURPOSE. See the GNU General Public License for more
+details.
+
+You should have received a copy of the GNU General Public License along with
+this program; if not, see <https://www.gnu.org/licenses>.
+-->
+<!--
+Added 2026-09-11 in https://github.com/nkyo/csf - see CHANGES.md.
+
+The admin role's nav (Task 7), spliced into layout.html's raw nav slot (the
+three-brace marker, "nav") by ui-src/bin/csf-ui's _render_nav(). All five hrefs below are LITERAL strings
+this codebase wrote, never a substituted value - href/src/action are flagged
+by t/50-render.t's scanner the moment ANY {{ }} lands in them, allowlist or
+not (R47), on purpose: the rule is "never templated", not "never templated
+unless the author is sure the value is safe today". Only "which link is
+current" varies per request, and it varies through aria-current, which IS on
+the scanner's inert-attribute allowlist because it is an aria-* attribute
+(R47) - so that is the one thing this file lets vary, via a plain {{}}
+value, never "page"/"" but always one of ARIA's own defined tokens ("page" or
+"false") so a screen reader is never handed an attribute value ARIA does not
+define. See ui-src/bin/csf-ui's _render_nav() for how cur_* is chosen.
+
+The logout control is a POST form, not a link, because logging out is a
+state-changing action (ui-src/bin/csf-ui's POST /ui/logout, mutates => 1) and
+every state-changing action here is a CSRF-carrying POST - task-7-brief.md
+is explicit that hiding a button is not enforcement, but a GET link would not
+even be the right shape to hide: a bare <a href="/ui/logout"> could be
+triggered by anything that can make the browser issue a GET (an <img>, a
+prefetch, a crawler), which is exactly the cross-site request the CSRF
+nonce exists to rule out.
+-->
+<ul>
+	<li><a href="/ui/overview" aria-current="{{cur_overview}}">Overview</a></li>
+	<li><a href="/ui/block" aria-current="{{cur_block}}">Block / Unblock</a></li>
+	<li><a href="/ui/lists" aria-current="{{cur_lists}}">Lists</a></li>
+	<li><a href="/ui/lookup" aria-current="{{cur_lookup}}">IP Lookup</a></li>
+	<li><a href="/ui/health" aria-current="{{cur_health}}">Health</a></li>
+	<li>
+		<form method="POST" action="/ui/logout">
+			<input type="hidden" name="_csrf" value="{{csrf}}">
+			<button type="submit" class="btn btn-quiet btn-small">Log out</button>
+		</form>
+	</li>
+</ul>

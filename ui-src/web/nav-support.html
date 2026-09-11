@@ -1,0 +1,39 @@
+<!--
+Copyright (C) 2006-2025 Jonathan Michaelson
+
+https://github.com/waytotheweb/scripts
+
+This program is free software; you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation; either version 3 of the License, or (at your option) any later
+version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT
+ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+FOR A PARTICULAR PURPOSE. See the GNU General Public License for more
+details.
+
+You should have received a copy of the GNU General Public License along with
+this program; if not, see <https://www.gnu.org/licenses>.
+-->
+<!--
+Added 2026-09-11 in https://github.com/nkyo/csf - see CHANGES.md.
+
+The support role's nav (Task 7) - lookup and read-only Lists only, per
+docs/WEBUI-RPC.md S5's role mapping ("support may call grep and list only").
+This is a convenience: the actual enforcement is server-side, per request,
+in ui-src/bin/csf-ui's @ROUTES (Overview/Block/Health simply have no
+`support => 1` flag) - this file merely avoids showing a support user a link
+to a page the server will refuse. See nav-admin.html for why the hrefs are
+literal and only aria-current is templated.
+-->
+<ul>
+	<li><a href="/ui/lists" aria-current="{{cur_lists}}">Lists</a></li>
+	<li><a href="/ui/lookup" aria-current="{{cur_lookup}}">IP Lookup</a></li>
+	<li>
+		<form method="POST" action="/ui/logout">
+			<input type="hidden" name="_csrf" value="{{csrf}}">
+			<button type="submit" class="btn btn-quiet btn-small">Log out</button>
+		</form>
+	</li>
+</ul>

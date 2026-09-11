@@ -1,0 +1,44 @@
+<!--
+Copyright (C) 2006-2025 Jonathan Michaelson
+
+https://github.com/waytotheweb/scripts
+
+This program is free software; you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation; either version 3 of the License, or (at your option) any later
+version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT
+ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+FOR A PARTICULAR PURPOSE. See the GNU General Public License for more
+details.
+
+You should have received a copy of the GNU General Public License along with
+this program; if not, see <https://www.gnu.org/licenses>.
+-->
+<!--
+Added 2026-09-11 in https://github.com/nkyo/csf - see CHANGES.md.
+
+One row of a which=temp Lists page, admin variant (Task 7) - the temp-ban
+shape (docs/WEBUI-RPC.md S5.9: ports/dir/ttl_left, no protected/line), against
+POST /ui/lists/temprm, which is `csf -trd` NOT `csf -tr` (S5.8 - removing a
+row here must never also remove a temp-ALLOW the operator cannot see on this
+screen). See lists-row-deny.html's header comment for the rest of the shape.
+-->
+<tr>
+	<td data-label="IP">{{ip}}</td>
+	<td data-label="Note">{{note}}</td>
+	<td data-label="Ports">{{ports}}</td>
+	<td data-label="Direction">{{dir}}</td>
+	<td data-label="Expires in">{{ttl_text}}</td>
+	<td data-label="Actions">
+		<form method="POST" action="/ui/lists/temprm" class="row-actions">
+			<input type="hidden" name="_csrf" value="{{csrf}}">
+			<input type="hidden" name="ip" value="{{ip}}">
+			<input type="hidden" name="which" value="{{which}}">
+			<input type="hidden" name="filter" value="{{filter}}">
+			<input type="hidden" name="offset" value="{{offset}}">
+			<button type="submit" class="btn btn-small">Remove</button>
+		</form>
+	</td>
+</tr>

@@ -26,43 +26,67 @@ exactly the five variables below - render() dies on a missing one rather
 than silently leaving a blank in the page (task-6-brief.md), so this list
 IS the contract; there is no version of "forgot one" that ships quietly.
 
-  {{title}}    escaped. Plain text - no markup. Used both in <title> and
-               as the visible <h1>.
-  {{user}}     escaped. The signed-in session's username
+  `title`   escaped two-brace marker. Plain text - no markup. Used both in
+               <title> and as the visible <h1>.
+  `user`    escaped two-brace marker. The signed-in session's username
                ($session->{user} - ui-src/bin/csf-ui's _gate() hands every
                non-anonymous route the session object it loaded).
-  {{role}}     escaped. "admin" or "support" ($session->{role}, same
-               source).
-  {{{nav}}}    RAW - see ConfigServer::UI::Render's header comment for
-               what that means and what it does not mean. Screen-to-screen
-               navigation, and this shell's only sensible place for a
-               "log out" action. Raw, and entirely Task 7's, for two
-               reasons together: which link is "current" and which links
-               exist at all (support sees only IP lookup and Lists per
+  `role`    escaped two-brace marker. "admin" or "support" ($session->{role},
+               same source).
+  `nav`     RAW three-brace marker - see ConfigServer::UI::Render's header
+               comment for what that means and what it does not mean.
+               Screen-to-screen navigation, and this shell's only sensible
+               place for a "log out" action. Raw, and entirely Task 7's, for
+               two reasons together: which link is "current" and which
+               links exist at all (support sees only IP lookup and Lists per
                docs/WEBUI-PLAN.md S7) depends on the route table Task 6
                must not touch; and logout is itself the mutating
                POST /api/logout route ui-src/bin/csf-ui already defines
                (mutates => 1) - a plain HTML form posting to it needs a
                CSRF hidden field carrying $session->{csrf}, the same
                nonce value a handler already has in hand (see
-               ConfigServer::UI::Render's header comment on {{{...}}} vars,
-               and ui-src/bin/csf-ui's own comment on where a template
-               gets this value) and the same nonce whatever screen this
-               layout wraps needs for ITS OWN forms. This file does not
-               reference {csrf} directly for exactly that reason: it has
-               no form of its own to put it in. Build {{{nav}}} BY CALLING
-               render()/escape_html() on every piece of it that is not a
-               literal string this codebase wrote (a label like
+               ConfigServer::UI::Render's header comment on raw markers in
+               general, and ui-src/bin/csf-ui's own comment on where a
+               template gets this value) and the same nonce whatever screen
+               this layout wraps needs for ITS OWN forms. This file does not
+               reference the csrf value directly for exactly that reason: it
+               has no form of its own to put it in. Build the `nav` value by
+               calling render()/escape_html() on every piece of it that is
+               not a literal string this codebase wrote (a label like
                "Overview" is fine as a literal; a value that ever
                originated from a request is not) and pass the finished,
                already-safe string in - never pass an unescaped fragment
-               here believing this layout will escape it, because
-               {{{...}}} never does.
-  {{{content}}} RAW, same rule as {{{nav}}}: the screen's own body,
-               already rendered (and therefore already escaped, piece by
-               piece, wherever it holds a value that did not originate as
-               a literal in this codebase) by the screen's own template
-               pass before it ever reaches this file.
+               here believing this layout will escape it, because a raw
+               marker never does.
+  `content` RAW three-brace marker, same rule as `nav`: the screen's own
+               body, already rendered (and therefore already escaped, piece
+               by piece, wherever it holds a value that did not originate as
+               a literal in this codebase) by the screen's own template pass
+               before it ever reaches this file.
+
+  A NOTE FOUND WHILE TASK 7 FIRST RENDERED THIS FILE WITH REAL CONTENT: the
+  five names above are spelled with backticks and no braces, ON PURPOSE, and
+  every other mention of a marker anywhere in this comment block follows the
+  same rule. render() processes this ENTIRE file as text, including this
+  comment - it has no notion of "this is documentation, not a real
+  placeholder". A literal two- or three-brace spelling of a real var name
+  written here as prose would be substituted exactly like the functional
+  markers below are: for `title`/`user`/`role` that silently duplicates the
+  escaped value into this comment's own text, and for `nav`/`content` (raw,
+  unescaped, and typically containing this app's HTML markup, which ends
+  its own comments the normal way) it can end THIS comment early instead,
+  spilling the rest of this comment's text out as visible page content -
+  HTML has no way to escape that closing sequence once it appears, so
+  merely being inside a comment does not protect against it. This is
+  exactly what happened here before this note was added: the original
+  version of this comment spelled out the real markers in brace syntax as
+  documentation, and every page render silently duplicated the nav/content
+  HTML into this comment and truncated it at the first place that HTML
+  closed a comment of its own. Fixed by respelling every mention in this
+  comment (functional markers below are unaffected); see CHANGES.md. (And
+  yes, this paragraph was itself rewritten once already for writing that
+  closing sequence out literally, for the exact same reason - the words
+  "ends a comment" appear here now for exactly that reason.)
 
 Structural elements below are landmarks by native HTML semantics, not by
 added ARIA roles (a <header>/<footer> that is not nested inside sectioning

@@ -766,6 +766,70 @@ table tbody tr:hover {
 }
 
 /* ---------------------------------------------------------------------
+ * Task 7 additions. app.css's own header comment (Task 6) already
+ * anticipates this: "Every one of the five screens (Task 7) and
+ * layout.html (Task 6) link this one file" - these rules are additive,
+ * nothing above this point is changed.
+ * ------------------------------------------------------------------- */
+
+/* Login screen (ui-src/web/screens/login.html) - a standalone document,
+   not wrapped by layout.html, so it needs its own top-level centering. */
+.login-shell {
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	min-height: 100vh;
+	padding: var(--space-5);
+}
+
+.login-panel {
+	width: 100%;
+	max-width: 24rem;
+}
+
+/* Lists screen (ui-src/web/screens/lists.html) which-tabs. Mirrors
+   .site-nav's own aria-current="page" convention (see that rule above)
+   rather than inventing a second one - "which link is current" always
+   means the same CSS attribute selector in this stylesheet. */
+.tabs {
+	display: flex;
+	flex-wrap: wrap;
+	gap: var(--space-2);
+	margin-bottom: var(--space-4);
+}
+
+.tabs a {
+	display: inline-flex;
+	align-items: center;
+	min-height: var(--touch-min);
+	padding: var(--space-2) var(--space-4);
+	border: var(--border-width) solid var(--color-control-border);
+	border-radius: var(--radius);
+	color: var(--color-text);
+	text-decoration: none;
+	font-weight: 500;
+}
+
+.tabs a:hover {
+	background: var(--color-bg-alt);
+}
+
+.tabs a[aria-current="page"] {
+	background: var(--color-primary);
+	border-color: var(--color-primary);
+	color: var(--color-primary-contrast);
+	font-weight: 700;
+}
+
+/* Health screen (ui-src/web/screens/health.html) findings table - a row's
+   fixability is a badge, same convention as everywhere else in this file
+   (color paired with a text label, never color alone). */
+.findings-fixable {
+	color: var(--color-text-muted);
+	font-size: 0.875rem;
+}
+
+/* ---------------------------------------------------------------------
  * Stat tiles (Overview screen counts).
  * ------------------------------------------------------------------- */
 .stat-grid {

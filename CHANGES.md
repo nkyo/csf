@@ -37,6 +37,77 @@ line is added below the original notice; the original stays intact.
 
 ### Unreleased
 
+#### Task 7 — the five screens: Overview, Block/Unblock, Lists, IP lookup, Health
+
+**2026-09-11** — Added the server-rendered screens people actually use, built entirely on
+top of the frozen contract (`docs/WEBUI-RPC.md`), the root helper (Task 2), the auth store
+(Task 3), the unprivileged web tier and its router (Task 4), the HTTP/TLS core (Task 5),
+and the rendering layer (Task 6). No JavaScript anywhere: every primary action is a plain
+HTML `<form>`, and every state-changing one carries the session's CSRF nonce. Twenty-one
+new template files under `ui-src/web/screens/` plus `ui-src/web/nav-admin.html` /
+`ui-src/web/nav-support.html`, wired to nineteen new routes in `ui-src/bin/csf-ui`'s
+`@ROUTES` (`ui-src/bin/csf-ui`, `ui-src/web/screens/*.html`, `ui-src/web/nav-*.html`,
+`t/60-screens.t`).
+
+- **Role enforcement is server-side, per request, in the same `_gate()` every `/api/*`
+  route already goes through** — `support => 1` on `GET /ui/lists` and `GET /ui/lookup`
+  only; every other `/ui/*` route defaults to admin-only, exactly `docs/WEBUI-RPC.md` S5's
+  role mapping. A logged-in support session that navigates straight to `/ui/overview`,
+  `/ui/block` or `/ui/health` by URL is refused with 403 before any handler runs, not
+  merely kept off a nav link.
+- **Health's destructive flow is two POSTs, never one**: `GET /ui/health` shows the
+  reconcile diff and posts to `POST /ui/health/review` (never a mutation itself — it only
+  re-runs the read-only `reconcile`), which shows exactly what a FRESH scan says is still
+  present and fixable and posts to `POST /ui/health/apply`, the only route in this whole
+  tier that ever calls `reconcile_fix`. Selection is via independently-named `fix_id_N` /
+  `apply_id_N` hidden fields rather than a shared `name="ids"`, because neither this
+  contract's query-string folding (S14.1) nor `csf-ui`'s own form-body parser promises to
+  preserve repeated same-named values as a list.
+- **Lists paginates and switches lists with GET `<form>`s carrying hidden fields, never a
+  query string spliced into `href=`** — see "R51" below.
+- A pre-existing bug in `layout.html` (Task 6) is fixed as part of this task:
+  `Render.pm`'s `render()` processes a template's ENTIRE text as one substitution pass,
+  comments included. `layout.html`'s own documentation comment spelled out its five
+  variables using the literal brace syntax it was explaining (`{{title}}`, `{{{nav}}}`,
+  `{{{content}}}`, ...) — every one of those got substituted too, silently duplicating the
+  real values into the comment and, for the two RAW markers, truncating the comment at the
+  first place the substituted HTML happened to close a comment of its own. Never caught
+  before this task because nothing before it actually rendered `layout.html` with real
+  `nav`/`content` HTML end to end. Fixed by respelling every mention in that comment
+  without brace syntax; the functional markers are unchanged. The same class of problem
+  (a partial's own header comment being spliced, verbatim, into a page that composes many
+  small partials) is why `ui-src/bin/csf-ui`'s new `_strip_leading_comments()` strips each
+  template's leading GPL/doc comments from rendered output before it is used — GPLv3 S5(a)
+  requires the notice in the source tree, not in every HTTP response a Lists page's
+  twenty-five rows would otherwise have repeated it in.
+- **Every screen author hits the URL-parameter question on the first screen with
+  pagination — the remedy is written down twice, per the review's own instruction**: in
+  `t/50-render.t`'s scanner failure message, and in `ui-src/web/screens/lists.html`'s own
+  header comment (the worked example, since Lists is the screen that needed it): a GET
+  `<form>` whose parameters are hidden `name=`/`value=` inputs, never a query string
+  spliced into `href=`/`src=`/`action=` (those three are flagged unconditionally the
+  moment any `{{ }}` lands in them — see Task 6 fix round 5's R47 below — there is no
+  allowlist rescue for them the way there is for `value=`).
+
+**R50 (review carry-over from Task 6, closed by this task)** — the escaping-context
+scanner's entire premise (an inert-attribute allowlist that lets `title="{{v}}"` and
+`data-ip="{{id}}"` through unescaped-for-JS) rests on this UI shipping no JavaScript at
+all. Nothing enforced that premise: `<script src="/app.js">` and a static, un-templated
+`onclick="showDetail(this)"` both scanned clean while being live script/XSS the moment
+anything else on the page carried attacker text. Closed in `t/50-render.t` by
+`_find_script_or_event_handlers()`, which reuses the same tag/attribute tokenizer as the
+placeholder-safety scan (rather than a fresh regex — that is the whole lesson of Task 6's
+five fix rounds) to flag any `<script>` element or `on*=` attribute NAME anywhere under
+`ui-src/web/`, unconditionally of whether a `{{ }}` placeholder is anywhere near it. This
+guard was written and verified BEFORE any screen template was authored, per the review's
+own instruction, and the real enforcement loop at the bottom of `t/50-render.t` runs it
+against every `.html` file automatically.
+
+**Guard-removal verification** (the method this project has used since Task 5): every
+guarantee added by this task was removed, the specific test(s) that go red were recorded,
+and the guard was restored and re-verified byte-identical before moving to the next. Full
+table with the exact tests in `.superpowers/sdd/webui-implementation/task-7-report.md`.
+
 #### Task 6 fix round 5 — invert the attribute rule, model the script-data escape states, correct a comment that lied about its own guard
 
 - **2026-09-11** — Re-review of fix round 4 verdicted the rewrite sound and both R45 and R46

@@ -117,11 +117,20 @@ use JSON::Tiny ();
 use ConfigServer::UI::Client    ();
 use ConfigServer::UI::Session   ();
 use ConfigServer::UI::RateLimit ();
+use ConfigServer::UI::Render    ();
 
 our $VERSION = '1.00';
 
 our $DEFAULT_UI_CONF    = '/etc/csf-ui/ui.conf';
 our $DEFAULT_ACCESS_LOG = '/var/log/csf-ui-access.log';
+
+# Task 7: where layout.html, app.css and ui-src/web/screens/*.html live once
+# installed - the same "/usr/local/csf-ui/..." convention $DEFAULT_UI_CONF's
+# neighbours already use for this tier's own files, one directory over from
+# `lib`. Injectable for the same reason every other default in this
+# constructor is: t/60-screens.t points it at this repository's own
+# ui-src/web rather than a real install path.
+our $DEFAULT_WEB_ROOT = '/usr/local/csf-ui/web';
 
 # docs/WEBUI-RPC.md S14.1 - the same figure as the wire line cap (S3.1), for
 # consistency rather than derivation. A defensive backstop only: Task 5
@@ -209,6 +218,60 @@ our @ROUTES = (
 
 	{ method => 'POST', path => '/api/login',  handler => \&_route_login,  anonymous => 1 },
 	{ method => 'POST', path => '/api/logout', handler => \&_route_logout, mutates => 1, any_role => 1 },
+
+	###########################################################################
+	# Task 7: the five server-rendered screens people actually use, plus the
+	# static stylesheet they all link. These are ADDITIVE to the JSON /api/*
+	# tier above (Task 4/5), never a replacement for it - a JS-driven caller
+	# can still use /api/*; a plain browser with no JavaScript uses these
+	# instead, which is why every one of them is a `handler` row that renders
+	# HTML (or issues a redirect) rather than JSON, and why the mutating ones
+	# below have their OWN routes rather than pointing a <form> at /api/deny
+	# et al: a plain HTML form submission needs an HTML/redirect response, not
+	# a raw JSON body dumped into the browser.
+	#
+	# PROTECTION IS STILL OPT-OUT, NOT OPT-IN (see this table's own header
+	# comment above): every row below goes through the exact same _gate() as
+	# every /api/* row, with the exact same meaning for `mutates`/`support`/
+	# `any_role`/`anonymous`. Nothing about being a screen loosens any of
+	# that - task-7-brief.md: "the server enforces this per request ...
+	# because hiding a button is not enforcement", and that enforcement is
+	# _gate(), unchanged, run before every handler below exactly as it is run
+	# before every /api/* one.
+	#
+	# /ui/health/review carries `mutates => 1` even though it never calls a
+	# mutating RPC operation itself (it only re-runs the read-only
+	# `reconcile`) - a deliberate, application-level choice to require the
+	# CSRF nonce on this step too, since it is the doorway to the one
+	# genuinely destructive screen (docs/WEBUI-RPC.md S5.12: "a diff shown
+	# and a separate confirmation"), not something docs/WEBUI-RPC.md itself
+	# requires of a non-mutating step.
+	###########################################################################
+	{ method => 'GET',  path => '/app.css', handler => \&_route_app_css, anonymous => 1 },
+
+	{ method => 'GET',  path => '/ui/login',  handler => \&_route_ui_login_form,   anonymous => 1 },
+	{ method => 'POST', path => '/ui/login',  handler => \&_route_ui_login_submit, anonymous => 1 },
+	{ method => 'POST', path => '/ui/logout', handler => \&_route_ui_logout, mutates => 1, any_role => 1 },
+
+	{ method => 'GET',  path => '/ui/overview', handler => \&_route_ui_overview },
+	{ method => 'POST', path => '/ui/restart',  handler => \&_route_ui_restart, mutates => 1 },
+
+	{ method => 'GET',  path => '/ui/block',          handler => \&_route_ui_block },
+	{ method => 'POST', path => '/ui/block/deny',     handler => \&_route_ui_block_deny,     mutates => 1 },
+	{ method => 'POST', path => '/ui/block/tempdeny', handler => \&_route_ui_block_tempdeny, mutates => 1 },
+	{ method => 'POST', path => '/ui/block/allow',    handler => \&_route_ui_block_allow,    mutates => 1 },
+	{ method => 'POST', path => '/ui/block/undeny',   handler => \&_route_ui_block_undeny,   mutates => 1 },
+
+	{ method => 'GET',  path => '/ui/lists',         handler => \&_route_ui_lists,        support => 1 },
+	{ method => 'POST', path => '/ui/lists/undeny',  handler => \&_route_ui_lists_undeny,  mutates => 1 },
+	{ method => 'POST', path => '/ui/lists/unallow', handler => \&_route_ui_lists_unallow, mutates => 1 },
+	{ method => 'POST', path => '/ui/lists/temprm',  handler => \&_route_ui_lists_temprm,  mutates => 1 },
+
+	{ method => 'GET',  path => '/ui/lookup', handler => \&_route_ui_lookup, support => 1 },
+
+	{ method => 'GET',  path => '/ui/health',        handler => \&_route_ui_health },
+	{ method => 'POST', path => '/ui/health/review', handler => \&_route_ui_health_review, mutates => 1 },
+	{ method => 'POST', path => '/ui/health/apply',  handler => \&_route_ui_health_apply,  mutates => 1 },
 );
 
 ###############################################################################
@@ -237,6 +300,7 @@ sub new {
 		sessions   => $opt{sessions}   || ConfigServer::UI::Session->new(idle => $idle, max => $max),
 		ratelimit  => $opt{ratelimit}  || ConfigServer::UI::RateLimit->new,
 		access_log => $opt{access_log} || $DEFAULT_ACCESS_LOG,
+		web_root   => $opt{web_root}   || $DEFAULT_WEB_ROOT,
 		now        => $opt{now}        || sub { time() },
 	}, $class;
 }
@@ -539,6 +603,942 @@ sub _route_logout {
 	my $response = _json_response(200, { ok => _true(), data => {} });
 	push @{ $response->{headers} }, ['Set-Cookie', $self->{sessions}->clear_cookie_header];
 	return ($response, $session->{user}, $session->{role}, undef);
+}
+
+###############################################################################
+# TASK 7 - the five server-rendered screens.
+#
+# Everything below this point renders ui-src/web/screens/*.html through
+# ConfigServer::UI::Render rather than answering JSON, and calls the RPC
+# client directly rather than going through _forward_to_helper() (which
+# always produces a JSON body - exactly wrong for a plain HTML <form>
+# submission, which needs a normal page or a redirect back to one).
+#
+# A NOTE ON IDS AND THE ACCESS LOG: a screen that needs more than one RPC
+# call to render (Overview: status+counts+reconcile) generates ONE id and
+# passes it to every call that request makes, rather than a fresh id per
+# call - docs/WEBUI-RPC.md S8 correlates the helper's own audit log by id,
+# and one page view that made three calls is one event worth finding
+# together under one id, not three unrelated ones. Nothing in the contract
+# requires ids to be globally unique across separate calls (S3.2 only
+# requires the id echoed back on the one request/response pair it was sent
+# on to match, which Client.pm already checks), so this is safe.
+###############################################################################
+
+###############################################################################
+# Small value helpers shared by every handler below.
+###############################################################################
+
+# A defined, non-reference value the RPC client decoded as a number,
+# coerced to a plain integer for display - JSON::Tiny numbers are plain
+# Perl scalars (never blessed), so this is just a defensive default for a
+# missing/malformed field, never a workaround for a boolean-shaped ref
+# (that is _is_ok(), already defined above).
+sub _num {
+	my ($value) = @_;
+	return (defined $value && !ref $value) ? ($value + 0) : 0;
+}
+
+# A defined, non-reference value as text, or a caller-supplied default
+# (itself defaulting to '') when the value is missing, undef or a
+# reference - render() dies on any of those, and a handler should choose
+# its own fallback text deliberately rather than let a formatting bug
+# surface as a 500.
+sub _text {
+	my ($value, $default) = @_;
+	return (defined $value && !ref($value) && length("$value")) ? "$value" : (defined $default ? $default : '');
+}
+
+# Percent-encodes one value for a query string, operating byte-by-byte
+# (the same raw-bytes convention docs/WEBUI-RPC.md S14.2 and Render.pm's
+# own header comment use throughout this tier) - unreserved characters
+# (RFC 3986) pass through unchanged, everything else becomes %XX.
+sub _url_encode {
+	my ($text) = @_;
+	$text = defined $text ? "$text" : '';
+	$text =~ s/([^A-Za-z0-9\-\._~])/sprintf('%%%02X', ord($1))/ge;
+	return $text;
+}
+
+# Builds a query string from a flat hashref, dropping undef/empty values
+# and sorting keys for a deterministic, testable result. Used only to
+# build a REDIRECT Location this module itself constructs - never to
+# assemble an href= a template substitutes (that is exactly what R51,
+# documented in t/50-render.t and in lists.html's own header comment,
+# says not to do).
+sub _build_query {
+	my ($kv) = @_;
+	return '' unless ref($kv) eq 'HASH';
+	return join('&',
+		map  { _url_encode($_) . '=' . _url_encode($kv->{$_}) }
+		grep { defined $kv->{$_} && length("$kv->{$_}") }
+		sort keys %$kv);
+}
+
+sub _redirect_response {
+	my ($status, $location) = @_;
+	return {
+		status  => $status,
+		headers => [ ['Location', $location], ['Content-Type', 'text/plain; charset=utf-8'] ],
+		body    => '',
+	};
+}
+
+sub _html_response {
+	my ($status, $html) = @_;
+	return { status => $status, headers => [ ['Content-Type', 'text/html; charset=utf-8'] ], body => $html };
+}
+
+# A human-readable rendering of an RPC failure for a flash message -
+# never `pass` (nothing here ever touches it; see _route_ui_login_submit),
+# and every other field here already passed docs/WEBUI-RPC.md S3.6's
+# output sanitising inside the helper before it ever reached this
+# process, so it is safe to hand straight to the escaped {{}} marker a
+# screen renders it through.
+sub _rpc_error_text {
+	my ($result) = @_;
+	my $code = (ref($result) eq 'HASH' && defined $result->{error}) ? $result->{error} : 'E_INTERNAL';
+	my $message = (ref($result) eq 'HASH' && defined $result->{message} && length("$result->{message}"))
+		? "$result->{message}" : 'the request could not be completed';
+	return "$code: $message";
+}
+
+###############################################################################
+# Rendering helpers.
+###############################################################################
+sub _screen_path {
+	my ($self, $name) = @_;
+	return "$self->{web_root}/screens/$name";
+}
+
+# Every template under ui-src/web (this file's own convention, and every
+# file Task 7 added) opens with a GPL header comment and a dated
+# "what this file is" comment - required to be IN THE SOURCE TREE, per
+# GPLv3 S5(a) (CHANGES.md's own words: "a modified work must carry
+# prominent notices ... Git history is convenient but is not a substitute
+# for this file" - the requirement is about the file on disk, never about
+# every rendered HTTP response repeating it). Stripped here, once, before
+# a rendered fragment is used: a screen that composes many small partials
+# (a Lists row rendered once per row, for instance - found exactly this
+# way, by actually rendering a page with several rows during Task 7's own
+# manual verification) would otherwise repeat 30+ lines of licence and
+# design-rationale text per row, which is not a security issue - it is all
+# inert, codebase-authored text inside an HTML comment - but is real,
+# needless bloat on every page this tier serves. The header stays exactly
+# where GPLv3 needs it: in the file. layout.html carried the same class of
+# problem in a more serious form - see its own header comment (added by
+# this task) for the truncation bug that specific case caused, fixed
+# separately by respelling that file's OWN comment rather than by this
+# helper (this helper cannot fix a marker that is INSIDE the comment being
+# stripped, only the comment's mere presence in the output).
+sub _strip_leading_comments {
+	my ($html) = @_;
+	1 while $html =~ s/\A\s*<!--.*?-->//s;
+	return $html;
+}
+
+sub _render_screen {
+	my ($self, $name, $vars) = @_;
+	return _strip_leading_comments(
+		ConfigServer::UI::Render::render_file($self->_screen_path($name), $vars));
+}
+
+# role => [nav template under web_root, ordered list of page keys it names
+# an aria-current var for]. See ui-src/web/nav-admin.html /
+# ui-src/web/nav-support.html's own header comments for why the hrefs in
+# those files are literal and only aria-current is templated (R47's
+# aria-* carve-out).
+my %NAV_PAGES = (
+	admin   => [ 'nav-admin.html',   [qw(overview block lists lookup health)] ],
+	support => [ 'nav-support.html', [qw(lists lookup)] ],
+);
+
+sub _render_nav {
+	my ($self, $current, $role, $csrf) = @_;
+	my $spec = $NAV_PAGES{$role} || $NAV_PAGES{support};
+	my ($file, $pages) = @$spec;
+	my %vars = (csrf => $csrf);
+	$vars{"cur_$_"} = ($_ eq (defined $current ? $current : '')) ? 'page' : 'false' for @$pages;
+	return _strip_leading_comments(
+		ConfigServer::UI::Render::render_file("$self->{web_root}/$file", \%vars));
+}
+
+# Wraps an already-rendered screen body in layout.html - the one place
+# {{{content}}} (layout.html's own allowlisted raw slot, task-6-report.md)
+# is filled in by this tier.
+sub _authed_page {
+	my ($self, $session, $current, $title, $body_html) = @_;
+	my $nav = $self->_render_nav($current, $session->{role}, $session->{csrf});
+	my $html = _strip_leading_comments(
+		ConfigServer::UI::Render::render_file("$self->{web_root}/layout.html", {
+			title   => $title,
+			user    => $session->{user},
+			role    => $session->{role},
+			nav     => $nav,
+			content => $body_html,
+		}));
+	return _html_response(200, $html);
+}
+
+# Every screen's flash banner: a `msg` query argument (set by this
+# module's own redirects after a POST, but reachable by anyone crafting a
+# URL - see the note in _route_ui_overview) rendered through the ordinary
+# ESCAPED {{}} marker regardless of who put it there, and an `err` flag
+# choosing the alert style. '' / 'visually-hidden' when there is nothing
+# to show - the same always-present-structure, toggled-class pattern
+# named in every screen's own header comment.
+sub _flash_vars {
+	my ($args) = @_;
+	my $msg = (ref($args) eq 'HASH' && defined $args->{msg}) ? "$args->{msg}" : '';
+	return ('visually-hidden', '') unless length $msg;
+	my $is_err = (ref($args) eq 'HASH' && defined $args->{err} && length("$args->{err}"));
+	return ($is_err ? 'alert alert-error' : 'alert alert-success', $msg);
+}
+
+###############################################################################
+# _ui_call_and_redirect(): the shared shape behind every mutating screen
+# action (deny/undeny/allow/unallow/tempdeny/temprm/restart) - call one RPC
+# operation, then a 303 (See Other, so a reload never resubmits the form)
+# back to a GET screen carrying the outcome as a `msg`/`err` flash. Never
+# retried (Client.pm's own "one attempt, always" - see its header comment);
+# a double-click or a reload after this redirect just re-views the list,
+# it does not re-submit.
+###############################################################################
+sub _ui_call_and_redirect {
+	my ($self, $session, $op, $rpc_args, $redirect_path, $on_success, $extra_query) = @_;
+
+	my $id = $self->{client}->generate_id;
+	my $result = $self->{client}->call($op, $rpc_args, (defined $id ? (id => $id) : ()));
+
+	my %q = (ref($extra_query) eq 'HASH') ? %$extra_query : ();
+	if (_is_ok($result->{ok})) {
+		$q{msg} = $on_success->($result->{data} || {});
+	}
+	else {
+		$q{err} = 1;
+		$q{msg} = _rpc_error_text($result);
+	}
+
+	my $qs = _build_query(\%q);
+	my $location = $redirect_path . (length($qs) ? "?$qs" : '');
+	return (_redirect_response(303, $location), $session->{user}, $session->{role}, $id);
+}
+
+###############################################################################
+# /app.css - the one static asset every screen links (layout.html's own
+# <link>, and login.html's, which is not wrapped by layout.html). Task 5's
+# Server.pm (mode B) and the mode-A front-server adapter both hand EVERY
+# path to dispatch() with no special-casing (see Server.pm's own
+# handle_connection()), so without a route here this file would simply
+# 404 and every screen would render unstyled. `anonymous => 1`: a
+# stylesheet carries no user data and needs no session to be safe to
+# serve - the same reasoning that makes a login page's own chrome need no
+# session.
+###############################################################################
+sub _route_app_css {
+	my ($self, $request, undef, $args) = @_;
+
+	my $path = "$self->{web_root}/app.css";
+	my $css = eval {
+		open(my $fh, '<:raw', $path) or die "open failed: $!\n";
+		local $/;
+		my $text = <$fh>;
+		close $fh;
+		$text;
+	};
+	unless (defined $css) {
+		return (_json_response(404, { ok => _false(), error => 'WEB_NOT_FOUND',
+			message => 'app.css is not available' }), undef, undef, undef);
+	}
+	return ({ status => 200, headers => [ ['Content-Type', 'text/css; charset=utf-8'] ], body => $css },
+		undef, undef, undef);
+}
+
+###############################################################################
+# Login / logout screens.
+###############################################################################
+sub _route_ui_login_form {
+	my ($self, $request, undef, $args) = @_;
+	my $html = $self->_render_screen('login.html', {
+		error_class  => 'visually-hidden',
+		error_text   => '',
+		prefill_user => '',
+	});
+	return (_html_response(200, $html), undef, undef, undef);
+}
+
+# Deliberately NOT a refactor of _route_login() above: that function is
+# already covered by t/33-app.t and used by any JSON/JS-driven caller of
+# /api/login, and duplicating its handful of steps here (rather than
+# extracting a shared helper both would call) keeps this screen's own
+# change surface - a different, HTML-rendering response shape on every
+# branch - from ever risking the JSON API's tested behaviour.
+sub _route_ui_login_submit {
+	my ($self, $request, undef, $args) = @_;
+	my $peer = defined $request->{peer} ? "$request->{peer}" : '';
+	my $user = (ref($args) eq 'HASH') ? $args->{user} : undef;
+	my $pass = (ref($args) eq 'HASH') ? $args->{pass} : undef;
+
+	my $render_error = sub {
+		my ($text) = @_;
+		my $html = $self->_render_screen('login.html', {
+			error_class  => 'alert alert-error',
+			error_text   => $text,
+			prefill_user => defined $user ? "$user" : '',
+		});
+		return (_html_response(200, $html), (defined $user ? $user : undef), undef);
+	};
+
+	unless (defined $user && length("$user")) {
+		my ($resp, $u, $r) = $render_error->('Username is required.');
+		return ($resp, $u, $r, undef);
+	}
+
+	if ($self->{ratelimit}->blocked($peer, $user)) {
+		my ($resp, $u, $r) = $render_error->(
+			'Too many attempts from this address or for this account; try again later.');
+		return ($resp, $u, $r, undef);
+	}
+
+	my $id = $self->{client}->generate_id;
+	# 'pass' is read once, above, and handed straight to the helper - never
+	# put into any hash again, never logged, never appears again in this
+	# function. Same rule, same reason, as _route_login()'s own comment.
+	my $result = $self->{client}->call('authenticate', { user => $user, pass => $pass },
+		(defined $id ? (id => $id) : ()));
+
+	unless (_is_ok($result->{ok})) {
+		my ($resp, $u, $r) = $render_error->('Could not sign in right now. Try again shortly.');
+		return ($resp, $u, $r, $id);
+	}
+
+	my $data = $result->{data} || {};
+	unless (_is_ok($data->{ok})) {
+		$self->{ratelimit}->record_failure($peer, $user);
+		my $locked = _is_ok($data->{locked});
+		my ($resp, $u, $r) = $render_error->($locked
+			? 'This account is temporarily locked. Try again later.'
+			: 'Wrong username or password.');
+		return ($resp, $u, $r, $id);
+	}
+
+	my $role = $data->{role};
+	unless (defined $role && ($role eq 'admin' || $role eq 'support')) {
+		my ($resp, $u, $r) = $render_error->('Could not sign in right now. Try again shortly.');
+		return ($resp, $u, $r, $id);
+	}
+
+	my $session = eval { $self->{sessions}->create(user => $user, role => $role) };
+	unless ($session) {
+		my ($resp, $u, $r) = $render_error->('Could not start a session. Try again shortly.');
+		return ($resp, $u, $r, $id);
+	}
+
+	# support lands on the one screen it can actually use; admin lands on
+	# Overview. Landing an unblessed role on a page its own role cannot
+	# reach cannot happen here regardless - the role check above already
+	# refused anything but admin/support.
+	my $landing = ($role eq 'support') ? '/ui/lookup' : '/ui/overview';
+	my $response = _redirect_response(303, $landing);
+	push @{ $response->{headers} }, ['Set-Cookie', $self->{sessions}->set_cookie_header($session->{id})];
+	return ($response, $user, $role, $id);
+}
+
+sub _route_ui_logout {
+	my ($self, $request, $session, $args) = @_;
+	$self->{sessions}->destroy($session->{id});
+	my $response = _redirect_response(303, '/ui/login');
+	push @{ $response->{headers} }, ['Set-Cookie', $self->{sessions}->clear_cookie_header];
+	return ($response, $session->{user}, $session->{role}, undef);
+}
+
+###############################################################################
+# Overview.
+###############################################################################
+sub _route_ui_overview {
+	my ($self, $request, $session, $args) = @_;
+
+	my $id = $self->{client}->generate_id;
+	my %ids = (defined $id ? (id => $id) : ());
+
+	my $status_result = $self->{client}->call('status',    {}, %ids);
+	my $counts_result  = $self->{client}->call('counts',   {}, %ids);
+	my $recon_result   = $self->{client}->call('reconcile', {}, %ids);
+
+	my $body;
+	if (!_is_ok($status_result->{ok}) || !_is_ok($counts_result->{ok})) {
+		# docs/WEBUI-RPC.md S5.1's own words: "the firewall is not loaded"
+		# and "I could not find out" are different answers - this screen
+		# never shows stat tiles built from data it never actually read.
+		my $err = !_is_ok($status_result->{ok}) ? $status_result : $counts_result;
+		$body = $self->_render_screen('overview-error.html', { error_text => _rpc_error_text($err) });
+	}
+	else {
+		my $s = $status_result->{data} || {};
+		my $c = $counts_result->{data} || {};
+		my ($flash_class, $flash_text) = _flash_vars($args);
+
+		my %vars = (
+			flash_class => $flash_class, flash_text => $flash_text,
+			enabled_class => _is_ok($s->{enabled})      ? 'badge-success' : 'badge-danger',
+			enabled_text  => _is_ok($s->{enabled})      ? 'Enabled'       : 'Disabled',
+			rules_class   => _is_ok($s->{rules_loaded}) ? 'badge-success' : 'badge-danger',
+			rules_text    => _is_ok($s->{rules_loaded}) ? 'Rules loaded'  : 'Rules NOT loaded',
+			testing_class => _is_ok($s->{testing})      ? 'badge-warning' : 'badge-success',
+			testing_text  => _is_ok($s->{testing})      ? 'TESTING mode'  : 'Not in testing mode',
+			lfd_class     => _is_ok($s->{lfd_running})  ? 'badge-success' : 'badge-danger',
+			lfd_text      => _is_ok($s->{lfd_running})  ? 'lfd running'   : 'lfd NOT running',
+			version_text  => _text($s->{version}, 'unknown'),
+			count_deny           => _num($c->{deny}),
+			count_allow          => _num($c->{allow}),
+			count_temp_deny      => _num($c->{temp_deny}),
+			count_temp_allow     => _num($c->{temp_allow}),
+			count_deny_includes  => _num($c->{deny_includes}),
+			count_allow_includes => _num($c->{allow_includes}),
+			csrf => $session->{csrf},
+		);
+		my $start_error = _text($s->{start_error});
+		$vars{start_error_class} = length($start_error) ? 'alert alert-error' : 'visually-hidden';
+		$vars{start_error_text}  = $start_error;
+
+		if (_is_ok($recon_result->{ok})) {
+			my $rd = $recon_result->{data} || {};
+			my $t  = $rd->{totals} || {};
+			my $total = _num($t->{orphan}) + _num($t->{ghost}) + _num($t->{dup});
+			if ($total > 0) {
+				$vars{reconcile_class} = 'alert alert-warning';
+				$vars{reconcile_text}  = "$total reconciliation issue(s) found: "
+					. _num($t->{orphan}) . ' orphan, ' . _num($t->{ghost}) . ' ghost, '
+					. _num($t->{dup}) . ' duplicate.';
+			}
+			else {
+				$vars{reconcile_class} = 'alert alert-success';
+				$vars{reconcile_text}  = 'No reconciliation issues found.';
+			}
+		}
+		else {
+			# Most commonly E_UNAVAILABLE (LF_IPSET, docs/WEBUI-RPC.md
+			# S5.11) - Overview simply says nothing rather than treating a
+			# reconcile it could not run as "no issues".
+			$vars{reconcile_class} = 'visually-hidden';
+			$vars{reconcile_text}  = '';
+		}
+
+		$body = $self->_render_screen('overview.html', \%vars);
+	}
+
+	my $response = $self->_authed_page($session, 'overview', 'Overview', $body);
+	return ($response, $session->{user}, $session->{role}, $id);
+}
+
+sub _route_ui_restart {
+	my ($self, $request, $session, $args) = @_;
+	return _ui_call_and_redirect($self, $session, 'restart', {}, '/ui/overview',
+		sub {
+			my ($data) = @_;
+			return _is_ok($data->{testing})
+				? 'csf restarted. Note: TESTING mode is enabled.'
+				: 'csf restarted.';
+		});
+}
+
+###############################################################################
+# Block / Unblock.
+###############################################################################
+sub _route_ui_block {
+	my ($self, $request, $session, $args) = @_;
+	my ($flash_class, $flash_text) = _flash_vars($args);
+	my $prefill_ip = (ref($args) eq 'HASH' && defined $args->{ip}) ? "$args->{ip}" : '';
+
+	my $body = $self->_render_screen('block.html', {
+		flash_class => $flash_class, flash_text => $flash_text,
+		prefill_ip  => $prefill_ip,
+		csrf        => $session->{csrf},
+	});
+	my $response = $self->_authed_page($session, 'block', 'Block / Unblock', $body);
+	return ($response, $session->{user}, $session->{role}, undef);
+}
+
+sub _route_ui_block_deny {
+	my ($self, $request, $session, $args) = @_;
+	my $ip   = (ref($args) eq 'HASH') ? $args->{deny_ip}   : undef;
+	my $note = (ref($args) eq 'HASH') ? $args->{deny_note} : undef;
+	return _ui_call_and_redirect($self, $session, 'deny', { ip => $ip, note => $note }, '/ui/block',
+		sub {
+			my ($data) = @_;
+			my $shown = _text($data->{ip}, defined $ip ? "$ip" : '');
+			return _is_ok($data->{already}) ? "$shown was already denied." : "$shown has been denied.";
+		},
+		{ ip => $ip });
+}
+
+sub _route_ui_block_tempdeny {
+	my ($self, $request, $session, $args) = @_;
+	my $ip    = (ref($args) eq 'HASH') ? $args->{tempdeny_ip}    : undef;
+	my $ttl   = (ref($args) eq 'HASH') ? $args->{tempdeny_ttl}   : undef;
+	my $ports = (ref($args) eq 'HASH') ? $args->{tempdeny_ports} : undef;
+
+	my %rpc = (ip => $ip, ttl => $ttl);
+	# docs/WEBUI-RPC.md S4.3: absent/null/"" means "all ports" and the
+	# helper passes no -p at all - so an empty ports field is simply
+	# omitted rather than forwarded as "".
+	$rpc{ports} = $ports if defined $ports && length("$ports");
+
+	return _ui_call_and_redirect($self, $session, 'tempdeny', \%rpc, '/ui/block',
+		sub {
+			my ($data) = @_;
+			my $shown = _text($data->{ip}, defined $ip ? "$ip" : '');
+			return _is_ok($data->{already})
+				? "$shown was already temporarily denied."
+				: "$shown has been temporarily denied.";
+		},
+		{ ip => $ip });
+}
+
+sub _route_ui_block_allow {
+	my ($self, $request, $session, $args) = @_;
+	my $ip   = (ref($args) eq 'HASH') ? $args->{allow_ip}   : undef;
+	my $note = (ref($args) eq 'HASH') ? $args->{allow_note} : undef;
+	return _ui_call_and_redirect($self, $session, 'allow', { ip => $ip, note => $note }, '/ui/block',
+		sub {
+			my ($data) = @_;
+			my $shown = _text($data->{ip}, defined $ip ? "$ip" : '');
+			return _is_ok($data->{already}) ? "$shown was already allowed." : "$shown has been allowed.";
+		},
+		{ ip => $ip });
+}
+
+sub _route_ui_block_undeny {
+	my ($self, $request, $session, $args) = @_;
+	my $ip = (ref($args) eq 'HASH') ? $args->{undeny_ip} : undef;
+	return _ui_call_and_redirect($self, $session, 'undeny', { ip => $ip }, '/ui/block',
+		sub {
+			my ($data) = @_;
+			my $shown   = _text($data->{ip}, defined $ip ? "$ip" : '');
+			my $removed = _num($data->{removed});
+			return $removed > 0 ? "$shown removed from csf.deny." : "$shown was not in csf.deny.";
+		},
+		{ ip => $ip });
+}
+
+###############################################################################
+# Lists.
+###############################################################################
+my %LISTS_THEAD = (deny => 'lists-thead-simple.html', allow => 'lists-thead-simple.html', temp => 'lists-thead-temp.html');
+my %LISTS_ROW = (
+	admin   => { deny => 'lists-row-deny.html',    allow => 'lists-row-allow.html',    temp => 'lists-row-temp.html' },
+	support => { deny => 'lists-row-deny-ro.html', allow => 'lists-row-allow-ro.html', temp => 'lists-row-temp-ro.html' },
+);
+
+sub _ttl_text {
+	my ($seconds) = @_;
+	$seconds = _num($seconds);
+	return "${seconds}s" if $seconds < 60;
+	return int($seconds / 60) . 'm' if $seconds < 3600;
+	return int($seconds / 3600) . 'h ' . int(($seconds % 3600) / 60) . 'm';
+}
+
+sub _route_ui_lists {
+	my ($self, $request, $session, $args) = @_;
+
+	my $which = (ref($args) eq 'HASH' && defined $args->{which} && $args->{which} =~ /\A(deny|temp|allow)\z/)
+		? $1 : 'deny';
+	my $filter = (ref($args) eq 'HASH' && defined $args->{filter}) ? "$args->{filter}" : '';
+	my $offset = (ref($args) eq 'HASH' && defined $args->{offset} && "$args->{offset}" =~ /\A[0-9]+\z/)
+		? $args->{offset} + 0 : 0;
+	my $limit = 25;
+
+	my $id = $self->{client}->generate_id;
+	my $result = $self->{client}->call('list',
+		{ which => $which, offset => $offset, limit => $limit, filter => $filter },
+		(defined $id ? (id => $id) : ()));
+
+	my ($flash_class, $flash_text) = _flash_vars($args);
+	my %vars = (
+		flash_class => $flash_class, flash_text => $flash_text,
+		which => $which, filter => $filter,
+		tab_deny  => ($which eq 'deny')  ? 'page' : 'false',
+		tab_temp  => ($which eq 'temp')  ? 'page' : 'false',
+		tab_allow => ($which eq 'allow') ? 'page' : 'false',
+	);
+
+	if (!_is_ok($result->{ok})) {
+		$vars{total_text} = _rpc_error_text($result);
+		$vars{table_head} = $self->_render_screen($LISTS_THEAD{$which}, {});
+		$vars{rows}       = '';
+		$vars{pagination} = '';
+	}
+	else {
+		my $data = $result->{data} || {};
+		my $rows = (ref($data->{rows}) eq 'ARRAY') ? $data->{rows} : [];
+		my $total = _num($data->{total});
+		$vars{total_text} = "$total matching entr" . ($total == 1 ? 'y' : 'ies')
+			. ' (showing ' . scalar(@$rows) . ').';
+
+		my $role     = ($session->{role} eq 'admin') ? 'admin' : 'support';
+		my $row_file = $LISTS_ROW{$role}{$which};
+		my @row_html;
+		for my $row (@$rows) {
+			push @row_html, _render_lists_row($self, $row_file, $which, $row, $session->{csrf}, $filter, $offset);
+		}
+		$vars{table_head} = $self->_render_screen($LISTS_THEAD{$which}, {});
+		$vars{rows}       = join('', @row_html);
+
+		my @pagination;
+		if ($offset > 0) {
+			my $prev_offset = $offset - $limit;
+			$prev_offset = 0 if $prev_offset < 0;
+			push @pagination, $self->_render_screen('lists-pagination-prev.html',
+				{ which => $which, filter => $filter, offset => $prev_offset });
+		}
+		# docs/WEBUI-RPC.md S3.4/S5.9: next_offset is offset + returned,
+		# never offset + limit, and is null once the last row has been
+		# returned - never inferred from $offset/$limit ourselves.
+		if (defined $data->{next_offset} && length("$data->{next_offset}")) {
+			push @pagination, $self->_render_screen('lists-pagination-next.html',
+				{ which => $which, filter => $filter, offset => _num($data->{next_offset}) });
+		}
+		$vars{pagination} = join('', @pagination);
+	}
+
+	my $body = $self->_render_screen('lists.html', \%vars);
+	my $response = $self->_authed_page($session, 'lists', 'Lists', $body);
+	return ($response, $session->{user}, $session->{role}, $id);
+}
+
+sub _render_lists_row {
+	my ($self, $row_file, $which, $row, $csrf, $filter, $offset) = @_;
+	return '' unless ref($row) eq 'HASH';
+
+	my %vars = (
+		ip => _text($row->{ip}), note => _text($row->{note}),
+		csrf => $csrf, which => $which, filter => $filter, offset => $offset,
+	);
+	if ($which eq 'temp') {
+		$vars{ports}    = _text($row->{ports}, '*');
+		$vars{dir}      = _text($row->{dir}, 'in');
+		$vars{ttl_text} = _ttl_text($row->{ttl_left});
+	}
+	else {
+		$vars{protected_class} = _is_ok($row->{protected}) ? 'badge-warning' : 'visually-hidden';
+		$vars{protected_text}  = _is_ok($row->{protected}) ? 'protected'     : '';
+	}
+	return $self->_render_screen($row_file, \%vars);
+}
+
+# Shared by all three Lists row actions: which/filter/offset are carried
+# through purely so the redirect back to /ui/lists returns the operator to
+# the page/filter they were looking at - none of it is read by the RPC
+# call itself, which only ever sends `ip` (docs/WEBUI-RPC.md S5.4/S5.6/S5.8).
+sub _lists_context {
+	my ($args) = @_;
+	return {} unless ref($args) eq 'HASH';
+	my %ctx;
+	$ctx{filter} = $args->{filter} if defined $args->{filter} && length("$args->{filter}");
+	$ctx{offset} = $args->{offset} if defined $args->{offset} && "$args->{offset}" =~ /\A[0-9]+\z/;
+	return \%ctx;
+}
+
+sub _route_ui_lists_undeny {
+	my ($self, $request, $session, $args) = @_;
+	my $ip  = (ref($args) eq 'HASH') ? $args->{ip} : undef;
+	my $ctx = _lists_context($args);
+	return _ui_call_and_redirect($self, $session, 'undeny', { ip => $ip }, '/ui/lists',
+		sub {
+			my ($data) = @_;
+			my $shown   = _text($data->{ip}, defined $ip ? "$ip" : '');
+			my $removed = _num($data->{removed});
+			return $removed > 0 ? "$shown removed from csf.deny." : "$shown was not in csf.deny.";
+		},
+		{ %$ctx, which => 'deny' });
+}
+
+sub _route_ui_lists_unallow {
+	my ($self, $request, $session, $args) = @_;
+	my $ip  = (ref($args) eq 'HASH') ? $args->{ip} : undef;
+	my $ctx = _lists_context($args);
+	return _ui_call_and_redirect($self, $session, 'unallow', { ip => $ip }, '/ui/lists',
+		sub {
+			my ($data) = @_;
+			my $shown   = _text($data->{ip}, defined $ip ? "$ip" : '');
+			my $removed = _num($data->{removed});
+			return $removed > 0 ? "$shown removed from csf.allow." : "$shown was not in csf.allow.";
+		},
+		{ %$ctx, which => 'allow' });
+}
+
+sub _route_ui_lists_temprm {
+	my ($self, $request, $session, $args) = @_;
+	my $ip  = (ref($args) eq 'HASH') ? $args->{ip} : undef;
+	my $ctx = _lists_context($args);
+	return _ui_call_and_redirect($self, $session, 'temprm', { ip => $ip }, '/ui/lists',
+		sub {
+			my ($data) = @_;
+			my $shown   = _text($data->{ip}, defined $ip ? "$ip" : '');
+			my $removed = _num($data->{removed});
+			return $removed > 0 ? "$shown removed from the temporary list." : "$shown was not in the temporary list.";
+		},
+		{ %$ctx, which => 'temp' });
+}
+
+###############################################################################
+# IP lookup.
+###############################################################################
+sub _route_ui_lookup {
+	my ($self, $request, $session, $args) = @_;
+	my $ip = (ref($args) eq 'HASH' && defined $args->{ip}) ? "$args->{ip}" : '';
+	my ($flash_class, $flash_text) = _flash_vars($args);
+
+	my %vars = (
+		flash_class => $flash_class, flash_text => $flash_text,
+		prefill_ip => $ip,
+		result_class => 'visually-hidden',
+		queried_ip => '', result_count_text => '', lines_text => '',
+	);
+
+	my $id;
+	if (length $ip) {
+		$id = $self->{client}->generate_id;
+		my $result = $self->{client}->call('grep', { ip => $ip }, (defined $id ? (id => $id) : ()));
+		$vars{result_class} = 'panel';
+		$vars{queried_ip}   = $ip;
+
+		if (_is_ok($result->{ok})) {
+			my $data  = $result->{data} || {};
+			my $lines = (ref($data->{lines}) eq 'ARRAY') ? $data->{lines} : [];
+			$vars{lines_text} = @$lines ? join("\n", map { _text($_) } @$lines) : '(no matching entries)';
+			my $count = _num($data->{count});
+			$vars{result_count_text} = ($count == 1 ? '1 line' : "$count lines")
+				. (_is_ok($data->{truncated}) ? ' (truncated)' : '') . '.';
+		}
+		else {
+			$vars{lines_text}         = _rpc_error_text($result);
+			$vars{result_count_text} = '';
+		}
+	}
+
+	my $body = $self->_render_screen('lookup.html', \%vars);
+	my $response = $self->_authed_page($session, 'lookup', 'IP Lookup', $body);
+	return ($response, $session->{user}, $session->{role}, $id);
+}
+
+###############################################################################
+# Health.
+###############################################################################
+
+# The five fields every reconcile() entry contributes to a row template -
+# factored out because health.html's rows and health-review.html's rows
+# both need exactly these, docs/WEBUI-RPC.md S5.11's own shape.
+sub _reconcile_entry_vars {
+	my ($e) = @_;
+	return (
+		kind   => _text($e->{kind}),
+		chain  => _text($e->{chain}),
+		family => _num($e->{family}),
+		ip     => _text($e->{ip}),
+		spec   => _text($e->{spec}),
+	);
+}
+
+sub _route_ui_health {
+	my ($self, $request, $session, $args) = @_;
+
+	my $id = $self->{client}->generate_id;
+	my $result = $self->{client}->call('reconcile', {}, (defined $id ? (id => $id) : ()));
+
+	my ($flash_class, $flash_text) = _flash_vars($args);
+	my %vars = (flash_class => $flash_class, flash_text => $flash_text, csrf => $session->{csrf});
+
+	if (!_is_ok($result->{ok})) {
+		my $code = (ref($result) eq 'HASH' && defined $result->{error}) ? $result->{error} : '';
+		# docs/WEBUI-RPC.md S5.11: E_UNAVAILABLE here specifically means
+		# LF_IPSET is enabled, a configuration choice, not a fault - shown
+		# as a warning rather than an error for that reason.
+		$vars{unavailable_class} = ($code eq 'E_UNAVAILABLE') ? 'alert alert-warning' : 'alert alert-error';
+		$vars{unavailable_text}  = _rpc_error_text($result);
+		$vars{findings_class}    = 'visually-hidden';
+		$vars{summary_text}      = '';
+		$vars{rows}              = '';
+		$vars{review_form_class} = 'visually-hidden';
+	}
+	else {
+		my $data    = $result->{data} || {};
+		my $entries = (ref($data->{entries}) eq 'ARRAY') ? $data->{entries} : [];
+		my $totals  = $data->{totals} || {};
+		my $total   = _num($totals->{orphan}) + _num($totals->{ghost}) + _num($totals->{dup});
+
+		$vars{unavailable_class} = 'visually-hidden';
+		$vars{unavailable_text}  = '';
+
+		if ($total == 0) {
+			$vars{findings_class}    = 'visually-hidden';
+			$vars{summary_text}      = 'No reconciliation issues found.';
+			$vars{rows}              = '';
+			$vars{review_form_class} = 'visually-hidden';
+		}
+		else {
+			$vars{findings_class} = '';
+			$vars{summary_text}   = "$total finding(s): " . _num($totals->{orphan}) . ' orphan, '
+				. _num($totals->{ghost}) . ' ghost, ' . _num($totals->{dup}) . ' duplicate.';
+
+			# NOT `my (@row_html, $fixable_count, $i) = ((), 0, 0)` - an
+			# array in a list-assignment slurps every remaining value on
+			# the right, silently leaving the two scalars after it undef.
+			my @row_html;
+			my $fixable_count = 0;
+			my $i = 0;
+			for my $e (@$entries) {
+				next unless ref($e) eq 'HASH';
+				# docs/WEBUI-RPC.md S5.11: keyed strictly off `fixable`,
+				# never off `kind` - an ORPHAN is not necessarily
+				# deletable, and this is the field that says so.
+				if (_is_ok($e->{fixable})) {
+					$fixable_count++;
+					push @row_html, $self->_render_screen('health-row-fixable.html', {
+						_reconcile_entry_vars($e),
+						id            => _text($e->{id}),
+						checkbox_name => "fix_id_$i",
+					});
+				}
+				else {
+					push @row_html, $self->_render_screen('health-row-unfixable.html', {
+						_reconcile_entry_vars($e),
+						reason => _text($e->{reason}, 'not fixable here'),
+					});
+				}
+				$i++;
+			}
+			$vars{rows}              = join('', @row_html);
+			$vars{review_form_class} = $fixable_count > 0 ? '' : 'visually-hidden';
+		}
+	}
+
+	my $body = $self->_render_screen('health.html', \%vars);
+	my $response = $self->_authed_page($session, 'health', 'Health', $body);
+	return ($response, $session->{user}, $session->{role}, $id);
+}
+
+# Step 1 of the destructive flow's confirmation (docs/WEBUI-RPC.md S5.12:
+# "a diff shown and a separate confirmation"). Never calls `reconcile_fix`
+# - only re-runs the read-only `reconcile` and shows, from a FRESH scan,
+# exactly what the operator's selection still matches. See health.html's
+# own header comment for why each checkbox is independently named rather
+# than sharing one field name.
+sub _route_ui_health_review {
+	my ($self, $request, $session, $args) = @_;
+
+	my @selected_ids;
+	if (ref($args) eq 'HASH') {
+		for my $key (sort keys %$args) {
+			next unless $key =~ /\Afix_id_[0-9]+\z/;
+			my $v = $args->{$key};
+			push @selected_ids, "$v" if defined $v && "$v" =~ /\A[0-9a-f]{32}\z/;
+		}
+	}
+
+	my $id = $self->{client}->generate_id;
+	my $result = $self->{client}->call('reconcile', {}, (defined $id ? (id => $id) : ()));
+
+	unless (_is_ok($result->{ok})) {
+		my $qs = _build_query({ err => 1, msg => _rpc_error_text($result) });
+		return (_redirect_response(303, "/ui/health?$qs"), $session->{user}, $session->{role}, $id);
+	}
+
+	my $data    = $result->{data} || {};
+	my $entries = (ref($data->{entries}) eq 'ARRAY') ? $data->{entries} : [];
+	my %by_id;
+	for my $e (@$entries) {
+		$by_id{ $e->{id} } = $e if ref($e) eq 'HASH' && defined $e->{id};
+	}
+
+	my $requested = scalar @selected_ids;
+	my @survivors;
+	for my $sid (@selected_ids) {
+		my $e = $by_id{$sid};
+		push @survivors, $e if $e && _is_ok($e->{fixable});
+	}
+
+	my %vars = (csrf => $session->{csrf});
+	my $stale_count = $requested - scalar(@survivors);
+	if ($stale_count > 0) {
+		$vars{stale_class} = 'alert alert-warning';
+		$vars{stale_text}  = "$stale_count of $requested selected finding(s) are no longer present or no "
+			. 'longer fixable, and will be skipped.';
+	}
+	else {
+		$vars{stale_class} = 'visually-hidden';
+		$vars{stale_text}  = '';
+	}
+
+	if (!@survivors) {
+		$vars{empty_class} = '';
+		$vars{apply_class} = 'visually-hidden';
+		$vars{count_text}  = '';
+		$vars{rows}        = '';
+	}
+	else {
+		$vars{empty_class} = 'visually-hidden';
+		$vars{apply_class} = '';
+		$vars{count_text}  = scalar(@survivors) . ' rule(s) will be deleted:';
+
+		# Same array-slurp pitfall as _route_ui_health() above - kept as
+		# two separate declarations on purpose.
+		my @row_html;
+		my $i = 0;
+		for my $e (@survivors) {
+			push @row_html, $self->_render_screen('health-review-row.html', {
+				_reconcile_entry_vars($e),
+				id         => _text($e->{id}),
+				apply_name => "apply_id_$i",
+			});
+			$i++;
+		}
+		$vars{rows} = join('', @row_html);
+	}
+
+	my $body = $self->_render_screen('health-review.html', \%vars);
+	my $response = $self->_authed_page($session, 'health', 'Confirm firewall rule cleanup', $body);
+	return ($response, $session->{user}, $session->{role}, $id);
+}
+
+# Step 2 - the only route in this whole tier that ever calls
+# `reconcile_fix`. Its ids come only from apply_id_N fields this module's
+# own health-review-row.html just rendered a moment ago; §5.12 itself is
+# what makes a forged id harmless regardless ("It re-runs the full
+# reconcile scan ... and acts only on ids present in the fresh result").
+sub _route_ui_health_apply {
+	my ($self, $request, $session, $args) = @_;
+
+	my @ids;
+	if (ref($args) eq 'HASH') {
+		for my $key (sort keys %$args) {
+			next unless $key =~ /\Aapply_id_[0-9]+\z/;
+			my $v = $args->{$key};
+			push @ids, "$v" if defined $v && "$v" =~ /\A[0-9a-f]{32}\z/;
+		}
+	}
+
+	unless (@ids) {
+		my $qs = _build_query({ err => 1, msg => 'Nothing was selected to fix.' });
+		return (_redirect_response(303, "/ui/health?$qs"), $session->{user}, $session->{role}, undef);
+	}
+
+	my $id = $self->{client}->generate_id;
+	my $result = $self->{client}->call('reconcile_fix', { ids => \@ids }, (defined $id ? (id => $id) : ()));
+
+	my %q;
+	if (_is_ok($result->{ok})) {
+		my $data = $result->{data} || {};
+		$q{msg} = _num($data->{fixed}) . ' fixed, ' . _num($data->{stale}) . ' stale, '
+			. _num($data->{unfixable}) . ' unfixable.';
+	}
+	else {
+		$q{err} = 1;
+		$q{msg} = _rpc_error_text($result);
+	}
+
+	my $qs = _build_query(\%q);
+	return (_redirect_response(303, "/ui/health?$qs"), $session->{user}, $session->{role}, $id);
 }
 
 ###############################################################################

@@ -1,0 +1,30 @@
+<!--
+Copyright (C) 2006-2025 Jonathan Michaelson
+
+https://github.com/waytotheweb/scripts
+
+This program is free software; you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation; either version 3 of the License, or (at your option) any later
+version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT
+ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+FOR A PARTICULAR PURPOSE. See the GNU General Public License for more
+details.
+
+You should have received a copy of the GNU General Public License along with
+this program; if not, see <https://www.gnu.org/licenses>.
+-->
+<!--
+Added 2026-09-11 in https://github.com/nkyo/csf - see CHANGES.md.
+
+The support-role variant of lists-row-deny.html - same row data, no
+mutating form (support is lookup-only, docs/WEBUI-PLAN.md S7). See
+lists-row-deny.html's header comment.
+-->
+<tr>
+	<td data-label="IP">{{ip}}</td>
+	<td data-label="Note">{{note}} <span class="badge {{protected_class}}">{{protected_text}}</span></td>
+	<td data-label="Actions"><span class="text-muted">&mdash;</span></td>
+</tr>

@@ -1,0 +1,44 @@
+<!--
+Copyright (C) 2006-2025 Jonathan Michaelson
+
+https://github.com/waytotheweb/scripts
+
+This program is free software; you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation; either version 3 of the License, or (at your option) any later
+version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT
+ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+FOR A PARTICULAR PURPOSE. See the GNU General Public License for more
+details.
+
+You should have received a copy of the GNU General Public License along with
+this program; if not, see <https://www.gnu.org/licenses>.
+-->
+<!--
+Added 2026-09-11 in https://github.com/nkyo/csf - see CHANGES.md.
+
+A reconcile finding with fixable:true (Task 7, docs/WEBUI-RPC.md S5.11) -
+chosen by ui-src/bin/csf-ui purely from that field, never from `kind` (see
+health.html's own header comment). This row's checkbox `name=` is its own
+unique fix_id_N field, pre-checked - see health.html for why it is not a
+shared "ids" name. (Note for anyone editing this file: never spell a var
+name here as a literal two-brace marker in a comment - Render.pm processes
+the WHOLE file as text, comments included, so that would either silently
+substitute real data into this prose or, for a name that is not one of
+this file's own vars, die.)
+-->
+<tr>
+	<td data-label="Kind"><span class="badge badge-warning">{{kind}}</span></td>
+	<td data-label="Chain">{{chain}}</td>
+	<td data-label="Family">IPv{{family}}</td>
+	<td data-label="Address">{{ip}}</td>
+	<td data-label="Rule"><code>{{spec}}</code></td>
+	<td data-label="Fix">
+		<label>
+			<input type="checkbox" name="{{checkbox_name}}" value="{{id}}" checked>
+			Fix
+		</label>
+	</td>
+</tr>

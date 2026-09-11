@@ -47,7 +47,7 @@ use lib "$FindBin::Bin/..", "$FindBin::Bin/../ui-src/lib";
 
 use File::Find ();
 use File::Temp qw(tempdir);
-use Test::More tests => 202;
+use Test::More tests => 217;
 
 require_ok('ConfigServer::UI::Render');
 
@@ -509,6 +509,59 @@ ok($@, 'escape_html: a coderef dies');
 #     inverting the rule - see %INERT_ATTRIBUTES.)
 ###############################################################################
 
+###############################################################################
+# R50 (task-7-brief.md, carried over from the Task 6 review): everything
+# above this comment answers "is {{ }} safe HERE", which is only a
+# meaningful question at all because %INERT_ATTRIBUTES and the quoted-
+# attribute allowance both rest on ONE premise stated in Render.pm's own
+# header comment and repeated at the top of this file - this UI ships NO
+# JAVASCRIPT AT ALL. Nothing before this round enforced that premise. A
+# screen author who wrote:
+#
+#     <tr data-ip="{{id}}" ...>
+#       <td><button onclick="showDetail(this)">Detail</button></td>
+#     </tr>
+#
+# passed every check above - data-ip="{{id}}" is on the inert allowlist by
+# design (R47), and onclick="showDetail(this)" has no {{ in it at all, so
+# _report_attribute() never even looks at it (every check above is gated on
+# `index($value, '{{') >= 0`, because they are all answering "is THIS
+# PLACEHOLDER safe", not "does this document contain a live script"). The
+# result is a page that scans clean while shipping working, attacker-
+# reachable XSS the moment ANY placeholder anywhere else on the same page
+# carries attacker text - showDetail(this) reads the row's OWN data-ip
+# attribute via the DOM, so the "inert" value never needed to be escaped
+# specially at all, it just needed a script willing to read it. Same shape
+# with <script src="/app.js"> next to title="{{v}}": the placeholder is
+# genuinely inert, and irrelevant, because the danger is the <script> tag
+# itself, not any placeholder near it.
+#
+# So this is a DIFFERENT question from everything above, checked
+# separately rather than folded into _find_unsafe_placeholders(): not "is a
+# placeholder safe in this position" but "does this document contain the
+# ingredients for a script at all, independent of {{ anywhere near them".
+# The answer has to be unconditional - a <script> tag or an on*= attribute
+# is exactly as much a premise violation with zero placeholders in the
+# document as with one, because the premise ("this UI ships no JavaScript")
+# is what makes EVERY OTHER finding in this file meaningful, not something
+# that only matters at the moment a placeholder happens to sit nearby.
+#
+# Implementation: reuse the SAME tag/attribute tokenizer that already gets
+# comments, quoted values, RCDATA and self-closing tags right (rather than
+# a fresh regex - the R38-R49 history above is the reason nothing in this
+# file reaches for one), instead of a second, independent parser that would
+# have to re-earn all of those same correctness properties from scratch.
+# _report_attribute() and the <script>-element branch of
+# _find_unsafe_placeholders() both already see every attribute name and
+# every <script> tag as they walk a document; they now ALSO record what
+# they see into this collector, unconditionally of {{ content. `local`-ised
+# per call by _find_script_or_event_handlers() below, so it never affects
+# the many existing calls to _find_unsafe_placeholders() elsewhere in this
+# file (they never read this variable, and its default value is never
+# consulted unless a caller explicitly `local`-ises and reads it).
+###############################################################################
+our @JS_FINDINGS;
+
 # _find_unsafe_placeholders($html) -> @findings
 #
 # The DATA state: ordinary element content, which is the one place the
@@ -590,6 +643,14 @@ sub _find_unsafe_placeholders {
 				# states a <script> body can enter (R48).
 				my ($body, $next) = _scan_script_data($html, $pos, $len);
 				push @findings, '<script> block' if index($body, '{{') >= 0;
+				# R50: recorded unconditionally, independent of whether
+				# this particular <script> body happens to contain a
+				# placeholder - see the header comment above @JS_FINDINGS.
+				# This UI ships no JavaScript at all, so a <script>
+				# ELEMENT existing under ui-src/web/ is itself the
+				# violation, not merely a script body that is unsafe to
+				# put a placeholder in.
+				push @JS_FINDINGS, 'a <script> element is present - this UI ships no JavaScript (R50)';
 				$pos = $next;
 			}
 			elsif ($name eq 'style') {
@@ -704,6 +765,24 @@ sub _scan_tag {
 # position only (an end tag).
 sub _report_attribute {
 	my ($findings, $attr, $value, $quoted) = @_;
+
+	# R50: an on*= attribute NAME is recorded the moment it is parsed,
+	# unconditionally of {{ anywhere in its value (or of it having a value
+	# at all - a valueless "onclick" reaching here still names a real,
+	# parsed attribute) and unconditionally of $findings, which is undef
+	# only for an end tag's attributes (discarded by the HTML parser and
+	# so never live - see the caller). This is deliberately BEFORE the
+	# `return unless defined $findings` below: that early return exists to
+	# skip the PLACEHOLDER-safety checks for an end tag, which do not
+	# apply to attributes that can never become live; it must not also
+	# skip this literal, "does the text 'on...=' name a real start-tag
+	# attribute anywhere" check, which answers a different question this
+	# file did not ask before R50 at all. See @JS_FINDINGS's header
+	# comment for why this is unconditional rather than folded into the
+	# {{-gated checks below.
+	push @JS_FINDINGS, "an on*= attribute ('$attr') is present - this UI ships no JavaScript (R50)"
+		if defined $findings && $attr =~ /\Aon[A-Za-z]+\z/i;
+
 	return unless defined $findings;
 
 	push @$findings, "placeholder used as an attribute name ('$attr')"
@@ -1011,6 +1090,18 @@ sub _skip_to_gt {
 ###############################################################################
 our %RAW_MARKER_ALLOWLIST = (
 	'ui-src/web/layout.html' => { nav => 1, content => 1 },
+
+	# Task 7 screens. Each entry below is the same "canonical case"
+	# Render.pm's own header comment describes: a screen handler renders
+	# one small partial per repeating row (or per optional section),
+	# HTML-escaping every cell through the {{}} form, joins the
+	# already-safe pieces, and hands the whole string to the PARENT
+	# template as a raw var - never a screen splicing unescaped request
+	# data in directly. See each screen file's own header comment for the
+	# specific partials that feed each slot.
+	'ui-src/web/screens/lists.html'        => { table_head => 1, rows => 1, pagination => 1 },
+	'ui-src/web/screens/health.html'       => { rows => 1 },
+	'ui-src/web/screens/health-review.html' => { rows => 1 },
 );
 
 sub _find_unauthorized_raw_markers {
@@ -1025,6 +1116,30 @@ sub _find_unauthorized_raw_markers {
 	}
 
 	return @findings;
+}
+
+###############################################################################
+# _find_script_or_event_handlers($html) -> @findings
+#
+# R50's own entry point: every <script> element and every on*= attribute
+# name in $html, found by walking it with the SAME tokenizer
+# _find_unsafe_placeholders() already uses, unconditionally of whether any
+# {{ }} placeholder is anywhere near them. See @JS_FINDINGS's header
+# comment (above _find_unsafe_placeholders()) for why this is a separate
+# question from everything else in this file rather than another branch of
+# the existing {{-gated checks.
+#
+# `local`s the collector for the duration of this one call and discards
+# _find_unsafe_placeholders()'s own return value - this function only wants
+# what accumulated in @JS_FINDINGS while walking, not the placeholder-
+# safety findings, which is a different question this function does not
+# ask.
+###############################################################################
+sub _find_script_or_event_handlers {
+	my ($html) = @_;
+	local @JS_FINDINGS = ();
+	_find_unsafe_placeholders($html);
+	return @JS_FINDINGS;
 }
 
 ###############################################################################
@@ -1505,6 +1620,80 @@ sub _html_files_under {
 		'render() confirms the escaped marker in the identical position stays inert text, unlike the raw one');
 }
 
+###############################################################################
+# R50: _find_script_or_event_handlers() itself - proven directly, the same
+# way every earlier round proved its own function before trusting the
+# enforcement loop to exercise it. The defining property under test is
+# that NONE of these need a {{ anywhere in them: a hardcoded, entirely
+# static <script> or onclick is exactly as much a violation as one sitting
+# next to a placeholder, because the premise this closes ("no JavaScript
+# at all") does not become true just because nothing was substituted into
+# it today.
+###############################################################################
+{
+	# Positives: no {{ anywhere in any of these.
+	my %must_flag = (
+		'a bare, entirely static <script src=...> tag'
+			=> ['<script src="/app.js"></script>', qr/script/],
+		'a static, empty <script></script> with nothing inside it'
+			=> ['<script></script>',                qr/script/],
+		'a static onclick with a literal function call, no placeholder at all'
+			=> ['<button onclick="showDetail(this)">Detail</button>', qr/onclick/],
+		"the brief's own motivating example: data-ip (inert) beside a static onclick"
+			=> ['<tr data-ip="{{id}}"><td><button onclick="showDetail(this)">Detail</button></td></tr>', qr/onclick/],
+		"the brief's other example: title (inert) beside a static onmouseover"
+			=> ['<span title="{{v}}" onmouseover="tip(this)">x</span>',  qr/onmouseover/],
+		'an uppercase SCRIPT tag'
+			=> ['<SCRIPT>x</SCRIPT>',                qr/script/],
+		'a self-closing-styled script tag'
+			=> ['<script/>',                          qr/script/],
+		'onload on a static <body>-like element'
+			=> ['<div onload="init()">x</div>',       qr/onload/],
+	);
+	for my $name (sort keys %must_flag) {
+		my ($html, $expect) = @{ $must_flag{$name} };
+		my @f = _find_script_or_event_handlers($html);
+		ok((grep { $_ =~ $expect } @f), "R50: $name is flagged")
+			or diag("findings: " . (@f ? join('; ', @f) : '(none)'));
+	}
+
+	# Negatives: ordinary, safe Task 7 shapes - no script, no on*=, so
+	# nothing for this check to find, placeholder or not.
+	my %must_not_flag = (
+		'an ordinary inert quoted attribute carrying a placeholder'
+			=> '<tr data-ip="{{id}}"><td>{{note}}</td></tr>',
+		'a plain button with no handler at all'
+			=> '<button type="submit" class="btn">Go</button>',
+		'an attribute that merely CONTAINS the letters "on" mid-word'
+			=> '<div data-action="{{v}}" class="section">x</div>',
+		'the word "script" appearing as ordinary prose, not a tag'
+			=> '<p>Enable script blocking in your browser.</p>',
+		'an end tag carrying a stray onclick-shaped attribute (discarded by the HTML parser, never live)'
+			=> '<div>x</div onclick="never live">',
+	);
+	for my $name (sort keys %must_not_flag) {
+		my @f = _find_script_or_event_handlers($must_not_flag{$name});
+		is_deeply(\@f, [], "R50: not flagged - $name")
+			or diag("unexpected findings: " . join('; ', @f));
+	}
+
+	# _find_unsafe_placeholders()'s OWN return value is unaffected by R50 -
+	# the two checks answer different questions and must not bleed into
+	# each other. A static onclick with no {{ in it is invisible to the
+	# placeholder-safety scan (correctly - there is no placeholder there
+	# to be unsafe), even though R50's own check flags it.
+	is_deeply([ _find_unsafe_placeholders('<button onclick="go()">x</button>') ], [],
+		"R50: a static onclick with no placeholder is NOT what _find_unsafe_placeholders() reports (different question)");
+
+	# And the converse: calling _find_unsafe_placeholders() directly (not
+	# through _find_script_or_event_handlers()) does not require the
+	# caller to have `local`-ised anything - proving @JS_FINDINGS accumulating
+	# in the background changes nothing observable about the ordinary,
+	# already-tested call shape used everywhere else in this file.
+	my @ordinary = _find_unsafe_placeholders('<h1>{{title}}</h1>');
+	is_deeply(\@ordinary, [], 'R50: an ordinary _find_unsafe_placeholders() call is unaffected by the new collector existing');
+}
+
 # R44: the traversal itself, isolated from the enforcement test below -
 # a file saved as SCREEN.HTML (any case) must still be found. Built in
 # a tempdir rather than relying on a coincidence of what currently
@@ -1523,10 +1712,11 @@ sub _html_files_under {
 
 # The real enforcement: every .html file under ui-src/web, walked
 # recursively (case-insensitively, R44) so ui-src/web/screens/*.html
-# (Task 7, not yet created) is covered automatically with no second
-# place to remember to add it. Checks both _find_unsafe_placeholders()
-# (context) and _find_unauthorized_raw_markers() (R42's allowlist) on
-# every file.
+# (Task 7) is covered automatically with no second place to remember to
+# add it. Checks _find_unsafe_placeholders() (context),
+# _find_unauthorized_raw_markers() (R42's allowlist) and, since R50,
+# _find_script_or_event_handlers() (the "no JavaScript at all" premise
+# itself) on every file.
 {
 	my @html_files = _html_files_under("$FindBin::Bin/../ui-src/web");
 
@@ -1547,17 +1737,24 @@ sub _html_files_under {
 		$rel =~ s{^\Q$FindBin::Bin\E/\.\./}{};
 		push @all_findings, map { "$rel: $_" } _find_unsafe_placeholders($html);
 		push @all_findings, map { "$rel: $_" } _find_unauthorized_raw_markers($html, $rel);
+		push @all_findings, map { "$rel: $_" } _find_script_or_event_handlers($html);
 	}
 
 	is_deeply(\@all_findings, [],
-		'context scan: no ui-src/web/*.html file has {{ in an unsafe context, an unauthorised raw marker, or a placeholder as an attribute name')
+		'context scan: no ui-src/web/*.html file has {{ in an unsafe context, an unauthorised raw marker, a placeholder as an attribute name, a <script> element or an on*= attribute')
 		or diag("Found a problem:\n  " . join("\n  ", @all_findings) . "\n\n"
 			. "Fix: move the value out of that position, don't reach for the raw {{{ }}} marker instead - "
 			. "neither marker is safe there. A URL should be a literal this codebase wrote, not a substituted "
-			. "value; server-rendered HTML should not have inline event-handler attributes at all; a placeholder "
-			. "must never be the NAME of an attribute nor any part of a TAG name, only the value of an attribute on the inert allowlist in this file; the raw {{{ }}} marker is only "
-			. "authorised for layout.html's own nav/content slots - if a screen genuinely needs to insert raw HTML "
-			. "it built itself, add it to \%RAW_MARKER_ALLOWLIST in this file and say why in the same commit; and "
-			. "dynamic data a <script> needs should be placed OUTSIDE the <script> tag (a data-* attribute the "
-			. "script reads) rather than interpolated into its source text.");
+			. "value - if it must carry parameters that vary (pagination offset/limit, a filter, an id), do not "
+			. "splice them into href=; render a GET <form> whose parameters are hidden name=/value= inputs "
+			. "instead (value= is on the inert allowlist - R51, task-7-report.md 'How a screen paginates or "
+			. "links with parameters' has the worked example and says what to do if this pattern does not fit "
+			. "your case); server-rendered HTML should not have inline event-handler attributes at all, and per "
+			. "R50 this UI ships no <script> element anywhere, hardcoded or templated - a placeholder must never "
+			. "be the NAME of an attribute nor any part of a TAG name, only the value of an attribute on the "
+			. "inert allowlist in this file; the raw {{{ }}} marker is only authorised for layout.html's own "
+			. "nav/content slots - if a screen genuinely needs to insert raw HTML it built itself, add it to "
+			. "\%RAW_MARKER_ALLOWLIST in this file and say why in the same commit; and dynamic data a <script> "
+			. "would have needed should be placed OUTSIDE any script (a data-* attribute) - except there is no "
+			. "script for it to be read by, because this UI ships none.");
 }

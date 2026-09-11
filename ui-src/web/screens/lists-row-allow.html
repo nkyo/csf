@@ -1,0 +1,39 @@
+<!--
+Copyright (C) 2006-2025 Jonathan Michaelson
+
+https://github.com/waytotheweb/scripts
+
+This program is free software; you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation; either version 3 of the License, or (at your option) any later
+version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT
+ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+FOR A PARTICULAR PURPOSE. See the GNU General Public License for more
+details.
+
+You should have received a copy of the GNU General Public License along with
+this program; if not, see <https://www.gnu.org/licenses>.
+-->
+<!--
+Added 2026-09-11 in https://github.com/nkyo/csf - see CHANGES.md.
+
+One row of a which=allow Lists page, admin variant (Task 7) - see
+lists-row-deny.html's header comment; identical shape, against
+POST /ui/lists/unallow (docs/WEBUI-RPC.md S5.6) instead of undeny.
+-->
+<tr>
+	<td data-label="IP">{{ip}}</td>
+	<td data-label="Note">{{note}} <span class="badge {{protected_class}}">{{protected_text}}</span></td>
+	<td data-label="Actions">
+		<form method="POST" action="/ui/lists/unallow" class="row-actions">
+			<input type="hidden" name="_csrf" value="{{csrf}}">
+			<input type="hidden" name="ip" value="{{ip}}">
+			<input type="hidden" name="which" value="{{which}}">
+			<input type="hidden" name="filter" value="{{filter}}">
+			<input type="hidden" name="offset" value="{{offset}}">
+			<button type="submit" class="btn btn-small">Unallow</button>
+		</form>
+	</td>
+</tr>

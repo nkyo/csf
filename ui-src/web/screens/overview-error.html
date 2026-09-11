@@ -1,0 +1,29 @@
+<!--
+Copyright (C) 2006-2025 Jonathan Michaelson
+
+https://github.com/waytotheweb/scripts
+
+This program is free software; you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation; either version 3 of the License, or (at your option) any later
+version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT
+ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+FOR A PARTICULAR PURPOSE. See the GNU General Public License for more
+details.
+
+You should have received a copy of the GNU General Public License along with
+this program; if not, see <https://www.gnu.org/licenses>.
+-->
+<!--
+Added 2026-09-11 in https://github.com/nkyo/csf - see CHANGES.md.
+
+What Overview renders when `status` or `counts` itself fails (E_BACKEND,
+E_UNAVAILABLE, ...) rather than showing stat tiles built from data that was
+never actually read - see overview.html's own header comment.
+-->
+<section class="panel">
+	<h2 class="panel-title">Firewall state</h2>
+	<div class="alert alert-error" role="alert">Could not determine firewall state: {{error_text}}</div>
+</section>

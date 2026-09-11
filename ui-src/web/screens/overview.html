@@ -1,0 +1,90 @@
+<!--
+Copyright (C) 2006-2025 Jonathan Michaelson
+
+https://github.com/waytotheweb/scripts
+
+This program is free software; you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation; either version 3 of the License, or (at your option) any later
+version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT
+ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+FOR A PARTICULAR PURPOSE. See the GNU General Public License for more
+details.
+
+You should have received a copy of the GNU General Public License along with
+this program; if not, see <https://www.gnu.org/licenses>.
+-->
+<!--
+Added 2026-09-11 in https://github.com/nkyo/csf - see CHANGES.md.
+
+Overview (Task 7, docs/WEBUI-PLAN.md S2): firewall state, counts, a
+reconcile summary, and the one place `restart` lives (docs/WEBUI-RPC.md S5's
+own Screen column). admin only - ui-src/bin/csf-ui's GET /ui/overview route
+carries no `support => 1`.
+
+Every value here is an ordinary escaped {{}} scalar in element content or an
+inert attribute (class=); no raw marker in this file, no per-row loop, so
+nothing here needed an entry in t/50-render.t's %RAW_MARKER_ALLOWLIST.
+Badge/alert CLASS is chosen server-side by ui-src/bin/csf-ui from the
+`status`/`counts`/`reconcile` results - never the raw boolean or count
+itself - so this file only ever substitutes a literal class name the
+codebase already chose, the same pattern app.css's own header comment
+documents for the nav slot's aria-current handling.
+
+See overview-error.html for what renders instead when `status` or `counts`
+itself fails - docs/WEBUI-RPC.md S5.1's own words apply here too: "the
+firewall is not loaded" and "I could not find out" are different answers,
+so this screen never shows zeroed-out stat tiles dressed up as real ones.
+-->
+<div class="{{flash_class}}" role="status">{{flash_text}}</div>
+
+<section class="panel">
+	<h2 class="panel-title">Firewall state</h2>
+	<p>
+		<span class="badge {{enabled_class}}">{{enabled_text}}</span>
+		<span class="badge {{rules_class}}">{{rules_text}}</span>
+		<span class="badge {{testing_class}}">{{testing_text}}</span>
+		<span class="badge {{lfd_class}}">{{lfd_text}}</span>
+	</p>
+	<p class="text-muted">csf version {{version_text}}</p>
+	<div class="{{start_error_class}}" role="alert">{{start_error_text}}</div>
+
+	<form method="POST" action="/ui/restart">
+		<input type="hidden" name="_csrf" value="{{csrf}}">
+		<div class="form-actions">
+			<button type="submit" class="btn btn-danger">Restart csf</button>
+		</div>
+		<p class="field-hint">Reloads the firewall ruleset from configuration. Brief interruption to filtering while it runs.</p>
+	</form>
+</section>
+
+<section class="panel">
+	<h2 class="panel-title">Counts</h2>
+	<div class="stat-grid">
+		<div class="stat-tile">
+			<span class="stat-value">{{count_deny}}</span>
+			<span class="stat-label">Denied (permanent)</span>
+		</div>
+		<div class="stat-tile">
+			<span class="stat-value">{{count_temp_deny}}</span>
+			<span class="stat-label">Denied (temporary)</span>
+		</div>
+		<div class="stat-tile">
+			<span class="stat-value">{{count_allow}}</span>
+			<span class="stat-label">Allowed (permanent)</span>
+		</div>
+		<div class="stat-tile">
+			<span class="stat-value">{{count_temp_allow}}</span>
+			<span class="stat-label">Allowed (temporary)</span>
+		</div>
+	</div>
+	<p class="field-hint">{{count_deny_includes}} include file(s) in csf.deny, {{count_allow_includes}} in csf.allow (contents not shown).</p>
+</section>
+
+<section class="panel">
+	<h2 class="panel-title">Reconciliation</h2>
+	<div class="{{reconcile_class}}" role="status">{{reconcile_text}}</div>
+	<p><a href="/ui/health">Open Health</a> to review and fix reconciliation findings.</p>
+</section>
