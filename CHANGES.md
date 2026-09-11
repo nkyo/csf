@@ -37,6 +37,145 @@ line is added below the original notice; the original stays intact.
 
 ### Unreleased
 
+#### Task 8 — the setup wizard, and the two independent ways it refuses to lock you out
+
+**2026-09-11** — The setup wizard: `ui-src/bin/csf-ui-setup`, plus
+`ConfigServer::UI::Firewall` (backend detection and the temporary port) and
+`ConfigServer::UI::Rollback` (the snapshot, the atomic commit, and the independent
+rollback timer). `docs/WEBUI-PLAN.md` §6 is the design; `docs/WEBUI-RPC.md` §2.3 and §10
+are the frozen paths and the frozen `ui.conf` keys, neither of which this task adds to.
+
+Every other part of this UI fails by refusing to work. This one can leave an operator
+locked out of a machine they are holding a support ticket about, so the notable thing
+about all three files is what they decline to do.
+
+- **The backend is detected, never inferred from the distribution.** `Firewall.pm` probes
+  the binaries and reads what they say about themselves — `iptables --version`'s
+  parenthetical (`(nf_tables)` / `(legacy)` / absent, meaning pre-1.8 legacy),
+  `firewall-cmd --state`, `ufw status`, `nft list ruleset` — and produces one of six
+  answers: `iptables-legacy`, `iptables-nft`, `nftables`, `firewalld`, `ufw`, `unknown`.
+  Managers are asked before the raw layer, because a rule written straight into the
+  ruleset a running firewalld or ufw manages is a rule that manager rewrites away. On
+  `unknown`, every mutating path declines and the wizard falls back to the SSH tunnel.
+
+  Three hosts that are *not* nothing and are still `unknown`: firewalld running with no
+  `firewall-cmd` installed (a rule could go in but could never come out); an iptables
+  present whose ruleset will not read back; and — the one worth stating — **both
+  `iptables-legacy` and `iptables-nft` holding live rules at once**, however confidently
+  `/sbin/iptables` identified itself, because a permit added to one can be overruled by a
+  drop in the other and "which is in force" then has two answers.
+
+  `nftables` is detected and then deliberately never written to, with its own refusal code
+  (`E_NO_SAFE_RULE`) rather than being folded into `unknown`. In nftables an `accept` in a
+  base chain does not end evaluation of the other base chains at the same hook, so a permit
+  rule in a table of our own would not reliably open anything while reporting that it had;
+  and csf drives `$config{IPTABLES}` for everything, so a host with no iptables binary is a
+  host where the thing being configured will not start. "We know exactly what this is and
+  will not write to it" is different information from "we have no idea what this is", and
+  the operator gets the difference.
+
+- **A rule that is added is read back, and it is the backend's rendering that is stored.**
+  Removal matches that stored text against a *fresh* read-back and deletes the line the
+  backend is showing right now. Nothing rebuilds a rule string from the port and address it
+  remembers: iptables turns `-s 203.0.113.5` into `-s 203.0.113.5/32`, inserts an `-m tcp`
+  nobody typed, and orders the match modules its own way, so a `-D` built from memory
+  matches nothing — and a `-D` that matches nothing leaves the port open forever with this
+  code certain it had closed it. ufw gets the same treatment from the other direction: its
+  indices renumber on every change, so the index used to delete is read at removal time,
+  never the one the rule had when it was added. firewalld's rule is added to the **runtime**
+  configuration only, never `--permanent`, so the worst case for a session that dies badly
+  is a hole that closes itself on the next reload or reboot.
+
+- **The temporary port additionally requires TLS material to already exist**, and this is
+  a deviation from the plan text, made deliberately and flagged here rather than buried.
+  The loopback default is reached through the operator's own SSH tunnel and is encrypted by
+  that tunnel; a temporary port is not, and serving a firewall's configuration interface
+  and its session cookie in cleartext to the Internet to save someone an `ssh -L` is not a
+  trade this code makes on the operator's behalf. Provisioning TLS is Task 9's job and this
+  task does not do it — it only declines to use a port when the material is absent. The
+  tunnel is always available and is strictly safer.
+
+  The listener follows the offer rather than being decided separately, because the two ways
+  of getting that wrong are both silent: a port opened in the firewall while the process
+  still binds `127.0.0.1` is a hole that leads nowhere, and a listener bound to a public
+  address while the process still speaks cleartext defeats the condition above one layer
+  further down. So the bind address, the TLS flag and the one peer the listener will talk
+  to all come out of the same decision at once, and the listener enforces the operator's
+  address itself as well — two independent walls, so the inner one still stands if the rule
+  is removed out from under it or was never as narrow as intended.
+
+- **Applying goes through csf's `TESTING=1` / `TESTING_INTERVAL=300` *and* an independent
+  systemd timer that belongs to neither csf nor lfd.** csf's own TESTING is a cron job csf
+  installs, so it assumes csf's timer is still running — and the configurations most likely
+  to lock somebody out are the ones most likely to stop lfd or leave csf unable to start. It
+  also *flushes* rather than *restores*, which takes out rules csf never created (a Docker
+  NAT chain, the hosting provider's own rules) and hands back SSH at the price of something
+  else, silently. So `Rollback.pm` snapshots `csf.conf`, `ui.conf` and the live ruleset
+  first, then installs `csf-ui-rollback.{service,timer}` naming no csf or lfd unit in any
+  dependency directive — being ordered after `csf.service` would mean csf failing to start
+  stopped the rollback, which is the case it exists for. The timer is **enabled**, not
+  merely started, and carries `OnBootSec=` as well as `OnActiveSec=`, so a power cycle
+  mid-apply does not quietly disarm it. Confirming cancels and deletes it; the restore path
+  disarms itself so it cannot fire twice.
+
+  **On a host without systemd, `arm()` refuses and the apply does not happen.** There is no
+  cron, `at`, or forked-sleeper fallback: a forked sleeper dies with the session, which is
+  the event the rollback is for, and an approximation of this net is worse than none because
+  the operator would be told they had one. The refusal names the reason and says to apply
+  from a shell instead, with a second session already open.
+
+- **Configuration is committed atomically, and both candidates are judged before either is
+  renamed.** Build in a temp file in the same directory, fsync, validate the finished file
+  *off the disk*, rename, fsync the directory. ui.conf's validator is `Server.pm`'s own
+  `read_ui_conf()` — the actual startup gate, not a second opinion about it — and it runs
+  as a dry run before `csf.conf` is touched at all, because `UI_SESSION_IDLE` and
+  `UI_SESSION_MAX` are each valid alone and invalid as a pair, so ui.conf can only be judged
+  whole. csf.conf's validator re-reads the candidate with `ConfigServer::Config`'s own rules
+  and additionally asserts that every setting asked for **reads back with the value asked
+  for** — which catches the interesting failure: a perfectly valid file that does not
+  contain the change.
+
+- **The token is never in a URL.** It is printed on the terminal, pasted into a password
+  field, and POSTed; the reply mints a *different* value as the session id and sets that in
+  the cookie, so the printed secret is used once and never stored by the browser. Enforced
+  rather than avoided: the wizard refuses **any** request carrying **any** query string, on
+  every route, because it has no route that takes one — so there is no shape of URL in which
+  a secret could arrive and be acted on, and none in which one could reach shell history, a
+  proxy log, or a `Referer` header. Comparisons use `Session.pm`'s constant-time compare
+  rather than a second implementation. Sessions last 30 minutes absolute and 10 minutes
+  idle, and both limits end the **process**, not merely the session — an expired session
+  with the listener still up is a port still bound and a firewall rule still installed.
+
+- **The wizard writes an answers file and re-invokes the CLI**; it never edits `csf.conf`
+  itself. That is what makes a browser session reproducible from a shell
+  (`csf-ui-setup --answers FILE --yes`) and what keeps a fault in the web tier from being a
+  fault in the firewall's configuration. The answers grammar is the same `KEY="VALUE"` shape
+  as `csf.conf` and `ui.conf`, parsed and never evaluated, with an allowlisted key table: an
+  unknown key and a duplicate key are both refusals, for the reasons §10 already gives.
+  `TESTING` may be mentioned only with the value it is going to have anyway —
+  `TESTING="0"` is **refused**, not quietly overridden, because somebody wrote that on
+  purpose and is entitled to be told it is not on offer.
+
+- `csf-ui-setup --cleanup` closes a port left open by a session that died badly, using the
+  same read-back removal path; the record of the rule is **kept** when the port could not be
+  closed, since deleting it would delete the only thing that knows a hole is open.
+  `EXIT`, `INT` and `TERM` all run the same idempotent cleanup.
+
+No shell anywhere (G2): the only `exec` in the new code is the block form with an argv list,
+in `Firewall.pm`, and `argv[0]` is always an absolute path resolved from a fixed directory
+list rather than the inherited `$PATH` — which matters most here, because the values
+reaching those argv lists came out of a form submitted over the network and the program on
+the other end is the firewall. No new runtime dependency; no new `ui.conf` key; no new
+helper operation.
+
+Note on naming: `docs/WEBUI-PLAN.md` §6 calls the CLI `csf-setup` while
+`docs/WEBUI-RPC.md` §2.3 — the frozen layout, which wins over plan prose — installs exactly
+one setup binary, `csf-ui-setup`. They are the same program.
+
+New: `t/70-firewall-detect.t` (177 assertions, detection against fixture command output for
+all six cases plus the ambiguous and unusable hosts, and the canonical-spec round trip) and
+`t/71-rollback.t` (272 assertions). Whole suite: **2290 tests** (was 1841), `prove -I. t/`.
+
 #### Task 7 fix round 2 — the R58 accessibility fix hid the one message Health exists to show
 
 **2026-09-11** — One finding. R55, R56, R57 and the destructive-control half of R58 all

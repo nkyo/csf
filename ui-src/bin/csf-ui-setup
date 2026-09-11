@@ -1,0 +1,1685 @@
+#!/usr/bin/perl
+###############################################################################
+# Copyright (C) 2006-2025 Jonathan Michaelson
+#
+# https://github.com/waytotheweb/scripts
+#
+# This program is free software; you can redistribute it and/or modify it under
+# the terms of the GNU General Public License as published by the Free Software
+# Foundation; either version 3 of the License, or (at your option) any later
+# version.
+#
+# This program is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+# FOR A PARTICULAR PURPOSE. See the GNU General Public License for more
+# details.
+#
+# You should have received a copy of the GNU General Public License along with
+# this program; if not, see <https://www.gnu.org/licenses>.
+###############################################################################
+# Added 2026-09-11 in https://github.com/nkyo/csf - see CHANGES.md.
+#
+# csf-ui-setup - the setup wizard (docs/WEBUI-PLAN.md S6, task-8-brief.md).
+#
+# THE ONE SENTENCE THAT SHAPES THIS FILE: everything else in this UI fails by
+# refusing to work; this program can take somebody's server away from them.
+# Every design decision below is the one that fails towards "the operator can
+# still get in".
+#
+# WHAT RUNS WHERE
+#
+#   csf-ui-setup --web                    the browser wizard (root)
+#   csf-ui-setup --answers FILE --yes     apply an answers file (root, the CLI
+#                                         path; docs/WEBUI-PLAN.md S6 spells
+#                                         this csf-setup --answers FILE --yes
+#                                         - see THE NAME, below)
+#   csf-ui-setup --confirm                cancel the rollback: "I still have
+#                                         my session"
+#   csf-ui-setup --cleanup                remove what a session that died badly
+#                                         left behind
+#   csf-ui-setup --rollback-now --snapshot DIR
+#                                         what the systemd timer runs
+#
+# THE NAME. docs/WEBUI-PLAN.md S6 calls the CLI csf-setup;
+# docs/WEBUI-RPC.md S2.3 - which is the frozen layout and wins over plan
+# prose - installs exactly one setup binary, /usr/local/csf-ui/bin/
+# csf-ui-setup. They are the same program: this one. The web wizard does not
+# apply anything in its own process; it writes an answers file and RE-INVOKES
+# this program with --answers FILE --yes as a child, which is what makes a
+# browser session reproducible from a shell, and what keeps a fault in the web
+# tier from being a fault in the firewall's configuration. $SETUP_CLI below is
+# the path it invokes, overridable so a test can drive that seam.
+#
+# THE THREE SAFETY PROPERTIES, AND WHERE THEY LIVE
+#
+# 1. REACHING THE WIZARD. It binds 127.0.0.1 and prints an ssh -L line.
+#    That is the default and it is always available. The alternative - a
+#    temporary port restricted to one operator address - is offered only when
+#    ConfigServer::UI::Firewall can name the backend with certainty AND a
+#    single operator address is known AND (see below) the connection can be
+#    encrypted. Any rule added is removed using the canonical form read back
+#    out of the backend; Firewall.pm's header explains why a rebuilt string is
+#    a rule that never gets removed.
+#
+#    THE TLS CONDITION IS THIS FILE'S OWN, ADDED ON TOP OF THE PLAN, and a
+#    reviewer should read it as a deliberate deviation rather than an
+#    oversight. Provisioning TLS material is Task 9's; this program does not
+#    and must not create a certificate. But a temporary port carries the
+#    wizard - and its session cookie - across a network, where the loopback
+#    default never does, and serving a firewall's configuration interface in
+#    cleartext to the Internet to save someone an ssh -L is not a trade this
+#    file is willing to make on the operator's behalf. So: if the material
+#    Server.pm already names is present and IO::Socket::SSL loads, the
+#    temporary port is available; otherwise the wizard says why and falls back
+#    to the tunnel. It is a REFUSAL, not an approximation - the tunnel is
+#    right there and it is strictly safer.
+#
+# 2. NOT LOCKING THE OPERATOR OUT. Applying always sets TESTING=1 and
+#    TESTING_INTERVAL=300 (and refuses an answers file that tries to set
+#    TESTING to anything else), AND arms ConfigServer::UI::Rollback's
+#    independent systemd timer first. If that timer cannot be installed, the
+#    apply does not happen. Rollback.pm's header explains why csf's own
+#    TESTING is not sufficient alone and why there is no cron fallback.
+#    Configuration is committed atomically: temp file, validate, rename.
+#
+# 3. THE TOKEN IS NEVER IN A URL. URLs reach shell history, proxy logs and
+#    Referer headers. The token is printed on the terminal, pasted into a
+#    form, and POSTed; the reply sets a cookie carrying a DIFFERENT value (a
+#    session id minted at that moment), so the printed token is used exactly
+#    once and is never stored by the browser at all. Enforced, not merely
+#    avoided: this wizard refuses any request carrying ANY query string, on
+#    every route, because it has no route that takes one - so there is no
+#    shape of URL in which a secret could arrive and be acted on.
+#
+# WHAT IS NOT HERE. The accept loop (serve()) is not unit-tested, the same
+# way ui-src/lib/ConfigServer/UI/Server.pm's run() and ui-src/bin/
+# csf-ui-helper's main() are not: it needs a real listening socket. Everything
+# it does with one request is handle_request(), a plain function of a request
+# structure, and everything it does to the system is a method on
+# ConfigServer::UI::Firewall or ConfigServer::UI::Rollback with an injected
+# runner. t/70-firewall-detect.t and t/71-rollback.t drive all of those
+# directly, with no root, no network and no IO::Socket::SSL (G1).
+#
+# NO SHELL, EVER (G2). There is no backtick, no qx, no shell-invoking call
+# of any kind, no piped open and no string exec in this file. Children run
+# through ConfigServer::UI::Firewall::run(), whose only exec is the block
+# form with an argv list - which matters more here than anywhere else in this
+# tree, because the values reaching those argv lists came out of a form
+# submitted over the network and the program on the other end is the firewall.
+###############################################################################
+package ConfigServer::UI::Setup;
+
+use strict;
+use warnings;
+
+use lib '/usr/local/csf-ui/lib', '/usr/local/csf/lib';
+
+use Fcntl qw(:DEFAULT);
+use MIME::Base64 ();
+use POSIX ();
+use Socket ();
+use Time::HiRes ();
+
+use ConfigServer::UI::Proto    ();
+use ConfigServer::UI::Render   ();
+use ConfigServer::UI::Session  ();
+use ConfigServer::UI::HTTP     ();
+use ConfigServer::UI::Server   ();
+use ConfigServer::UI::Firewall ();
+use ConfigServer::UI::Rollback ();
+
+our $VERSION = '1.00';
+
+my $P = 'ConfigServer::UI::Proto';
+my $R = 'ConfigServer::UI::Render';
+my $H = 'ConfigServer::UI::HTTP';
+
+our $DEFAULT_STATE_DIR = '/var/lib/csf-ui/setup';
+our $DEFAULT_UI_CONF   = '/etc/csf-ui/ui.conf';
+our $DEFAULT_CSF_CONF  = '/etc/csf/csf.conf';
+
+# The CLI this program re-invokes to apply an answers file. Its own installed
+# path (docs/WEBUI-RPC.md S2.3) - see THE NAME in the header.
+our $SETUP_CLI = '/usr/local/csf-ui/bin/csf-ui-setup';
+
+# Session lifetimes (task-8-brief.md). Absolute 30 minutes, idle 10.
+our $ABSOLUTE_LIFETIME = 1800;
+our $IDLE_LIFETIME     = 600;
+
+our $COOKIE_NAME = 'csfui_setup';
+our $TOKEN_BYTES = 32;
+
+# The running --web session, for the END block at the foot of this file. Set
+# by cmd_web() and by nothing else.
+our $ACTIVE;
+
+# Forced whenever anything is applied, whatever the answers file says.
+our $FORCED_TESTING          = '1';
+our $FORCED_TESTING_INTERVAL = '300';
+
+# The default port the wizard listens on. Above 1024 because this is a
+# throwaway listener and there is no reason for it to want a privileged one,
+# and distinct from ui.conf's UI_PORT default (8443) so that starting the
+# wizard can never collide with a csf-ui that is already running.
+our $DEFAULT_WIZARD_PORT = 8444;
+
+###############################################################################
+# THE ANSWERS FILE
+#
+# Same grammar as ui.conf and csf.conf - KEY="VALUE", # comments, blanks -
+# because docs/WEBUI-RPC.md S10's reasoning applies here too: nobody should
+# have to learn a second format, and it is PARSED, NEVER EVALUATED.
+#
+# Every key is allowlisted below with the file it lands in and the check it
+# must pass. An unknown key is a refusal naming the key, and a duplicate key
+# is a refusal, for exactly the reasons S10 gives for ui.conf: a typo that is
+# silently ignored is a setting the operator believes they made, and
+# last-one-wins is how a reviewer and a program come to different conclusions
+# about the same file.
+#
+# forced marks a key whose value this program sets itself. TESTING is the
+# one that matters: an answers file may mention it, but only with the value
+# this program was going to write anyway. An answers file that says
+# TESTING="0" is refused rather than quietly overridden - somebody wrote that
+# on purpose, and they are entitled to be told it is not on offer here rather
+# than to believe it took effect.
+###############################################################################
+our %ANSWER = (
+	# --- ui.conf (docs/WEBUI-RPC.md S10; this table adds no key to it) ---
+	UI_MODE          => { dest => 'ui',  check => \&_check_ui_mode },
+	UI_LISTEN        => { dest => 'ui',  check => \&_check_address_literal },
+	UI_PORT          => { dest => 'ui',  check => sub { _check_range($_[0], 1024, 65535) } },
+	UI_ALLOW         => { dest => 'ui',  check => \&_check_allow_list },
+	UI_CRYPT_ROUNDS  => { dest => 'ui',  check => sub { _check_range($_[0], 5000, 2000000) } },
+	UI_SESSION_IDLE  => { dest => 'ui',  check => sub { _check_range($_[0], 60, 86400) } },
+	UI_SESSION_MAX   => { dest => 'ui',  check => sub { _check_range($_[0], 300, 604800) } },
+
+	# --- csf.conf ---
+	TCP_IN           => { dest => 'csf', check => \&_check_port_list },
+	TCP_OUT          => { dest => 'csf', check => \&_check_port_list },
+	UDP_IN           => { dest => 'csf', check => \&_check_port_list },
+	UDP_OUT          => { dest => 'csf', check => \&_check_port_list },
+	IPV6             => { dest => 'csf', check => \&_check_boolean },
+	TESTING          => { dest => 'csf', check => \&_check_boolean, forced => $FORCED_TESTING },
+	TESTING_INTERVAL => { dest => 'csf', check => sub { _check_range($_[0], 5, 3600) },
+	                      forced => $FORCED_TESTING_INTERVAL },
+);
+
+sub _check_ui_mode {
+	my ($value) = @_;
+	return (defined $value && ($value eq 'a' || $value eq 'b'))
+		? (1, $value) : (0, 'must be exactly "a" or "b", lowercase');
+}
+
+sub _check_range {
+	my ($value, $low, $high) = @_;
+	return (0, 'must be digits with no leading zero')
+		unless defined $value && $value =~ /^(?:0|[1-9][0-9]*)\z/;
+	return (0, "must be between $low and $high") if $value + 0 < $low || $value + 0 > $high;
+	return (1, $value + 0);
+}
+
+sub _check_boolean {
+	my ($value) = @_;
+	return (defined $value && ($value eq '0' || $value eq '1'))
+		? (1, $value) : (0, 'must be 0 or 1');
+}
+
+sub _check_address_literal {
+	my ($value) = @_;
+	return (0, 'must be a literal IPv4 or IPv6 address, not a hostname')
+		unless defined $value && length $value && $value !~ /[^\x21-\x7E]/;
+	my $family = ($value =~ /:/) ? Socket::AF_INET6() : Socket::AF_INET();
+	my $packed = eval { Socket::inet_pton($family, $value) };
+	return (defined $packed) ? (1, $value)
+		: (0, 'must be a literal IPv4 or IPv6 address, not a hostname');
+}
+
+# UI_ALLOW: 1-64 addresses or CIDRs, comma separated. Same shape
+# docs/WEBUI-RPC.md S10 specifies, checked with the one IP parser this tree
+# has (ConfigServer::UI::Proto::ip_info), so there is no second opinion about
+# what an address is.
+sub _check_allow_list {
+	my ($value) = @_;
+	return (0, 'must not be empty - an empty allowlist means nobody, and csf-ui refuses to start with one')
+		unless defined $value && length $value;
+
+	my @entry = split(/\s*,\s*/, $value, -1);
+	return (0, 'must have between 1 and 64 entries') if !@entry || @entry > 64;
+
+	my @canonical;
+	for my $entry (@entry) {
+		my ($info, $why) = $P->can('ip_info')->($entry);
+		return (0, "entry \"$entry\" $why") unless defined $info;
+		return (0, 'a /0 prefix means the whole Internet and is not accepted here')
+			if defined $info->{plen} && $info->{plen} == 0;
+		push @canonical, $info->{canonical};
+	}
+	return (1, join(',', @canonical));
+}
+
+# csf.conf port lists. NOT ConfigServer::UI::Proto::validate_ports: that one
+# is the helper's argument validator for a single allow/deny operation and
+# caps at 20 expanded ports with - ranges, while csf.conf's TCP_IN ships
+# with 25 entries and writes ranges as low:high. Different grammar, different
+# limits, so a separate check rather than a shared one bent to fit both.
+sub _check_port_list {
+	my ($value) = @_;
+	return (1, '') if defined $value && $value eq '';
+	return (0, 'must be ports or low:high ranges separated by commas')
+		unless defined $value && length $value;
+	return (0, 'must contain only digits, commas and colons') if $value =~ /[^0-9,:]/;
+
+	my @entry = split(/,/, $value, -1);
+	return (0, 'must have between 1 and 128 entries') if !@entry || @entry > 128;
+
+	for my $entry (@entry) {
+		my @bound = split(/:/, $entry, -1);
+		return (0, "\"$entry\" is not a port or a low:high range") if @bound < 1 || @bound > 2;
+		for my $bound (@bound) {
+			return (0, "\"$bound\" is not a port between 1 and 65535")
+				unless $bound =~ /^[1-9][0-9]{0,4}\z/ && $bound + 0 <= 65535;
+		}
+		return (0, "\"$entry\" is a range whose low bound is above its high bound")
+			if @bound == 2 && $bound[0] + 0 > $bound[1] + 0;
+	}
+	return (1, $value);
+}
+
+###############################################################################
+# parse_answers($text) -> (\%answers, \@problems)
+#
+# \%answers maps KEY => canonical value. Any problem at all returns
+# (undef, \@problems) with one entry per problem, the same "report everything
+# that is wrong, not just the first thing" shape Server.pm's read_ui_conf()
+# uses for ui.conf.
+###############################################################################
+sub parse_answers {
+	my ($text) = @_;
+
+	return (undef, ['the answers file is empty or could not be read'])
+		unless defined $text;
+
+	my (%raw, @problem);
+	my $line_number = 0;
+	for my $line (split(/\n/, $text)) {
+		$line_number++;
+		next if $line =~ /^\s*$/;
+		next if $line =~ /^\s*#/;
+		unless ($line =~ /^\s*([A-Z][A-Z0-9_]*)\s*=\s*"([^"]*)"\s*\z/) {
+			push @problem, "line $line_number does not match the KEY=\"VALUE\" grammar";
+			next;
+		}
+		my ($key, $value) = ($1, $2);
+		unless ($ANSWER{$key}) {
+			push @problem, "line $line_number: \"$key\" is not a setting this wizard writes";
+			next;
+		}
+		if (exists $raw{$key}) {
+			push @problem, "line $line_number: \"$key\" is set more than once";
+			next;
+		}
+		$raw{$key} = $value;
+	}
+
+	my %answer;
+	for my $key (sort keys %raw) {
+		my $spec = $ANSWER{$key};
+		my ($ok, $result) = $spec->{check}->($raw{$key});
+		unless ($ok) {
+			push @problem, "$key $result";
+			next;
+		}
+		if (defined $spec->{forced} && "$result" ne $spec->{forced}) {
+			# See the %ANSWER header: refused, never quietly overridden.
+			push @problem, "$key is always set to \"$spec->{forced}\" by this wizard "
+				. "(it is what stops a bad configuration from being permanent) and cannot be answered as \"$raw{$key}\"";
+			next;
+		}
+		$answer{$key} = "$result";
+	}
+
+	return (undef, \@problem) if @problem;
+	return (\%answer, []);
+}
+
+# The inverse: a %answers hash back to the file text, so a browser session is
+# reproducible on the command line byte for byte.
+sub serialise_answers {
+	my ($answer) = @_;
+	my $text = "# Written by csf-ui-setup. Apply with:\n"
+		. "#   csf-ui-setup --answers THIS-FILE --yes\n";
+	for my $key (sort keys %$answer) {
+		my $value = defined $answer->{$key} ? $answer->{$key} : '';
+		$value =~ s/"//g;   # the grammar has no escape; a quote cannot survive and must not be smuggled
+		$text .= qq{$key="$value"\n};
+	}
+	return $text;
+}
+
+###############################################################################
+# csf.conf rewriting.
+#
+# In place, line by line, preserving every comment and every setting this
+# wizard was not asked about. csf.conf is a 1,500-line file full of the
+# administrator's own decisions and a rewrite from a template would silently
+# revert all of them.
+#
+# A key that is present is replaced where it stands. A key that is absent is
+# appended with a comment saying who added it. Nothing is ever added twice:
+# ConfigServer::Config::loadconfig croaks on a repeated setting, which would
+# leave csf unable to start - which is to say, a duplicate written here is
+# itself a lockout.
+###############################################################################
+sub rewrite_csf_conf {
+	my ($text, $answer) = @_;
+
+	my %pending = %$answer;
+	my @out;
+
+	for my $line (split(/\n/, defined $text ? $text : '', -1)) {
+		if ($line =~ /^(\s*)([A-Z][A-Z0-9_]*)(\s*=\s*)"([^"]*)"(\s*)\z/) {
+			my ($lead, $key, $sep, $tail) = ($1, $2, $3, $5);
+			if (exists $pending{$key}) {
+				push @out, qq{$lead$key$sep"$pending{$key}"$tail};
+				delete $pending{$key};
+				next;
+			}
+		}
+		push @out, $line;
+	}
+
+	if (keys %pending) {
+		push @out, '', '# Added by csf-ui-setup';
+		push @out, map { qq{$_ = "$pending{$_}"} } sort keys %pending;
+		push @out, '';
+	}
+
+	return join("\n", @out);
+}
+
+###############################################################################
+# validate_csf_conf($path, \%expected) -> (1) | (0, \@problems)
+#
+# The gate between "wrote a temp file" and "renamed it over csf.conf". It
+# re-reads the finished file off the disk with the same rules
+# ConfigServer::Config::loadconfig applies and asserts three things:
+#
+#   * every line containing "=" has a quoted value (loadconfig croaks
+#     otherwise, and a csf that croaks on its own config is a csf that will
+#     not start);
+#   * no setting appears twice (loadconfig croaks on that too);
+#   * every key this apply meant to change now reads back with exactly the
+#     value it meant.
+#
+# The third is the one that catches the interesting bug: a rewrite that
+# matched nothing, appended nothing, and produced a perfectly valid file that
+# does not contain the change the operator asked for.
+###############################################################################
+sub validate_csf_conf {
+	my ($path, $expected) = @_;
+
+	open(my $fh, '<:raw', $path) or return (0, ["the new csf.conf could not be re-read for validation: $!"]);
+	local $/;
+	my $text = <$fh>;
+	close $fh;
+	return (0, ['the new csf.conf is empty']) unless defined $text && length $text;
+
+	my (%seen, @problem);
+	my $line_number = 0;
+	for my $line (split(/\n/, $text)) {
+		$line_number++;
+		next if $line =~ /^\s*(?:#|$)/;
+		next unless $line =~ /=/;
+		unless ($line =~ /^\s*([A-Za-z][A-Za-z0-9_]*)\s*=\s*"([^"]*)"\s*\z/) {
+			push @problem, "line $line_number would make csf refuse to load its configuration: $line";
+			next;
+		}
+		my ($key, $value) = ($1, $2);
+		push @problem, "\"$key\" appears more than once, which makes csf refuse to start"
+			if $seen{$key}++;
+		$seen{"value:$key"} = $value;
+	}
+
+	for my $key (sort keys %$expected) {
+		my $got = $seen{"value:$key"};
+		unless (defined $got) {
+			push @problem, "$key is missing from the new csf.conf";
+			next;
+		}
+		push @problem, "$key reads back as \"$got\", not the \"$expected->{$key}\" that was asked for"
+			unless $got eq $expected->{$key};
+	}
+
+	return @problem ? (0, \@problem) : (1, []);
+}
+
+###############################################################################
+# ui.conf writing. The validator is Server.pm's own read_ui_conf() - the
+# actual startup gate, run against the temp file before it is renamed into
+# place. Nothing else in this tree is entitled to have a second opinion about
+# whether a ui.conf is valid, and a wizard that wrote one csf-ui then refuses
+# to start from would be a wizard that locked the operator out of the UI it
+# had just set up.
+###############################################################################
+sub build_ui_conf {
+	my ($answer) = @_;
+	my %value = %$answer;
+	my $text = "# /etc/csf-ui/ui.conf - written by csf-ui-setup.\n"
+		. "# Grammar and the meaning of every key: docs/WEBUI-RPC.md section 10.\n";
+	for my $key (@ConfigServer::UI::Server::UI_CONF_KEYS) {
+		next unless defined $value{$key};
+		$text .= qq{$key="$value{$key}"\n};
+	}
+	return $text;
+}
+
+sub validate_ui_conf {
+	my ($path) = @_;
+	my (undef, $problems) = ConfigServer::UI::Server::read_ui_conf($path);
+	return (0, $problems) if ref($problems) eq 'ARRAY' && @$problems;
+	return (1, []);
+}
+
+###############################################################################
+# Construction.
+###############################################################################
+sub new {
+	my ($class, %opt) = @_;
+
+	my $firewall = $opt{firewall} || ConfigServer::UI::Firewall->new;
+	my $self = bless {
+		firewall  => $firewall,
+		state_dir => $opt{state_dir} || $DEFAULT_STATE_DIR,
+		ui_conf   => $opt{ui_conf}   || $DEFAULT_UI_CONF,
+		csf_conf  => $opt{csf_conf}  || $DEFAULT_CSF_CONF,
+		setup_cli => $opt{setup_cli} || $SETUP_CLI,
+		now       => $opt{now} || sub { time() },
+		token     => $opt{token},
+		session   => undef,
+		applied   => undef,
+		confirmed => 0,
+		port      => defined $opt{port} ? $opt{port} : $DEFAULT_WIZARD_PORT,
+		tls_available => $opt{tls_available},
+	}, $class;
+
+	$self->{rollback} = $opt{rollback} || ConfigServer::UI::Rollback->new(
+		firewall  => $firewall,
+		csf_conf  => $self->{csf_conf},
+		ui_conf   => $self->{ui_conf},
+		setup_bin => $self->{setup_cli},
+	);
+	$self->{token} = _b64url(_random_bytes($TOKEN_BYTES)) unless defined $self->{token};
+	return $self;
+}
+
+# The same /dev/urandom idiom ConfigServer::UI::Session and
+# ConfigServer::UI::Auth use. Not Perl's rand(), which is seeded predictably
+# enough that a token from it is a token an observer can guess.
+sub _random_bytes {
+	my ($count) = @_;
+	open(my $fh, '<', '/dev/urandom') or die "csf-ui-setup: cannot open /dev/urandom: $!\n";
+	binmode($fh);
+	my $data = '';
+	while (length($data) < $count) {
+		my $chunk;
+		my $read = sysread($fh, $chunk, $count - length($data));
+		unless (defined $read && $read > 0) {
+			close $fh;
+			die "csf-ui-setup: short read from /dev/urandom\n";
+		}
+		$data .= $chunk;
+	}
+	close $fh;
+	return $data;
+}
+
+sub _b64url {
+	my ($bytes) = @_;
+	my $text = MIME::Base64::encode_base64($bytes, '');
+	$text =~ tr{+/}{-_};
+	$text =~ s/=+\z//;
+	return $text;
+}
+
+# Constant time, and the same implementation the web tier's CSRF check uses
+# rather than a second one written here - a eq on a secret leaks its length
+# and its first differing byte through timing, and there is no reason for
+# this tree to have two opinions about that.
+sub _secret_equal {
+	my ($expected, $submitted) = @_;
+	return ConfigServer::UI::Session->csrf_ok({ csrf => $expected }, $submitted) ? 1 : 0;
+}
+
+###############################################################################
+# THE TEMPORARY PORT
+#
+# offer_port($self, address => $from_ssh_client) -> \%outcome
+#
+#   { ok => 1, spec => \%spec }
+#   { ok => 0, code => ..., reason => ... }       -> fall back to the tunnel
+#
+# Three gates, in the order that makes the cheapest refusal first:
+#
+#   1. TLS material must exist (see the header - this file's own condition);
+#   2. the operator address must be known and must be a single host;
+#   3. the backend must be identifiable with certainty.
+#
+# (2) and (3) are ConfigServer::UI::Firewall::open_port()'s own gates and are
+# not re-implemented here; it is the module that knows what an address and a
+# backend are, and duplicating its rules here is how the two come to disagree.
+###############################################################################
+sub tls_available {
+	my ($self) = @_;
+	return $self->{tls_available}->() if ref($self->{tls_available}) eq 'CODE';
+	return 0 unless eval { require IO::Socket::SSL; 1 };
+	return 0 unless -r $ConfigServer::UI::Server::TLS_CERT_FILE;
+	return 0 unless -r $ConfigServer::UI::Server::TLS_KEY_FILE;
+	return 1;
+}
+
+sub offer_port {
+	my ($self, %opt) = @_;
+
+	unless ($self->tls_available) {
+		return { ok => 0, code => 'E_NO_TLS', reason =>
+			'no TLS certificate and key are installed for this UI yet, and a port open to the '
+			. 'network would carry this wizard and its session cookie in cleartext. Use the SSH '
+			. 'tunnel below - it is encrypted already and needs nothing installed.' };
+	}
+
+	return $self->{firewall}->open_port(port => $self->{port}, address => $opt{address});
+}
+
+# $SSH_CLIENT is "<client ip> <client port> <server port>"; $SSH_CONNECTION is
+# "<client ip> <client port> <server ip> <server port>". Read, never trusted:
+# whatever comes out goes through Firewall::open_port()'s own single-host
+# validation before it can reach an argv list. Returns undef when the wizard
+# was not started from an SSH session at all, which is a perfectly ordinary
+# case and means "tunnel only".
+sub operator_address {
+	my ($self, $env) = @_;
+	$env = \%ENV unless ref $env eq 'HASH';
+	for my $name (qw(SSH_CLIENT SSH_CONNECTION)) {
+		my $value = $env->{$name};
+		next unless defined $value && length $value;
+		my ($address) = split(/\s+/, $value, 2);
+		next unless defined $address && length $address;
+		my ($info) = $P->can('ip_info')->($address);
+		next unless defined $info;
+		return $info->{canonical};
+	}
+	return undef;
+}
+
+###############################################################################
+# APPLYING - the CLI path. csf-ui-setup --answers FILE --yes.
+#
+# Order is the whole of the safety argument, so it is spelled out:
+#
+#   1. parse and validate the answers. Nothing on disk has been touched.
+#   2. SNAPSHOT. Still nothing changed; now there is something to go back to.
+#   3. ARM the independent rollback timer. If this cannot be done - no
+#      systemd - the apply STOPS HERE, with the snapshot taken and nothing
+#      changed. This is the step the brief calls out and it is the step this
+#      program refuses to proceed without.
+#   4. write csf.conf   (temp -> validate -> rename)
+#   5. write ui.conf    (temp -> validate with Server.pm's own startup gate
+#                        -> rename)
+#   6. restart csf, so the configuration that is armed against is the
+#      configuration actually in force. A TESTING=1 config that was never
+#      loaded protects nothing.
+#
+# From step 3 onwards every failure leaves the timer ARMED. That is
+# deliberate: an apply that failed half way is exactly when an automatic
+# restore is most wanted, and the restore's own target is the snapshot from
+# step 2, which is the state the machine was in before any of this.
+###############################################################################
+sub apply {
+	my ($self, %opt) = @_;
+
+	my $answer = $opt{answers};
+	return { ok => 0, reason => 'no answers were given', problems => [] }
+		unless ref($answer) eq 'HASH';
+
+	# Forced settings, applied here rather than trusted from the file, so the
+	# CLI path and the browser path cannot differ about them.
+	my %applied = %$answer;
+	$applied{TESTING}          = $FORCED_TESTING;
+	$applied{TESTING_INTERVAL} = $FORCED_TESTING_INTERVAL;
+
+	my %csf = map { $_ => $applied{$_} } grep { $ANSWER{$_}{dest} eq 'csf' } keys %applied;
+	my %ui  = map { $_ => $applied{$_} } grep { $ANSWER{$_}{dest} eq 'ui'  } keys %applied;
+
+	my $snapshot = $self->{rollback}->snapshot;
+	return { ok => 0, reason => "no snapshot could be taken, so nothing was applied: $snapshot->{reason}", problems => [] }
+		unless $snapshot->{ok};
+
+	my $armed = $self->{rollback}->arm($snapshot->{dir});
+	unless ($armed->{ok}) {
+		return {
+			ok       => 0,
+			code     => $armed->{code},
+			reason   => 'the independent rollback timer could not be armed, so nothing was applied: '
+				. $armed->{reason}
+				. ($armed->{code} && $armed->{code} eq 'E_NO_SYSTEMD'
+					? '. Apply from a shell you can watch instead (csf-ui-setup --answers FILE --yes), '
+					. 'with a second session already open, so a mistake can be undone by hand.'
+					: ''),
+			snapshot => $snapshot->{dir},
+			problems => [],
+		};
+	}
+
+	my @step;
+
+	# BOTH candidates are validated before EITHER is renamed into place.
+	#
+	# write_atomic() already makes each individual file all-or-nothing, but
+	# this apply writes two of them, and two renames are not one rename. The
+	# case that makes this matter is real and cannot be caught by per-key
+	# checks: UI_SESSION_IDLE and UI_SESSION_MAX are each perfectly valid on
+	# their own and invalid as a PAIR (docs/WEBUI-RPC.md S10), so ui.conf can
+	# only be judged as a whole - and judging it after csf.conf had already
+	# been committed would leave the machine half-configured for no reason.
+	# So the ui.conf candidate is built and run past Server.pm's startup gate
+	# HERE, before csf.conf is touched at all. What remains is the window
+	# between the two renames, which is what the armed rollback covers.
+	my $ui_text = keys(%ui) ? build_ui_conf(\%ui) : '';
+	if (length $ui_text) {
+		my ($ok, $problems) = $self->_precheck_ui_conf($ui_text);
+		unless ($ok) {
+			return { ok => 0, reason => 'nothing was applied: the ui.conf this would produce is one csf-ui would refuse to start from',
+				problems => $problems, snapshot => $snapshot->{dir}, armed => 1 };
+		}
+	}
+
+	my $csf_text = _slurp($self->{csf_conf});
+	return { ok => 0, reason => "$self->{csf_conf} could not be read", snapshot => $snapshot->{dir}, problems => [] }
+		unless defined $csf_text;
+
+	my $new_csf = rewrite_csf_conf($csf_text, \%csf);
+	my $wrote = $self->{rollback}->write_atomic($self->{csf_conf}, $new_csf,
+		mode     => 0600,
+		validate => sub { return validate_csf_conf($_[0], \%csf) });
+	unless ($wrote->{ok}) {
+		return { ok => 0, reason => "csf.conf was left unchanged: $wrote->{reason}",
+			problems => ($wrote->{problems} || []), snapshot => $snapshot->{dir}, armed => 1 };
+	}
+	push @step, "csf.conf: " . scalar(keys %csf) . ' settings written (TESTING=1, TESTING_INTERVAL=' . $FORCED_TESTING_INTERVAL . ')';
+
+	if (length $ui_text) {
+		my $ui_wrote = $self->{rollback}->write_atomic($self->{ui_conf}, $ui_text,
+			mode     => 0640,
+			validate => sub { return validate_ui_conf($_[0]) });
+		unless ($ui_wrote->{ok}) {
+			return { ok => 0, reason => "ui.conf was left unchanged: $ui_wrote->{reason}",
+				problems => ($ui_wrote->{problems} || []), snapshot => $snapshot->{dir},
+				armed => 1, steps => \@step };
+		}
+		push @step, 'ui.conf: ' . scalar(keys %ui) . ' settings written and accepted by csf-ui\'s own startup gate';
+	}
+
+	my $csf_binary = $self->{firewall}->locate('csf');
+	if ($csf_binary) {
+		my $restart = $self->{firewall}->run($csf_binary, '-r');
+		my $ok = (!$restart->{error} && !$restart->{timeout} && !$restart->{signal}
+			&& defined $restart->{exit} && $restart->{exit} == 0) ? 1 : 0;
+		push @step, $ok ? 'csf -r: the new configuration is in force'
+			: 'csf -r: FAILED - the rollback timer will restore the previous configuration unless you confirm';
+	}
+	else {
+		push @step, 'csf: binary not found, so the new configuration is on disk but not in force';
+	}
+
+	return {
+		ok       => 1,
+		snapshot => $snapshot->{dir},
+		armed    => 1,
+		window   => $armed->{window},
+		steps    => \@step,
+		problems => [],
+	};
+}
+
+# The ui.conf candidate, judged by the same gate that will judge it at
+# startup, written to a scratch path under the state directory and removed
+# again. The gate reads a FILE - that is the whole point of it (see
+# ConfigServer::UI::Rollback::write_atomic()'s header) - so a dry run needs a
+# real file, and the one place this program owns for scratch files is the
+# state directory.
+sub _precheck_ui_conf {
+	my ($self, $ui_text) = @_;
+
+	_make_state_dir($self->{state_dir});
+	my $probe = "$self->{state_dir}/ui.conf.candidate";
+	my $wrote = $self->{rollback}->write_atomic($probe, $ui_text, mode => 0600);
+	return (0, [$wrote->{reason}]) unless $wrote->{ok};
+
+	my ($ok, $problems) = validate_ui_conf($probe);
+	unlink $probe;
+	return ($ok, $problems);
+}
+
+sub confirm {
+	my ($self) = @_;
+	my $result = $self->{rollback}->confirm;
+	$self->{confirmed} = 1 if $result->{ok};
+	return $result;
+}
+
+###############################################################################
+# THE WEB TIER
+#
+# handle_request(\%request) -> \%response, in exactly the shapes
+# ui-src/bin/csf-ui's header defines and ConfigServer::UI::HTTP produces and
+# consumes. Everything about this wizard that can be tested is reachable
+# through this one function.
+###############################################################################
+our @ROUTES = (
+	{ method => 'GET',  path => '/',        handler => \&_page_token,   open => 1 },
+	{ method => 'POST', path => '/token',   handler => \&_do_token,     open => 1 },
+	{ method => 'GET',  path => '/wizard',  handler => \&_page_wizard },
+	{ method => 'POST', path => '/apply',   handler => \&_do_apply },
+	{ method => 'POST', path => '/confirm', handler => \&_do_confirm },
+);
+
+sub handle_request {
+	my ($self, $request) = @_;
+
+	my $response = eval { $self->_route($request) };
+	if (my $error = $@) {
+		print STDERR "csf-ui-setup: unhandled error while handling a request: $error";
+		return _html(500, '<h1>Something went wrong</h1><p>Nothing was changed.</p>');
+	}
+	return $response;
+}
+
+sub _route {
+	my ($self, $request) = @_;
+
+	return _html(400, '<h1>Bad request</h1>') unless ref($request) eq 'HASH';
+
+	# G9, enforced rather than merely observed. No route in this wizard takes
+	# a query parameter, so there is no legitimate request with one - and
+	# refusing the whole shape means there is no URL in which a token, a
+	# session id or anything else secret could arrive here, be acted on, and
+	# then sit in the operator's shell history, a proxy log and the Referer
+	# header of every subsequent request.
+	if (ref($request->{query}) eq 'HASH' && keys %{ $request->{query} }) {
+		return _html(400, '<h1>Not accepted</h1><p>The setup wizard takes no query parameters. '
+			. 'The session token is carried in a cookie and must never appear in a URL.</p>');
+	}
+
+	my $method = uc(defined $request->{method} ? "$request->{method}" : '');
+	my $path   = defined $request->{path} ? "$request->{path}" : '';
+
+	my @match = grep { $_->{path} eq $path } @ROUTES;
+	return _html(404, '<h1>No such page</h1>') unless @match;
+
+	my ($route) = grep { $_->{method} eq $method } @match;
+	unless ($route) {
+		my $response = _html(405, '<h1>Method not allowed</h1>');
+		push @{ $response->{headers} }, ['Allow', join(', ', map { $_->{method} } @match)];
+		return $response;
+	}
+
+	my $args = _parse_form($request);
+
+	unless ($route->{open}) {
+		my $session = $self->_session_for($request);
+		return _redirect('/') unless $session;
+		if ($method eq 'POST' && !_secret_equal($session->{csrf}, $args->{_csrf})) {
+			return _html(403, '<h1>Refused</h1><p>That form did not carry this session\'s token.</p>');
+		}
+		return $route->{handler}->($self, $request, $args);
+	}
+
+	return $route->{handler}->($self, $request, $args);
+}
+
+###############################################################################
+# Sessions. One operator, one session, held in memory - this process serves
+# one person for at most thirty minutes and then exits, so there is no session
+# store, nothing on disk to leak and nothing to clean up.
+#
+# Both lifetimes are checked on every request and an expired session is
+# DESTROYED, not merely rejected: leaving it in place would let the absolute
+# deadline be reset by an idle-timeout refusal.
+###############################################################################
+sub _session_for {
+	my ($self, $request) = @_;
+	my $session = $self->{session} or return undef;
+	my $now = $self->{now}->();
+
+	if ($now - $session->{created} >= $ABSOLUTE_LIFETIME
+		|| $now - $session->{seen} >= $IDLE_LIFETIME) {
+		$self->{session} = undef;
+		return undef;
+	}
+
+	my $cookie = defined $request->{headers}{cookie} ? $request->{headers}{cookie} : '';
+	my $presented;
+	for my $part (split(/;\s*/, $cookie)) {
+		my ($name, $value) = split(/=/, $part, 2);
+		next unless defined $name && defined $value && $name eq $COOKIE_NAME;
+		$presented = $value;
+	}
+	return undef unless defined $presented && _secret_equal($session->{id}, $presented);
+
+	$session->{seen} = $now;
+	return $session;
+}
+
+###############################################################################
+# Routes.
+###############################################################################
+sub _page_token {
+	my ($self) = @_;
+	return _render(200, <<'HTML', {});
+<h1>csf setup</h1>
+<p>Paste the setup token printed on the terminal.</p>
+<form method="post" action="/token">
+<p><label for="t">Setup token</label>
+<input id="t" name="token" type="password" autocomplete="off" size="50"></p>
+<p><button type="submit">Continue</button></p>
+</form>
+<p class="note">The token is sent by POST and answered with a cookie. It is
+never placed in a URL, because URLs end up in shell history, proxy logs and
+the Referer header of every page you visit afterwards.</p>
+HTML
+}
+
+sub _do_token {
+	my ($self, $request, $args) = @_;
+
+	unless (_secret_equal($self->{token}, $args->{token})) {
+		# No counter, no lockout, and none is needed: the listener is on
+		# 127.0.0.1 behind the operator's own SSH tunnel, the token is 32
+		# random bytes, and the whole process exits after thirty minutes.
+		return _render(403, <<'HTML', {});
+<h1>That token does not match</h1>
+<p>Copy the whole token from the terminal that started this wizard.</p>
+<p><a href="/">Try again</a></p>
+HTML
+	}
+
+	my $now = $self->{now}->();
+	$self->{session} = {
+		id      => _b64url(_random_bytes($TOKEN_BYTES)),
+		csrf    => _b64url(_random_bytes($TOKEN_BYTES)),
+		created => $now,
+		seen    => $now,
+	};
+
+	my $response = _redirect('/wizard');
+	# No Secure attribute on the loopback default: this wizard is reached
+	# over http://127.0.0.1 through the operator's own SSH tunnel, and a
+	# Secure cookie is not sent over http at all in some browsers, which
+	# would make the wizard silently unusable. Secure is added when the
+	# listener is actually wrapped in TLS, which is the only case where it
+	# means anything.
+	push @{ $response->{headers} }, ['Set-Cookie',
+		"$COOKIE_NAME=$self->{session}{id}; HttpOnly; SameSite=Strict; Path=/"
+			. ($self->{tls_in_use} ? '; Secure' : '')];
+	return $response;
+}
+
+sub _page_wizard {
+	my ($self, $request, $args, %opt) = @_;
+
+	my $session = $self->{session};
+	my %var = (
+		csrf    => $session ? $session->{csrf} : '',
+		message => defined $opt{message} ? $opt{message} : '',
+		tcp_in  => defined $opt{TCP_IN}  ? $opt{TCP_IN}  : _current_csf($self, 'TCP_IN'),
+		tcp_out => defined $opt{TCP_OUT} ? $opt{TCP_OUT} : _current_csf($self, 'TCP_OUT'),
+		ui_allow => defined $opt{UI_ALLOW} ? $opt{UI_ALLOW} : '',
+		ui_port  => defined $opt{UI_PORT}  ? $opt{UI_PORT}  : '8443',
+		ui_mode  => defined $opt{UI_MODE}  ? $opt{UI_MODE}  : 'a',
+	);
+
+	return _render(200, <<'HTML', \%var);
+<h1>csf setup</h1>
+{{{message}}}
+<form method="post" action="/apply">
+<input type="hidden" name="_csrf" value="{{csrf}}">
+<h2>Firewall</h2>
+<p><label for="tcp_in">Inbound TCP ports</label>
+<input id="tcp_in" name="TCP_IN" value="{{tcp_in}}" size="60"></p>
+<p><label for="tcp_out">Outbound TCP ports</label>
+<input id="tcp_out" name="TCP_OUT" value="{{tcp_out}}" size="60"></p>
+<h2>Web interface</h2>
+<p><label for="ui_mode">Mode</label>
+<input id="ui_mode" name="UI_MODE" value="{{ui_mode}}" size="4"></p>
+<p><label for="ui_port">Port</label>
+<input id="ui_port" name="UI_PORT" value="{{ui_port}}" size="8"></p>
+<p><label for="ui_allow">Allowed addresses</label>
+<input id="ui_allow" name="UI_ALLOW" value="{{ui_allow}}" size="60"></p>
+<p><button type="submit">Apply</button></p>
+</form>
+<p class="note">Applying turns on csf's own TESTING mode and arms an
+independent systemd timer that puts everything back after five minutes unless
+you confirm. Keep this session open and check that a NEW ssh connection still
+works before confirming.</p>
+HTML
+}
+
+sub _do_apply {
+	my ($self, $request, $args) = @_;
+
+	my %raw = map { $_ => $args->{$_} } grep { exists $ANSWER{$_} } keys %$args;
+	my $text = serialise_answers(\%raw);
+
+	my ($answer, $problems) = parse_answers($text);
+	unless ($answer) {
+		return $self->_page_wizard($request, $args,
+			message => _problem_block('Nothing was changed.', $problems), %raw);
+	}
+
+	# The browser path writes the file and then RE-INVOKES THE CLI. It does
+	# not call apply() in this process. That is the property the plan asks
+	# for - a browser session reproducible from a shell - and it is also what
+	# keeps a fault in this web tier from being a fault in the firewall's
+	# configuration.
+	my $path = $self->answers_path;
+	_make_state_dir($self->{state_dir});
+	my $wrote = $self->{rollback}->write_atomic($path, $text, mode => 0600);
+	unless ($wrote->{ok}) {
+		return $self->_page_wizard($request, $args,
+			message => _problem_block('Nothing was changed.', [$wrote->{reason}]), %raw);
+	}
+
+	my $result = $self->{firewall}->run($self->{setup_cli}, '--answers', $path, '--yes');
+	my $ok = (!$result->{error} && !$result->{timeout} && !$result->{signal}
+		&& defined $result->{exit} && $result->{exit} == 0) ? 1 : 0;
+
+	my $session = $self->{session};
+	my %var = (
+		csrf   => $session ? $session->{csrf} : '',
+		output => defined $result->{output} ? $result->{output} : '',
+		path   => $path,
+	);
+
+	unless ($ok) {
+		return _render(200, <<'HTML', \%var);
+<h1>Not applied</h1>
+<p>The configuration was left as it was. What the setup command said:</p>
+<pre>{{output}}</pre>
+<p><a href="/wizard">Back</a></p>
+HTML
+	}
+
+	return _render(200, <<'HTML', \%var);
+<h1>Applied - now prove you are not locked out</h1>
+<pre>{{output}}</pre>
+<p><strong>Open a NEW ssh connection to this machine now.</strong> Do not use
+the one you already have: an existing connection survives rules that would
+stop a new one being made, which is exactly how a lockout hides.</p>
+<form method="post" action="/confirm">
+<input type="hidden" name="_csrf" value="{{csrf}}">
+<p><button type="submit">A new connection works - keep this configuration</button></p>
+</form>
+<p class="note">If you do nothing, the rollback timer restores the previous
+configuration by itself. The answers are saved at {{path}} and can be applied
+again with: csf-ui-setup --answers {{path}} --yes</p>
+HTML
+}
+
+sub _do_confirm {
+	my ($self) = @_;
+	my $result = $self->confirm;
+	my %var = (
+		note => $result->{cancelled}
+			? 'The rollback timer has been cancelled and its units removed.'
+			: ('Nothing was armed to cancel: ' . (defined $result->{reason} ? $result->{reason} : '')),
+	);
+	return _render(200, <<'HTML', \%var);
+<h1>Kept</h1>
+<p>{{note}}</p>
+<p>csf is still in TESTING mode, which stops the configuration becoming
+permanent on its own. Turn it off with: csf -x, then csf -e - or set
+TESTING = "0" in /etc/csf/csf.conf and restart csf - once you are satisfied.</p>
+HTML
+}
+
+sub answers_path {
+	my ($self) = @_;
+	return "$self->{state_dir}/answers.conf";
+}
+
+sub _current_csf {
+	my ($self, $key) = @_;
+	my $text = _slurp($self->{csf_conf});
+	return '' unless defined $text;
+	for my $line (split(/\n/, $text)) {
+		next unless $line =~ /^\s*\Q$key\E\s*=\s*"([^"]*)"/;
+		return $1;
+	}
+	return '';
+}
+
+###############################################################################
+# Responses. Every page goes through ConfigServer::UI::Render, so every value
+# that reaches the HTML is escaped by the module whose entire job is not
+# forgetting to - see its header for why {{}} and {{{}}} are spelled
+# differently.
+###############################################################################
+our $LAYOUT = <<'LAYOUT';
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>csf setup</title>
+<style>
+body{font:16px/1.5 system-ui,sans-serif;margin:0 auto;padding:1.5rem;max-width:44rem;color:#111;background:#fff}
+label{display:block;font-weight:600;margin-bottom:.25rem}
+input{font:inherit;padding:.4rem;max-width:100%}
+button{font:inherit;padding:.5rem 1rem;min-height:2.75rem}
+pre{background:#f4f4f4;padding:.75rem;overflow-x:auto}
+.note{color:#444;font-size:.9rem}
+.problem{border-left:4px solid #a00;padding-left:.75rem}
+</style></head><body>
+{{{content}}}
+</body></html>
+LAYOUT
+
+sub _render {
+	my ($status, $template, $vars) = @_;
+	my $content = $R->can('render')->($template, $vars);
+	return _html($status, $content);
+}
+
+sub _html {
+	my ($status, $content) = @_;
+	my $body = $R->can('render')->($LAYOUT, { content => $content });
+	return {
+		status  => $status,
+		headers => [
+			['Content-Type', 'text/html; charset=utf-8'],
+			['Cache-Control', 'no-store'],
+			['Referrer-Policy', 'no-referrer'],
+			['X-Content-Type-Options', 'nosniff'],
+			['X-Frame-Options', 'DENY'],
+			['Content-Security-Policy', "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'"],
+		],
+		body    => $body,
+	};
+}
+
+sub _redirect {
+	my ($location) = @_;
+	# 303, and the Location is always a fixed literal from this file - never
+	# built from anything a request supplied, so there is nothing here that
+	# could become an open redirect or carry a secret in a URL.
+	return {
+		status  => 303,
+		headers => [['Location', $location], ['Content-Type', 'text/html; charset=utf-8'], ['Cache-Control', 'no-store']],
+		body    => '',
+	};
+}
+
+sub _problem_block {
+	my ($lead, $problems) = @_;
+	my $html = '<div class="problem"><p>' . $R->can('escape_html')->($lead) . '</p><ul>';
+	for my $problem (@{ $problems || [] }) {
+		$html .= '<li>' . $R->can('escape_html')->($problem) . '</li>';
+	}
+	return $html . '</ul></div>';
+}
+
+###############################################################################
+# application/x-www-form-urlencoded, the shape a plain HTML <form> POSTs as.
+# Raw bytes out, no UTF-8 flag - the same convention docs/WEBUI-RPC.md S14.2
+# states and ConfigServer::UI::Render is built around.
+###############################################################################
+sub _parse_form {
+	my ($request) = @_;
+	my %args;
+	my $body = defined $request->{body} ? $request->{body} : '';
+	return \%args unless length $body;
+	for my $pair (split(/[&;]/, $body)) {
+		my ($key, $value) = split(/=/, $pair, 2);
+		next unless defined $key && length $key;
+		$value = '' unless defined $value;
+		$args{ _url_decode($key) } = _url_decode($value);
+	}
+	return \%args;
+}
+
+sub _url_decode {
+	my ($text) = @_;
+	$text =~ tr/+/ /;
+	$text =~ s/%([0-9A-Fa-f]{2})/chr(hex($1))/ge;
+	return $text;
+}
+
+sub _slurp {
+	my ($path) = @_;
+	open(my $fh, '<:raw', $path) or return undef;
+	local $/;
+	my $content = <$fh>;
+	close $fh;
+	return $content;
+}
+
+###############################################################################
+# THE LISTENER
+#
+# One process, one connection at a time, no fork: there is exactly one
+# operator and everything they do to this wizard is a change to the firewall's
+# configuration, so serialising requests is a feature. No keep-alive, one
+# request per connection, the same as Server.pm.
+#
+# Not unit-tested, by design and by the precedent this tree already set for
+# Server.pm's run() and csf-ui-helper's main() - it needs a real listening
+# socket. Everything it decides is handle_request(), which is tested.
+###############################################################################
+###############################################################################
+# listen_plan($offer) -> \%plan
+#
+# The one decision that turns an accepted temporary-port offer into a
+# different listener, extracted as a plain function because getting it wrong
+# is the difference between a feature and a lie:
+#
+#   * a port opened in the firewall while this process still binds 127.0.0.1
+#     is a hole that leads nowhere - the operator is told to connect and
+#     cannot;
+#   * a listener bound to a public address while this process still speaks
+#     cleartext is exactly what offer_port()'s TLS condition exists to
+#     prevent, defeated one layer further down.
+#
+# So the bind address, the TLS flag and the single peer this listener will
+# talk to all come from the same place, at once, and the loopback default is
+# the shape of the plan when there is no offer.
+###############################################################################
+sub listen_plan {
+	my ($self, $offer) = @_;
+
+	unless (ref($offer) eq 'HASH' && $offer->{ok} && ref($offer->{spec}) eq 'HASH') {
+		return { bind => '127.0.0.1', tls => 0, peer => undef, tunnel => 1 };
+	}
+
+	my $address = $offer->{spec}{address};
+	return {
+		bind   => ($address =~ /:/) ? '::' : '0.0.0.0',
+		tls    => 1,
+		# The firewall rule is the outer wall; this is the inner one. Two
+		# independent checks of the same fact cost nothing and fail
+		# independently - and this one keeps working if the rule is removed
+		# out from under us, or was never as narrow as it was meant to be.
+		peer   => $address,
+		tunnel => 0,
+	};
+}
+
+# peer_allowed($peer) - only ever restrictive. undef means "no restriction",
+# which is the loopback case; anything else is one exact address.
+sub peer_allowed {
+	my ($self, $allow, $peer) = @_;
+	return 1 unless defined $allow;
+	return 0 unless defined $peer && length $peer;
+	return (lc($peer) eq lc($allow)) ? 1 : 0;
+}
+
+sub _listen_on {
+	my ($self, $address) = @_;
+	my $family = ($address =~ /:/) ? Socket::AF_INET6() : Socket::AF_INET();
+	my $packed = Socket::inet_pton($family, $address)
+		or die "csf-ui-setup: $address will not pack for its own family\n";
+
+	socket(my $listener,
+		($family == Socket::AF_INET6() ? Socket::PF_INET6() : Socket::PF_INET()),
+		Socket::SOCK_STREAM(), 0) or die "csf-ui-setup: socket: $!\n";
+	setsockopt($listener, Socket::SOL_SOCKET(), Socket::SO_REUSEADDR(), pack('l', 1));
+	my $sockaddr = ($family == Socket::AF_INET6())
+		? Socket::pack_sockaddr_in6($self->{port}, $packed)
+		: Socket::pack_sockaddr_in($self->{port}, $packed);
+	bind($listener, $sockaddr)
+		or die "csf-ui-setup: cannot bind $address:$self->{port}: $!\n";
+	listen($listener, 8) or die "csf-ui-setup: listen: $!\n";
+	return $listener;
+}
+
+sub _peer_text {
+	my ($paddr) = @_;
+	return undef unless defined $paddr;
+	if (length($paddr) >= 28) {
+		my (undef, $addr) = eval { Socket::unpack_sockaddr_in6($paddr) };
+		return undef unless defined $addr;
+		return lc(Socket::inet_ntop(Socket::AF_INET6(), $addr));
+	}
+	my (undef, $addr) = eval { Socket::unpack_sockaddr_in($paddr) };
+	return undef unless defined $addr;
+	return Socket::inet_ntop(Socket::AF_INET(), $addr);
+}
+
+# The same certificate and key ConfigServer::UI::Server names, read through
+# that module's own package variables so there is one answer to "where does
+# this UI's TLS material live" rather than two. This task does not create
+# them (Task 9's job); offer_port() has already refused the whole
+# temporary-port path when they are absent, so reaching here means they are
+# there.
+sub _tls_wrap {
+	my ($socket) = @_;
+	require IO::Socket::SSL;
+	return IO::Socket::SSL->start_SSL($socket,
+		SSL_server    => 1,
+		SSL_cert_file => $ConfigServer::UI::Server::TLS_CERT_FILE,
+		SSL_key_file  => $ConfigServer::UI::Server::TLS_KEY_FILE,
+	);
+}
+
+# The loop's whole stopping policy, extracted so both lifetimes are testable
+# without a real listening socket - the same thing Server.pm did with
+# _accept_backoff() for exactly the same reason. Returns the reason to stop,
+# or undef to keep going.
+sub stop_reason {
+	my ($self, $now, $deadline, $idle_since) = @_;
+	return 'the operator confirmed the configuration' if $self->{confirmed};
+	return 'the 30-minute limit was reached'          if $now >= $deadline;
+	return 'nothing has happened for 10 minutes'      if $now - $idle_since >= $IDLE_LIFETIME;
+	return undef;
+}
+
+sub serve {
+	my ($self, %opt) = @_;
+
+	my $plan = ref($opt{plan}) eq 'HASH' ? $opt{plan} : $self->listen_plan(undef);
+	my $listener = $self->_listen_on($plan->{bind});
+	my $deadline = $self->{now}->() + $ABSOLUTE_LIFETIME;
+	my $idle_since = $self->{now}->();
+
+	# BOTH lifetimes end the PROCESS, not just the session. An expired
+	# session with the listener still up is a port still bound, a temporary
+	# firewall rule still installed, and a wizard still sitting there
+	# looking reachable - the operator would have no way to tell it from a
+	# live one, and nothing would ever remove the rule.
+	while (1) {
+		my $now = $self->{now}->();
+		if (my $over = $self->stop_reason($now, $deadline, $idle_since)) {
+			print STDERR "csf-ui-setup: stopping - $over\n";
+			last;
+		}
+
+		my $left = $deadline - $now;
+		my $idle_left = $IDLE_LIFETIME - ($now - $idle_since);
+		$left = $idle_left if $idle_left < $left;
+		my $rin = '';
+		vec($rin, fileno($listener), 1) = 1;
+		my $ready = select(my $rout = $rin, undef, undef, ($left > 30 ? 30 : $left));
+		next unless defined $ready && $ready > 0;
+		$idle_since = $self->{now}->();
+
+		my $paddr = accept(my $connection, $listener);
+		next unless $paddr;
+
+		# Checked before TLS and before any parsing, the same order and for
+		# the same reason as Server.pm's accept loop: the cheapest possible
+		# rejection for a peer with no business here.
+		my $peer = _peer_text($paddr);
+		unless ($self->peer_allowed($plan->{peer}, $peer)) {
+			close $connection;
+			next;
+		}
+
+		my $socket = $connection;
+		if ($plan->{tls}) {
+			# A handshake watchdog, for the reason Server.pm's own header
+			# gives at length: a peer that completes the TCP handshake and
+			# then says nothing would otherwise park this single-threaded
+			# loop forever, which for this process means denying the
+			# operator the wizard entirely.
+			local $SIG{ALRM} = sub { die "handshake timed out\n" };
+			Time::HiRes::alarm($ConfigServer::UI::Server::DEFAULT_HANDSHAKE_TIMEOUT);
+			$socket = eval { _tls_wrap($connection) };
+			Time::HiRes::alarm(0);
+			unless ($socket && UNIVERSAL::isa($socket, 'IO::Socket::SSL')) {
+				close $socket if $socket;
+				close $connection;
+				next;
+			}
+		}
+
+		my $request = eval {
+			$H->can('read_request')->($socket,
+				header_timeout => $ConfigServer::UI::HTTP::HEADER_TIMEOUT,
+				body_timeout   => $ConfigServer::UI::HTTP::BODY_TIMEOUT);
+		};
+		if (my $error = $@) {
+			if ($H->can('is_fault')->($error) && !$error->{silent}) {
+				$H->can('write_response')->($socket,
+					$H->can('error_response')->($error->{status}, $error->{message}),
+					timeout => $ConfigServer::UI::HTTP::WRITE_TIMEOUT);
+			}
+			close $socket;
+			next;
+		}
+		unless (defined $request) { close $socket; next }
+
+		$request->{peer} = defined $peer ? $peer : '127.0.0.1';
+		my $response = $self->handle_request($request);
+		$H->can('write_response')->($socket, $response,
+			timeout => $ConfigServer::UI::HTTP::WRITE_TIMEOUT);
+		close $socket;
+	}
+
+	close $listener;
+	return 0;
+}
+
+###############################################################################
+# THE SESSION STATE FILE - the only thing this wizard leaves on disk while it
+# runs, and the only reason --cleanup can do anything useful.
+#
+# It holds the canonical rule specification ConfigServer::UI::Firewall
+# returned when a temporary port was opened. A session that dies badly - the
+# terminal closed, the process killed -9, the machine losing power - leaves
+# that file behind, and csf-ui-setup --cleanup reads it and closes the port
+# using the same read-back removal path the normal exit uses.
+###############################################################################
+sub state_path {
+	my ($self) = @_;
+	return "$self->{state_dir}/session.state";
+}
+
+# Serialised in the KEY="VALUE" grammar this tree already uses everywhere,
+# not JSON: it is written by root and read by root, it holds no structure
+# deeper than a flat string map, and every other config-shaped file in this
+# task uses this grammar.
+sub save_state {
+	my ($self, $spec) = @_;
+	my $text = '';
+	for my $key (sort keys %$spec) {
+		my $value = $spec->{$key};
+		next if ref $value && ref($value) ne 'ARRAY';
+		$value = join(' ', @$value) if ref($value) eq 'ARRAY';
+		next unless defined $value;
+		$value =~ s/["\n\r]//g;
+		$text .= uc($key) . qq{="$value"\n};
+	}
+	_make_state_dir($self->{state_dir});
+	return $self->{rollback}->write_atomic($self->state_path, $text, mode => 0600);
+}
+
+sub load_state {
+	my ($self) = @_;
+	my $text = _slurp($self->state_path);
+	return undef unless defined $text;
+	my %spec;
+	for my $line (split(/\n/, $text)) {
+		next unless $line =~ /^\s*([A-Z][A-Z0-9_]*)\s*=\s*"([^"]*)"\s*\z/;
+		$spec{ lc $1 } = $2;
+	}
+	return undef unless $spec{canonical} && $spec{kind};
+	$spec{wait} = [ split(/\s+/, defined $spec{wait} ? $spec{wait} : '') ];
+	return \%spec;
+}
+
+sub _make_state_dir {
+	my ($dir) = @_;
+	my $so_far = '';
+	for my $part (split(m{/}, $dir)) {
+		next if $part eq '';
+		$so_far .= "/$part";
+		mkdir($so_far, 0700) unless -d $so_far;
+	}
+	return -d $dir ? 1 : 0;
+}
+
+###############################################################################
+# cleanup() - the EXIT/INT/TERM path AND --cleanup.
+#
+# Idempotent on purpose: it is run by a signal handler, by END, and by a
+# later invocation of the program, and it must be safe for all three to
+# happen. It closes the temporary port through the read-back path (never by
+# rebuilding a rule string) and removes the state file only once the port is
+# confirmed shut - a state file deleted while the rule is still installed is
+# a port nothing will ever close.
+###############################################################################
+sub cleanup {
+	my ($self) = @_;
+	my @done;
+
+	my $spec = $self->load_state;
+	if ($spec) {
+		my $closed = $self->{firewall}->close_port($spec);
+		if ($closed->{ok}) {
+			push @done, $closed->{removed}
+				? 'the temporary firewall rule was removed'
+				: 'the temporary firewall rule was already gone';
+			unlink $self->state_path;
+		}
+		else {
+			push @done, 'the temporary firewall rule could NOT be removed: ' . $closed->{reason}
+				. (defined $closed->{manual} ? " - remove it by hand: $closed->{manual}" : '')
+				. ' (the record of it has been kept at ' . $self->state_path . ' so this can be retried)';
+		}
+	}
+
+	my $answers = $self->answers_path;
+	push @done, "the answers file $answers was left in place for reuse" if -f $answers;
+
+	return \@done;
+}
+
+###############################################################################
+# COMMAND LINE
+###############################################################################
+sub _usage {
+	print STDERR <<'USAGE';
+csf-ui-setup - set up csf and its web interface.
+
+  csf-ui-setup --web [--port N]        run the wizard in a browser
+  csf-ui-setup --answers FILE --yes    apply an answers file (no prompts)
+  csf-ui-setup --confirm               cancel the rollback: "I still have my session"
+  csf-ui-setup --cleanup               remove what a session that died badly left behind
+  csf-ui-setup --rollback-now --snapshot DIR
+                                       restore a snapshot (run by the rollback timer)
+
+The wizard listens on 127.0.0.1 and prints an ssh -L command. It writes an
+answers file and applies it through --answers, so anything done in a browser
+can be repeated from a shell.
+USAGE
+	return 2;
+}
+
+sub run {
+	my (@argv) = @_;
+
+	my %opt;
+	while (@argv) {
+		my $arg = shift @argv;
+		if    ($arg eq '--web')          { $opt{web} = 1 }
+		elsif ($arg eq '--yes')          { $opt{yes} = 1 }
+		elsif ($arg eq '--cleanup')      { $opt{cleanup} = 1 }
+		elsif ($arg eq '--confirm')      { $opt{confirm} = 1 }
+		elsif ($arg eq '--rollback-now') { $opt{rollback} = 1 }
+		elsif ($arg eq '--answers')      { $opt{answers} = shift @argv }
+		elsif ($arg eq '--snapshot')     { $opt{snapshot} = shift @argv }
+		elsif ($arg eq '--port')         {
+			$opt{port} = shift @argv;
+			unless (defined $opt{port} && $opt{port} =~ /^[1-9][0-9]{0,4}\z/
+				&& $opt{port} + 0 >= 1024 && $opt{port} + 0 <= 65535) {
+				print STDERR "csf-ui-setup: --port must be between 1024 and 65535\n";
+				return 2;
+			}
+			$opt{port} += 0;
+		}
+		elsif ($arg eq '--help' || $arg eq '-h') { return _usage() }
+		else {
+			print STDERR "csf-ui-setup: unrecognised argument \"$arg\"\n";
+			return _usage();
+		}
+	}
+
+	return cmd_rollback_now(\%opt) if $opt{rollback};
+	return cmd_cleanup(\%opt)      if $opt{cleanup};
+	return cmd_confirm(\%opt)      if $opt{confirm};
+	return cmd_answers(\%opt)      if defined $opt{answers};
+	return cmd_web(\%opt)          if $opt{web};
+	return _usage();
+}
+
+sub _require_root {
+	return 0 if $> == 0;
+	print STDERR "csf-ui-setup: this must run as root - it reads and writes /etc/csf/csf.conf\n";
+	return 1;
+}
+
+sub cmd_answers {
+	my ($opt) = @_;
+	return 1 if _require_root();
+
+	unless ($opt->{yes}) {
+		print STDERR "csf-ui-setup: --answers requires --yes, because applying changes the firewall.\n";
+		return 2;
+	}
+
+	my $text = _slurp($opt->{answers});
+	unless (defined $text) {
+		print STDERR "csf-ui-setup: the answers file $opt->{answers} could not be read\n";
+		return 1;
+	}
+
+	my ($answer, $problems) = parse_answers($text);
+	unless ($answer) {
+		print STDERR "csf-ui-setup refuses this answers file:\n";
+		print STDERR "  - $_\n" for @$problems;
+		return 1;
+	}
+
+	my $self = __PACKAGE__->new;
+	my $result = $self->apply(answers => $answer);
+	unless ($result->{ok}) {
+		print STDERR "csf-ui-setup did not apply anything: $result->{reason}\n";
+		print STDERR "  - $_\n" for @{ $result->{problems} || [] };
+		return 1;
+	}
+
+	print "$_\n" for @{ $result->{steps} || [] };
+	print "\nA snapshot is at $result->{snapshot} and a rollback timer will restore it\n";
+	print "in $result->{window} seconds. Open a NEW ssh connection to check you are not\n";
+	print "locked out, then run: csf-ui-setup --confirm\n";
+	return 0;
+}
+
+sub cmd_confirm {
+	my ($opt) = @_;
+	return 1 if _require_root();
+	my $self = __PACKAGE__->new;
+	my $result = $self->confirm;
+	print $result->{cancelled}
+		? "The rollback timer has been cancelled.\n"
+		: ("Nothing was armed to cancel" . (defined $result->{reason} ? ": $result->{reason}" : '') . "\n");
+	return 0;
+}
+
+sub cmd_cleanup {
+	my ($opt) = @_;
+	return 1 if _require_root();
+	my $self = __PACKAGE__->new;
+	print "$_\n" for @{ $self->cleanup };
+	my $removed = $self->{rollback}->armed ? 'a rollback timer is still armed; leaving it alone - run --confirm to cancel it'
+		: 'no rollback timer is armed';
+	print "$removed\n";
+	return 0;
+}
+
+sub cmd_rollback_now {
+	my ($opt) = @_;
+	return 1 if _require_root();
+
+	my $dir = $opt->{snapshot};
+	unless (defined $dir && length $dir) {
+		print STDERR "csf-ui-setup: --rollback-now needs --snapshot DIR\n";
+		return 2;
+	}
+	# The unit file that names this directory is written by root, so this is
+	# defence in depth rather than a boundary - but a restore that can be
+	# pointed at an arbitrary directory is a way to write arbitrary content
+	# over csf.conf, and the check costs one line.
+	unless ($dir =~ m{^\Q$ConfigServer::UI::Rollback::DEFAULT_DIR\E/[^/]+\z} && $dir !~ /\.\./) {
+		print STDERR "csf-ui-setup: --snapshot must name a directory directly under $ConfigServer::UI::Rollback::DEFAULT_DIR\n";
+		return 2;
+	}
+
+	my $self = __PACKAGE__->new;
+	my $result = $self->{rollback}->restore($dir);
+	print "$_\n" for @{ $result->{steps} || [] };
+	return $result->{ok} ? 0 : 1;
+}
+
+sub cmd_web {
+	my ($opt) = @_;
+	return 1 if _require_root();
+
+	my $self = __PACKAGE__->new(defined $opt->{port} ? (port => $opt->{port}) : ());
+
+	# EXIT/INT/TERM, all three, all idempotent (task-8-brief.md). $ACTIVE is
+	# what the END block below reaches for; it is set here and nowhere else,
+	# because --web is the only mode that leaves anything behind while it
+	# runs.
+	$ACTIVE = $self;
+	my $cleanup = sub {
+		print STDERR "$_\n" for @{ $self->cleanup };
+	};
+	$SIG{INT}  = sub { $cleanup->(); exit 130 };
+	$SIG{TERM} = sub { $cleanup->(); exit 143 };
+
+	my $address = $self->operator_address;
+	my $offer = $self->offer_port(address => $address);
+	$self->save_state($offer->{spec}) if $offer->{ok};
+
+	my $plan = $self->listen_plan($offer);
+	$self->{tls_in_use} = $plan->{tls};
+
+	if ($plan->{tunnel}) {
+		print "Listening on 127.0.0.1 only ($offer->{reason})\n\n";
+		print "From your own machine, run:\n\n";
+		printf("  ssh -N -L %d:127.0.0.1:%d root\@%s\n\n", $self->{port}, $self->{port}, _hostname());
+		print "then open  http://127.0.0.1:$self->{port}/\n\n";
+	}
+	else {
+		print "A temporary rule now allows $plan->{peer} to reach port $self->{port}, over TLS,\n";
+		print "and this listener will talk to that address and no other. Open:\n\n";
+		printf("  https://%s:%d/\n\n", _hostname(), $self->{port});
+		print "The rule is removed when this wizard exits; csf-ui-setup --cleanup removes it\n";
+		print "if this process dies without getting the chance.\n\n";
+	}
+
+	print "Setup token (paste it into the page - it is never part of a URL):\n\n";
+	print "  $self->{token}\n\n";
+	print "This wizard exits after 30 minutes, or 10 minutes idle, or on Ctrl-C.\n";
+
+	my $status = eval { $self->serve(plan => $plan) };
+	my $error = $@;
+	$cleanup->();
+	die $error if $error;
+	return $status;
+}
+
+sub _hostname {
+	my $name = eval { require POSIX; (POSIX::uname())[1] };
+	return (defined $name && length $name) ? $name : 'this-server';
+}
+
+###############################################################################
+# EXIT, as well as INT and TERM (task-8-brief.md). cmd_web() sets handlers
+# for the two signals and calls cleanup() itself on the normal path; this is
+# the third case - anything that ends this process without going through
+# either, including a die() from somewhere cmd_web()'s own eval does not
+# cover and an exit() from deeper in. cleanup() is idempotent by design (see
+# its header), so running twice costs a read of a state file that is no
+# longer there.
+###############################################################################
+END {
+	if ($ACTIVE) {
+		my $done = eval { $ACTIVE->cleanup } || [];
+		print STDERR "$_\n" for @$done;
+	}
+}
+
+exit(run(@ARGV)) unless caller;
+
+1;
