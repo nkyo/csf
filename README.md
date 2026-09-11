@@ -82,6 +82,10 @@ git archive --format=tar --prefix=csf/ v<version> | gzip -n -9 | sha256sum
 
 `UI = "0"` by default, and that is the right setting unless you need it.
 
+> It is being replaced. The current one is 5,071 lines that parse HTTP from the
+> network as root, store the password in plaintext and have no CSRF protection.
+> See [docs/WEBUI-PLAN.md](docs/WEBUI-PLAN.md).
+
 If you enable it, note what was fixed here: up to v15.00 a **private key shipped
 inside the tarball** and every installer copied it into `/etc/csf/ui/`, so every
 server running the WebUI used a key anyone who downloaded csf already had. Its
