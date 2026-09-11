@@ -75,6 +75,33 @@ line is added below the original notice; the original stays intact.
   would not. The exact modes and the ordering the installers must follow are now
   part of the document. (`docs/WEBUI-RPC.md`)
 
+- **2026-09-11** — Reviewed, and two things in it were wrong. **The WebUI now
+  lives outside every csf-managed tree** — `/usr/local/csf-ui/`, `/etc/csf-ui/`,
+  `/var/lib/csf-ui/` — because `lfd` resets `/etc/csf`, `/var/lib/csf` and
+  `/usr/local/csf` to mode `0600` on **every pass of its main loop**
+  (`lfd.pl:1173`, `lfd.pl:1187-1201`), logging each reset. A directory at `0600`
+  has no execute bit and cannot be entered at all, so an unprivileged UI account
+  could never read its own configuration, and systemd could not even execute a
+  binary stored there. That enforcement is correct and stays exactly as it is; the
+  UI moves instead.
+
+  **Temporarily blocking an address no longer makes root look it up in DNS.**
+  `csf -td` with an empty comment falls into `iplookup()` (`csf.pl:4320`), which
+  with the shipped default `LF_LOOKUPS = "1"` runs `host` against the address as
+  root (`ConfigServer/LookUpIP.pm:87`) — so every temporary block would have sent a
+  query to a nameserver chosen by whoever requested the block. The contract now
+  sends a fixed note on that call, and requires one on the permanent-block and
+  allow calls, so no path reaches that branch.
+
+  Also corrected: the minimum supported Perl is **5.14** (Socket 1.94), because
+  `inet_pton` and `SO_PEERCRED` do not exist before it; the optional Argon2id hash
+  branch is dropped, since the module is neither core nor vendored and a branch
+  that cannot run implies a strength that is not there; and the security claim
+  about password hashing now says what it actually buys — an attacker holding the
+  web tier cannot take the hash file away and attack every account offline, but
+  does read the password of anyone who logs in while they are there.
+  (`docs/WEBUI-RPC.md`)
+
 #### The update mechanism — moved to GitHub, and made verifiable
 
 The original update path fetched a tarball and ran `sh install.sh` from it **as
