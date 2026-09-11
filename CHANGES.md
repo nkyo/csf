@@ -160,6 +160,36 @@ line is added below the original notice; the original stays intact.
   `ui-src/lib/ConfigServer/UI/Proto.pm`, `t/10-proto.t`,
   `t/11-helper-validate.t`)
 
+- **2026-09-11** — Fixed a fail-open in the helper found by review: **when a state
+  file could not be rewritten, every rate cap and the password lockout silently
+  stopped applying.** `_with_state` discarded the return value of the atomic
+  rewrite, so under a full disk, a read-only remount or a wrong mode on the state
+  directory the counters went on answering as though they were still counting —
+  measured, twelve wrong passwords never locked and two hundred mutating calls
+  produced no refusal. A counter that did not persist has not been applied, so
+  every caller now refuses with `E_UNAVAILABLE` and the helper writes one line to
+  its audit log and one to stderr, because the condition was otherwise invisible:
+  an operator saw a working login form with no lockout and no diagnostic. The
+  restart interval is now claimed before `csf -r` runs rather than recorded after
+  it succeeds, since a mark written afterwards cannot refuse anything.
+
+  Also fixed: **a caller could make a rejected request leave no audit record at
+  all**, by padding it with thousands of short keys until the entry that logs it
+  exceeded the line cap — §8 says every rejected request is logged, and the loss
+  is the record of what an attacker tried. Logged argument keys are now capped in
+  number and length and sanitised like values, an entry that still will not fit is
+  replaced by a minimal line rather than dropped, and the append is looped so a
+  short write cannot leave a truncated line for the next entry to run into.
+  **§7's ten second deadline on `authenticate` is now implemented** — it was
+  declared and never applied, which mattered because password records carry their
+  own round count, so a store copied from another machine could make root hash
+  without a ceiling. Three smaller ones: descriptors are marked close-on-exec
+  explicitly rather than relying on Perl's `$^F` default, so nothing exec'd as
+  root inherits the peer's socket; the files the helper slurps are capped at 16
+  MiB, the one resource it had with no ceiling; and §5.13, §5.14 and §7 record the
+  refusals above. (`ui-src/bin/csf-ui-helper`, `docs/WEBUI-RPC.md`,
+  `t/11-helper-validate.t`)
+
 #### The update mechanism — moved to GitHub, and made verifiable
 
 The original update path fetched a tarball and ran `sh install.sh` from it **as

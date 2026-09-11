@@ -203,6 +203,10 @@ sub new_context {
 		run         => $override{run} || \&run_argv,
 		peercred    => $override{peercred} || \&peer_credentials,
 		auth_verify => $override{auth_verify} || \&auth_verify,
+		# §7's authenticate deadline. Overridable only so that a test can assert
+		# the timeout without waiting ten seconds for it; nothing on the wire
+		# reaches it, and main() builds its context with no overrides at all.
+		deadline_auth => $override{deadline_auth} || $LIMIT{deadline_auth},
 		expect_uid  => $override{expect_uid},
 		group_ready => defined $override{group_ready} ? $override{group_ready} : 1,
 		conf        => undef,
@@ -374,15 +378,25 @@ sub _recognised_refusal {
 ###############################################################################
 # File reading
 ###############################################################################
+# The one resource in this helper with no §7 limit in front of it: csf.deny can
+# be grown by anything that writes it, and sixteen children each slurping it is
+# sixteen copies in root's memory. Capped, and refused past the cap rather than
+# read half-way - a truncated block list read as though it were the whole thing
+# would report entries as missing that are not (G3).
+#
+# 'our' so that a test can lower it; nothing on the wire reaches it.
+our $MAX_FILE_BYTES = 16 * 1024 * 1024;
+
 sub _slurp_lines {
 	my ($path) = @_;
 	return ([], 'missing') unless -e $path;
 	open(my $fh, '<', $path) or return ([], 'unreadable');
 	binmode($fh);
-	local $/;
-	my $data = <$fh>;
+	my $data = '';
+	my $read = read($fh, $data, $MAX_FILE_BYTES + 1);
 	close $fh;
-	$data = '' unless defined $data;
+	return ([], 'unreadable') unless defined $read;
+	return ([], 'oversize') if length($data) > $MAX_FILE_BYTES;
 	my @lines = split(/\n/, $data, -1);
 	pop @lines if @lines && $lines[-1] eq '';
 	return (\@lines, undef);
@@ -437,10 +451,12 @@ sub parse_tempban_line {
 	};
 }
 
+# Returns (undef, $why) for every failure except a file that is simply not
+# there, which is a normal state and reads as empty.
 sub _entries {
 	my ($ctx, $key) = @_;
 	my ($lines, $error) = _slurp_lines($ctx->{path}{$key});
-	return (undef, $error) if $error && $error eq 'unreadable';
+	return (undef, $error) if $error && $error ne 'missing';
 	my $now = now($ctx);
 	my (@rows, $includes, $unparsable);
 	($includes, $unparsable) = (0, 0);
@@ -457,6 +473,14 @@ sub _entries {
 		push @rows, $row;
 	}
 	return ({ rows => \@rows, includes => $includes, unparsable => $unparsable }, undef);
+}
+
+sub _entries_failure {
+	my ($label, $why) = @_;
+	return _fail('E_BACKEND',
+		"$label is larger than this helper will read into memory; trim it from a shell")
+		if defined $why && $why eq 'oversize';
+	return _fail('E_BACKEND', "$label could not be read");
 }
 
 sub _matching {
@@ -518,22 +542,62 @@ sub _write_state {
 	return 1;
 }
 
+# Returns undef when the state could not be read, locked, or - this is the one
+# that hid - when it could not be REWRITTEN. A counter that did not persist has
+# not been applied, so every caller treats undef as "refuse", never as "carry
+# on": under ENOSPC, a read-only remount or a wrong mode on the state directory,
+# the §7 caps and the §5.14 lockout would otherwise go on answering as though
+# they were still counting. That is fail-open in the one process whose whole job
+# is to fail closed (G3).
 sub _with_state {
-	my ($path, $code) = @_;
+	my ($ctx, $path, $code) = @_;
 	my $fh = _lock_state($path);
-	return undef unless $fh;
+	unless ($fh) {
+		_state_unavailable($ctx, $path, 'it could not be opened or locked');
+		return undef;
+	}
 	my $struct = _read_state($fh);
 	my ($result, $dirty) = $code->($struct);
-	_write_state($path, $struct) if $dirty;
+	if ($dirty && !_write_state($path, $struct)) {
+		close $fh;
+		_state_unavailable($ctx, $path, 'it could not be rewritten');
+		return undef;
+	}
 	close $fh;
 	return $result;
 }
 
+# Said once per occurrence, in root's own log and on stderr, because the failure
+# this reports is invisible everywhere else: the caller sees a refusal, and
+# without this line nobody can tell a refusal that means "you are over the cap"
+# from one that means "this machine's disk is full".
+sub _state_unavailable {
+	my ($ctx, $path, $why) = @_;
+	my $name = $path;
+	$name =~ s{.*/}{};
+	print STDERR "csf-ui-helper: $name cannot be maintained ($why); "
+		. "every request that depends on it is being refused\n";
+	audit($ctx, {
+		ts     => now($ctx),
+		id     => undef,
+		op     => undef,
+		args   => {},
+		peer   => { uid => undef, pid => undef },
+		ok     => _false(),
+		error  => 'E_UNAVAILABLE',
+		detail => "$name cannot be maintained: $why",
+	});
+	return;
+}
+
 # Rolling one-minute windows, counted in whole seconds (section 7).
+# Returns { admit => 1 }, { admit => 0 } when the cap is reached, or
+# { admit => 0, unavailable => 1 } when the count could not be kept - §3.5 keeps
+# those last two apart: one is transient and one needs an operator.
 sub _rate_admit {
 	my ($ctx, $kind, $limit) = @_;
 	my $now = now($ctx);
-	my $result = _with_state($ctx->{path}{rate_state}, sub {
+	my $result = _with_state($ctx, $ctx->{path}{rate_state}, sub {
 		my ($state) = @_;
 		my $bucket = $state->{$kind} || {};
 		for my $second (keys %$bucket) {
@@ -543,46 +607,41 @@ sub _rate_admit {
 		$total += $bucket->{$_} for keys %$bucket;
 		if ($total >= $limit) {
 			$state->{$kind} = $bucket;
-			return (0, 1);
+			return ({ admit => 0 }, 1);
 		}
 		$bucket->{$now}++;
 		$state->{$kind} = $bucket;
-		return (1, 1);
+		return ({ admit => 1 }, 1);
 	});
 	# G3: if the counter cannot be maintained, the limit cannot be enforced, so
 	# the request is refused rather than admitted unmetered.
-	return defined $result ? $result : 0;
+	return defined $result ? $result : { admit => 0, unavailable => 1 };
 }
 
-sub _restart_gate {
+# Checks the interval and claims it in one locked pass. Claiming before the
+# restart runs rather than marking after it succeeds means a restart that fails
+# also holds the interval, which is the stricter reading of §7's row and the only
+# one that can fail closed: a mark written afterwards cannot refuse anything when
+# the write does not land.
+sub _restart_claim {
 	my ($ctx) = @_;
 	my $now = now($ctx);
-	my $result = _with_state($ctx->{path}{rate_state}, sub {
+	my $result = _with_state($ctx, $ctx->{path}{rate_state}, sub {
 		my ($state) = @_;
 		my $last = $state->{last_restart};
 		if (defined $last && $last =~ /^[0-9]+$/ && $now - $last < $LIMIT{restart_interval}) {
-			return ($LIMIT{restart_interval} - ($now - $last), 0);
+			return ({ wait => $LIMIT{restart_interval} - ($now - $last) }, 0);
 		}
-		return (0, 0);
-	});
-	return defined $result ? $result : $LIMIT{restart_interval};
-}
-
-sub _restart_mark {
-	my ($ctx) = @_;
-	my $now = now($ctx);
-	_with_state($ctx->{path}{rate_state}, sub {
-		my ($state) = @_;
 		$state->{last_restart} = $now;
-		return (1, 1);
+		return ({ wait => 0 }, 1);
 	});
-	return;
+	return defined $result ? $result : { wait => $LIMIT{restart_interval}, unavailable => 1 };
 }
 
 sub _auth_slot_take {
 	my ($ctx) = @_;
 	my $now = now($ctx);
-	my $result = _with_state($ctx->{path}{rate_state}, sub {
+	my $result = _with_state($ctx, $ctx->{path}{rate_state}, sub {
 		my ($state) = @_;
 		my $active = $state->{auth_active} || {};
 		for my $pid (keys %$active) {
@@ -595,18 +654,18 @@ sub _auth_slot_take {
 		}
 		if (scalar(keys %$active) >= $LIMIT{auth_concurrent}) {
 			$state->{auth_active} = $active;
-			return (0, 1);
+			return ({ admit => 0 }, 1);
 		}
 		$active->{$$} = $now;
 		$state->{auth_active} = $active;
-		return (1, 1);
+		return ({ admit => 1 }, 1);
 	});
-	return defined $result ? $result : 0;
+	return defined $result ? $result : { admit => 0, unavailable => 1 };
 }
 
 sub _auth_slot_release {
 	my ($ctx) = @_;
-	_with_state($ctx->{path}{rate_state}, sub {
+	_with_state($ctx, $ctx->{path}{rate_state}, sub {
 		my ($state) = @_;
 		my $active = $state->{auth_active} || {};
 		delete $active->{$$};
@@ -628,7 +687,7 @@ sub _auth_slot_release {
 sub _auth_state_check {
 	my ($ctx, $user) = @_;
 	my $now = now($ctx);
-	my $result = _with_state($ctx->{path}{authfail}, sub {
+	my $result = _with_state($ctx, $ctx->{path}{authfail}, sub {
 		my ($state) = @_;
 		my $users = $state->{users} || {};
 		my $record = $users->{$user};
@@ -646,13 +705,16 @@ sub _auth_state_check {
 		}
 		return ({ locked => 0, retry_after => 0 }, 0);
 	});
-	return defined $result ? $result : { locked => 1, retry_after => $LIMIT{auth_lock_seconds}, unavailable => 1 };
+	# A counter that cannot be read is a structural failure, not a lockout: telling
+	# an administrator their account is locked for 300 s when the real problem is
+	# an unreadable state file sends them to the wrong place entirely (§3.5).
+	return defined $result ? $result : { unavailable => 1 };
 }
 
 sub _auth_state_fail {
 	my ($ctx, $user) = @_;
 	my $now = now($ctx);
-	my $result = _with_state($ctx->{path}{authfail}, sub {
+	my $result = _with_state($ctx, $ctx->{path}{authfail}, sub {
 		my ($state) = @_;
 		my $users = $state->{users} || {};
 		if (!$users->{$user} && scalar(keys %$users) >= $LIMIT{auth_capacity}) {
@@ -676,12 +738,17 @@ sub _auth_state_fail {
 		my $locked = ($record->{locked_until} || 0) > $now ? 1 : 0;
 		return ({ locked => $locked, retry_after => $locked ? $record->{locked_until} - $now : 0 }, 1);
 	});
-	return defined $result ? $result : { locked => 0, retry_after => 0 };
+	# A failure that could not be recorded has not been counted. Answering
+	# "wrong password, not locked" here is what turns a full disk into unlimited
+	# password guessing with root running crypt() on every attempt.
+	return defined $result ? $result : { unavailable => 1 };
 }
 
 sub _auth_state_clear {
 	my ($ctx, $user) = @_;
-	_with_state($ctx->{path}{authfail}, sub {
+	# A clear that does not land leaves the record in place, which fails towards
+	# more lockout, not less - so its failure does not refuse the login.
+	_with_state($ctx, $ctx->{path}{authfail}, sub {
 		my ($state) = @_;
 		my $users = $state->{users} || {};
 		delete $users->{$user};
@@ -699,6 +766,13 @@ sub _auth_state_clear {
 # 'pass' is removed from the logged arguments rather than blanked, so there is
 # no field for a later change to start filling in.
 ###############################################################################
+# An audit entry is bounded so that no caller can price themselves out of it.
+# The request line may be 64 KiB of legal JSON; what is written here may not be,
+# so keys are capped in number and length exactly as values are.
+my $MAX_LOG_KEYS = 16;
+my $MAX_LOG_KEY_BYTES = 64;
+my $MAX_LOG_VALUE_BYTES = 200;
+
 sub _audit_args {
 	my ($args) = @_;
 	my %copy = %{ $args || {} };
@@ -712,11 +786,41 @@ sub _audit_args {
 sub audit {
 	my ($ctx, $entry) = @_;
 	my $line = eval { $P->can('encode')->($entry) };
+	unless (defined $line) {
+		# §8 logs every rejected request, so an entry that will not fit is
+		# replaced by a minimal one rather than dropped. Dropping it would let a
+		# caller choose which of their attempts leaves a record, and the record
+		# of what was attempted is the half an incident responder reads first.
+		$line = eval {
+			$P->can('encode')->({
+				ts     => $entry->{ts},
+				id     => $entry->{id},
+				op     => $entry->{op},
+				args   => {},
+				peer   => $entry->{peer},
+				ok     => $entry->{ok},
+				error  => $entry->{error},
+				detail => 'the arguments were too large to log',
+			});
+		};
+	}
 	return 0 unless defined $line;
+
 	sysopen(my $fh, $ctx->{path}{audit_log}, O_WRONLY | O_APPEND | O_CREAT, 0640) or return 0;
-	syswrite($fh, $line);
+	# A short write would leave a truncated line with no newline, and the next
+	# entry would concatenate onto it - losing both to any line-oriented reader.
+	my $written = 0;
+	while ($written < length $line) {
+		my $wrote = syswrite($fh, $line, length($line) - $written, $written);
+		unless (defined $wrote) {
+			next if $!{EINTR};
+			last;
+		}
+		last if $wrote <= 0;
+		$written += $wrote;
+	}
 	close $fh;
-	return 1;
+	return ($written == length $line) ? 1 : 0;
 }
 
 sub _audit_request {
@@ -738,6 +842,18 @@ sub _audit_request {
 ###############################################################################
 # Peer authentication (section 2.2)
 ###############################################################################
+# Perl already sets close-on-exec on every descriptor above $^F, so on this
+# interpreter the accepted socket is not inherited today. That is an interpreter
+# default, not a property of this file, and $^F is a writable global: a boundary
+# between an unprivileged peer and a root-exec'd child should not rest on it.
+# Set explicitly, once, where the descriptor is created.
+sub _set_cloexec {
+	my ($fh) = @_;
+	my $flags = fcntl($fh, F_GETFD, 0);
+	return 0 unless defined $flags;
+	return fcntl($fh, F_SETFD, $flags | FD_CLOEXEC) ? 1 : 0;
+}
+
 sub peer_credentials {
 	my ($socket) = @_;
 	my $packed = getsockopt($socket, Socket::SOL_SOCKET(), Socket::SO_PEERCRED());
@@ -879,14 +995,25 @@ sub handle_request {
 
 # Arguments that failed validation are still logged, so the audit trail shows
 # what was attempted - but 'pass' never is, not even to say it was rejected.
+#
+# These arguments never passed a grammar, so nothing about them is bounded yet:
+# the count of keys, the length of each key and the bytes in each value are all
+# the caller's choice. All three are capped here, and the keys go through the
+# same sanitiser as the values so that a C1 byte cannot reach root's log.
 sub _redacted {
 	my ($op, $args) = @_;
-	my %copy = %{ $args || {} };
-	delete $copy{pass};
-	for my $key (keys %copy) {
-		$copy{$key} = $P->can('sanitise')->($copy{$key}, 200) unless ref $copy{$key};
-		delete $copy{$key} if ref $copy{$key};
+	my %copy;
+	my $dropped = 0;
+	for my $key (sort keys %{ $args || {} }) {
+		next if $key eq 'pass';
+		if (scalar(keys %copy) >= $MAX_LOG_KEYS) { $dropped++; next }
+		my $name = $P->can('sanitise')->($key, $MAX_LOG_KEY_BYTES);
+		my $value = $args->{$key};
+		$copy{$name} = ref($value)
+			? '(' . lc(ref($value) eq 'ARRAY' ? 'array' : ref($value) eq 'HASH' ? 'object' : 'value') . ')'
+			: $P->can('sanitise')->($value, $MAX_LOG_VALUE_BYTES);
 	}
+	$copy{_unlogged} = $dropped + 0 if $dropped;
 	return \%copy;
 }
 
@@ -894,8 +1021,13 @@ sub execute {
 	my ($ctx, $op, $args, $peer) = @_;
 	my $spec = $OPS{$op};
 
-	if ($spec->{mutates} && !_rate_admit($ctx, 'mutate', $LIMIT{mutate_per_minute})) {
-		return _fail('E_BUSY', 'too many mutating requests; try again shortly');
+	if ($spec->{mutates}) {
+		my $rate = _rate_admit($ctx, 'mutate', $LIMIT{mutate_per_minute});
+		return _fail('E_UNAVAILABLE',
+			'the helper cannot maintain its rate counter, so it cannot enforce its own limits; check the disk and the mode of /var/run/csf-ui')
+			if $rate->{unavailable};
+		return _fail('E_BUSY', 'too many mutating requests; try again shortly')
+			unless $rate->{admit};
 	}
 
 	if ($spec->{child} && $op ne 'status') {
@@ -1015,15 +1147,15 @@ sub op_counts {
 	my %out;
 	for my $pair ([deny => 'csf_deny'], [allow => 'csf_allow']) {
 		my ($name, $key) = @$pair;
-		my ($set) = _entries($ctx, $key);
-		return _fail('E_BACKEND', "$name list could not be read") unless $set;
+		my ($set, $why) = _entries($ctx, $key);
+		return _entries_failure("the $name list", $why) unless $set;
 		$out{$name} = scalar @{ $set->{rows} };
 		$out{"${name}_includes"} = $set->{includes};
 	}
 	for my $pair ([temp_deny => 'tempban'], [temp_allow => 'tempallow']) {
 		my ($name, $key) = @$pair;
-		my ($set) = _entries($ctx, $key);
-		return _fail('E_BACKEND', "$name list could not be read") unless $set;
+		my ($set, $why) = _entries($ctx, $key);
+		return _entries_failure("the $name list", $why) unless $set;
 		$out{$name} = scalar grep { !$_->{expired} } @{ $set->{rows} };
 	}
 	$out{generated} = now($ctx) + 0;
@@ -1035,8 +1167,8 @@ sub op_counts {
 ###############################################################################
 sub _add_entry {
 	my ($ctx, $args, $flag, $key) = @_;
-	my ($before) = _entries($ctx, $key);
-	return _fail('E_BACKEND', 'the list could not be read') unless $before;
+	my ($before, $why) = _entries($ctx, $key);
+	return _entries_failure('the list', $why) unless $before;
 	my $present = scalar @{ _matching($before, $args->{ip}) };
 
 	my $result = $ctx->{run}->($ctx, $LIMIT{deadline_mutate},
@@ -1044,8 +1176,8 @@ sub _add_entry {
 	my $failure = _child_failed($result);
 	return _fail('E_BACKEND', "csf $flag failed: $failure") if $failure;
 
-	my ($after) = _entries($ctx, $key);
-	return _fail('E_BACKEND', 'the list could not be re-read after the change') unless $after;
+	my ($after, $after_why) = _entries($ctx, $key);
+	return _entries_failure('the list, re-read after the change', $after_why) unless $after;
 	my $now_present = scalar @{ _matching($after, $args->{ip}) };
 
 	if ($now_present > $present) {
@@ -1064,8 +1196,8 @@ sub _add_entry {
 
 sub _remove_entry {
 	my ($ctx, $args, $flag, $key) = @_;
-	my ($before) = _entries($ctx, $key);
-	return _fail('E_BACKEND', 'the list could not be read') unless $before;
+	my ($before, $why) = _entries($ctx, $key);
+	return _entries_failure('the list', $why) unless $before;
 	my $was = scalar @{ _matching($before, $args->{ip}) };
 
 	my $result = $ctx->{run}->($ctx, $LIMIT{deadline_mutate},
@@ -1073,8 +1205,8 @@ sub _remove_entry {
 	my $failure = _child_failed($result);
 	return _fail('E_BACKEND', "csf $flag failed: $failure") if $failure;
 
-	my ($after) = _entries($ctx, $key);
-	return _fail('E_BACKEND', 'the list could not be re-read after the change') unless $after;
+	my ($after, $after_why) = _entries($ctx, $key);
+	return _entries_failure('the list, re-read after the change', $after_why) unless $after;
 	my $left = _matching($after, $args->{ip});
 	my $removed = $was - scalar(@$left);
 	$removed = 0 if $removed < 0;
@@ -1096,8 +1228,8 @@ sub op_unallow { my ($ctx, $args) = @_; return _remove_entry($ctx, $args, '-ar',
 ###############################################################################
 sub op_tempdeny {
 	my ($ctx, $args) = @_;
-	my ($before) = _entries($ctx, 'tempban');
-	return _fail('E_BACKEND', 'the temporary ban list could not be read') unless $before;
+	my ($before, $why) = _entries($ctx, 'tempban');
+	return _entries_failure('the temporary ban list', $why) unless $before;
 	my $was = scalar @{ _matching($before, $args->{ip}, 1) };
 
 	my @argv = ($ctx->{path}{csf_bin}, '-td', $args->{ip}, $args->{ttl});
@@ -1108,8 +1240,8 @@ sub op_tempdeny {
 	my $failure = _child_failed($result);
 	return _fail('E_BACKEND', "csf -td failed: $failure") if $failure;
 
-	my ($after) = _entries($ctx, 'tempban');
-	return _fail('E_BACKEND', 'the temporary ban list could not be re-read') unless $after;
+	my ($after, $after_why) = _entries($ctx, 'tempban');
+	return _entries_failure('the temporary ban list, re-read after the change', $after_why) unless $after;
 	my $rows = _matching($after, $args->{ip}, 1);
 
 	if (scalar(@$rows) > $was) {
@@ -1149,8 +1281,8 @@ sub op_tempdeny {
 ###############################################################################
 sub op_temprm {
 	my ($ctx, $args) = @_;
-	my ($before) = _entries($ctx, 'tempban');
-	return _fail('E_BACKEND', 'the temporary ban list could not be read') unless $before;
+	my ($before, $why) = _entries($ctx, 'tempban');
+	return _entries_failure('the temporary ban list', $why) unless $before;
 	my $was = scalar @{ _matching($before, $args->{ip}, 1) };
 
 	my $result = $ctx->{run}->($ctx, $LIMIT{deadline_mutate},
@@ -1158,8 +1290,8 @@ sub op_temprm {
 	my $failure = _child_failed($result);
 	return _fail('E_BACKEND', "csf -trd failed: $failure") if $failure;
 
-	my ($after) = _entries($ctx, 'tempban');
-	return _fail('E_BACKEND', 'the temporary ban list could not be re-read') unless $after;
+	my ($after, $after_why) = _entries($ctx, 'tempban');
+	return _entries_failure('the temporary ban list, re-read after the change', $after_why) unless $after;
 	my $removed = $was - scalar @{ _matching($after, $args->{ip}, 1) };
 	$removed = 0 if $removed < 0;
 	return { ok => 1, detail => "removed $removed",
@@ -1172,8 +1304,8 @@ sub op_temprm {
 sub op_list {
 	my ($ctx, $args) = @_;
 	my $key = $WHICH_FILE{ $args->{which} };
-	my ($set) = _entries($ctx, $key);
-	return _fail('E_BACKEND', 'the list could not be read') unless $set;
+	my ($set, $why) = _entries($ctx, $key);
+	return _entries_failure('the list', $why) unless $set;
 
 	my $filter = defined $args->{filter} ? $args->{filter} : '';
 	$filter =~ tr/A-Z/a-z/;
@@ -1358,10 +1490,10 @@ sub _scan {
 		push @rules, @$found;
 	}
 
-	my ($deny) = _entries($ctx, 'csf_deny');
-	return (undef, _fail('E_BACKEND', 'csf.deny could not be read')) unless $deny;
-	my ($temp) = _entries($ctx, 'tempban');
-	return (undef, _fail('E_BACKEND', 'the temporary ban list could not be read')) unless $temp;
+	my ($deny, $deny_why) = _entries($ctx, 'csf_deny');
+	return (undef, _entries_failure('the deny list', $deny_why)) unless $deny;
+	my ($temp, $temp_why) = _entries($ctx, 'tempban');
+	return (undef, _entries_failure('the temporary ban list', $temp_why)) unless $temp;
 
 	my %configured;
 	$configured{ $P->can('ip_key')->($_->{ip}) } = 1 for @{ $deny->{rows} };
@@ -1549,9 +1681,13 @@ sub op_reconcile_fix {
 ###############################################################################
 sub op_restart {
 	my ($ctx, $args) = @_;
-	my $wait = _restart_gate($ctx);
-	return _fail('E_BUSY', "a restart ran less than $LIMIT{restart_interval} seconds ago; try again in $wait seconds")
-		if $wait > 0;
+	my $claim = _restart_claim($ctx);
+	return _fail('E_UNAVAILABLE',
+		'the helper cannot record when it last restarted csf, so it cannot hold the minimum interval; check the disk and the mode of /var/run/csf-ui')
+		if $claim->{unavailable};
+	return _fail('E_BUSY',
+		"a restart ran less than $LIMIT{restart_interval} seconds ago; try again in $claim->{wait} seconds")
+		if $claim->{wait} > 0;
 
 	my $started = Time::HiRes::time();
 	my $result = $ctx->{run}->($ctx, $LIMIT{deadline_restart}, $ctx->{path}{csf_bin}, '-r');
@@ -1570,8 +1706,6 @@ sub op_restart {
 	my $refusal = _recognised_refusal($output);
 	return { ok => 0, error => 'E_REFUSED', message => $refusal, detail => 'refused by csf' }
 		if defined $refusal;
-
-	_restart_mark($ctx);
 
 	my @warnings;
 	for my $line (split(/\n/, $output)) {
@@ -1648,10 +1782,19 @@ sub _auth_store {
 sub op_authenticate {
 	my ($ctx, $args, $peer) = @_;
 
+	my $rate = _rate_admit($ctx, 'auth', $LIMIT{auth_per_minute});
+	return _fail('E_UNAVAILABLE',
+		'the helper cannot maintain its rate counter, so it cannot bound password guessing; check the disk and the mode of /var/run/csf-ui')
+		if $rate->{unavailable};
 	return _fail('E_BUSY', 'too many authentication requests; try again shortly')
-		unless _rate_admit($ctx, 'auth', $LIMIT{auth_per_minute});
+		unless $rate->{admit};
+
+	my $slot = _auth_slot_take($ctx);
+	return _fail('E_UNAVAILABLE',
+		'the helper cannot maintain its rate counter, so it cannot bound password guessing; check the disk and the mode of /var/run/csf-ui')
+		if $slot->{unavailable};
 	return _fail('E_BUSY', 'too many authentication requests are in flight; try again shortly')
-		unless _auth_slot_take($ctx);
+		unless $slot->{admit};
 
 	my $result = eval { _authenticate_inner($ctx, $args) };
 	my $error = $@;
@@ -1665,6 +1808,9 @@ sub _authenticate_inner {
 	my $user = $args->{user};
 
 	my $lock = _auth_state_check($ctx, $user);
+	return { ok => 0, error => 'E_UNAVAILABLE', detail => 'counter unavailable',
+		message => 'the authentication failure counter cannot be read, so this helper cannot bound password guessing; check /var/lib/csf-ui/helper' }
+		if $lock->{unavailable};
 	if ($lock->{locked}) {
 		# Answered without running crypt() at all, which is what makes the
 		# counter a CPU control as well as an anti-guessing one.
@@ -1690,7 +1836,30 @@ sub _authenticate_inner {
 			detail => 'unknown algo' };
 	}
 
-	my ($verdict, $unavailable) = $ctx->{auth_verify}->($ctx, $hash, $args->{pass});
+	# §7: a wall-clock deadline on the hashing itself. It is slack today, because
+	# R17's placeholder never hashes - but records carry their own round count
+	# (§5.14), so a store copied from another machine can cost more than this
+	# deployment ever chose, and without this the cost has no ceiling at all while
+	# holding one of two auth slots and one of sixteen children.
+	my ($verdict, $unavailable);
+	my $broke = '';
+	eval {
+		local $SIG{ALRM} = sub { die "the password verifier exceeded its deadline\n" };
+		alarm($ctx->{deadline_auth}) if $ctx->{deadline_auth};
+		($verdict, $unavailable) = $ctx->{auth_verify}->($ctx, $hash, $args->{pass});
+		1;
+	} or $broke = ($@ || "the password verifier failed\n");
+	alarm(0) if $ctx->{deadline_auth};
+
+	if ($broke) {
+		# The counter is untouched: a verifier that never answered has not told us
+		# the password was wrong.
+		chomp $broke;
+		return { ok => 0, error => 'E_BACKEND',
+			message => 'the password could not be verified within its deadline',
+			detail => $P->can('sanitise')->($broke, 200) };
+	}
+
 	unless (defined $verdict) {
 		return { ok => 0, error => 'E_UNAVAILABLE', message => $unavailable,
 			detail => 'verifier unavailable' };
@@ -1708,6 +1877,11 @@ sub _authenticate_inner {
 	}
 
 	my $state = _auth_state_fail($ctx, $user);
+	# The verdict is withheld rather than delivered uncounted: an oracle nobody is
+	# counting is the thing §5.14 exists to prevent.
+	return { ok => 0, error => 'E_UNAVAILABLE', detail => 'counter unavailable',
+		message => 'the authentication failure counter cannot be written, so this helper cannot bound password guessing; check /var/lib/csf-ui/helper' }
+		if $state->{unavailable};
 	return { ok => 1, detail => ($state->{locked} ? 'bad, now locked' : 'bad'), data => {
 		ok => _false(), role => undef,
 		locked => _bool($state->{locked}),
@@ -1819,6 +1993,7 @@ sub open_socket {
 	}
 
 	listen($listener, $LIMIT{backlog}) or die "csf-ui-helper: listen: $!\n";
+	_set_cloexec($listener);
 	return $listener;
 }
 
@@ -1919,6 +2094,11 @@ sub main {
 			next if $!{EINTR};
 			next;
 		}
+		# Before anything else is done with it: csf and iptables are exec'd as
+		# root from a child of this process and must not inherit the peer's
+		# socket. A long-lived grandchild holding it would also keep the peer's
+		# connection from reaching EOF after this helper has answered and exited.
+		_set_cloexec($connection);
 
 		my ($problem, $peer, $reason, $silent) = check_peer($ctx, $connection);
 		if ($problem) {

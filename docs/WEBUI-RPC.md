@@ -910,7 +910,7 @@ Runs `('/usr/sbin/csf','-r')`, deadline 120 s.
 
 | Situation | Result |
 |---|---|
-| fewer than 10 seconds since the last successful restart (§7) | `E_BUSY` |
+| fewer than 10 seconds since the last restart **attempt** (§7) | `E_BUSY` |
 | `csf` is disabled (`/etc/csf/csf.disable`) | `E_REFUSED` — `-r` is not exempt from that check (`csf.pl:93`), and `csf -e` is not on this list |
 | `csf` has an unresolved start error (`/etc/csf/csf.error`) | **runs** — `csf.pl:104` exempts `-r`, and this operation is how that state is cleared (§5.0.5) |
 | the csf lock is held ("csf is being restarted, try again in a moment") | `E_BUSY` |
@@ -941,6 +941,8 @@ up treating a backend failure as a login.
 | wrong password, **or no such user** | `{"ok":false,"role":null,"locked":false,"retry_after":0}` |
 | the username is locked out | `{"ok":false,"role":null,"locked":true,"retry_after":287}` |
 | the store is missing, unreadable, not a regular file, a symlink, not owned by uid 0, group/other-readable, or contains no accounts | `E_UNAVAILABLE` with the remedy |
+| the failure counter cannot be read or written, so the attempt cannot be counted | `E_UNAVAILABLE` — **no verdict is returned**, because an oracle nobody is counting is what the counter exists to prevent, and the counter is not advanced |
+| verification exceeds the 10 s deadline in §7, or the verifier fails | `E_BACKEND` — **the counter is untouched**: a verifier that never answered has not said the password was wrong |
 | the user's record carries an `algo` this helper cannot verify | `E_UNAVAILABLE` naming the algorithm and the remedy — **and the failure counter is not incremented** |
 | `user` or `pass` fails §4.9 / §4.10 | `E_ARG`, naming the field and the rule only |
 
@@ -1158,11 +1160,28 @@ caller says — so they hold for a hostile caller.
 | Child deadline — `restart` | 120 s | `SIGKILL`, `E_BACKEND` (with the caveat in §5.13) |
 | Bytes read from any child | 65536 | kill, `E_BACKEND` |
 | Mutating operations, all callers combined | 120 per rolling 60 s | `E_BUSY` |
-| Minimum interval between successful `restart`s | 10 s | `E_BUSY` |
+| Minimum interval between `restart` **attempts** | 10 s | `E_BUSY` |
 | Concurrent `authenticate` children | 2 | `E_BUSY` |
 | `authenticate` calls, all callers combined | 30 per rolling 60 s | `E_BUSY` |
 | Consecutive `authenticate` failures per username | 5, then locked 300 s | `data.locked:true`, no `crypt()` run (§5.14) |
 | Wall-clock deadline — `authenticate` (hashing runs in the connection child, not a `csf` child) | 10 s | `E_BACKEND` |
+
+**A limit that cannot be counted is not a limit, so a counter that cannot be
+maintained refuses the operation with `E_UNAVAILABLE`** — not `E_BUSY`, which
+would say "transient, retry", and above all not success. If the state file cannot
+be opened, locked or rewritten — a full disk, a read-only remount, a wrong mode —
+then the mutation cap, the `authenticate` caps and the restart interval have all
+stopped applying, and the only safe answer is to say so and refuse (G3). The
+helper writes one line to its audit log and one to stderr each time, because the
+condition is otherwise invisible: without it an operator sees a login form with
+no lockout and no diagnostic.
+
+This is also why the restart interval is **claimed before `csf -r` runs** rather
+than recorded after it succeeds, which is the one place the rows above are
+stricter than an earlier draft: a mark written afterwards cannot refuse anything
+when the write does not land, and it is not atomic against a second caller. The
+cost is that a restart which fails also holds the interval — the right way round
+for a firewall that has just failed to restart.
 
 Rate-counter state is `/var/run/csf-ui/rate.state` and the per-username failure
 counter is `/var/lib/csf-ui/helper/authfail.state` (§5.14). **Both files are

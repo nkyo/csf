@@ -35,8 +35,9 @@ use lib "$FindBin::Bin/..", "$FindBin::Bin/../ui-src/lib";
 
 use File::Temp qw(tempdir);
 use Socket ();
+use Fcntl ();
 use JSON::Tiny ();
-use Test::More tests => 238;
+use Test::More tests => 279;
 
 my $HELPER_PATH = "$FindBin::Bin/../ui-src/bin/csf-ui-helper";
 my $PROTO_PATH  = "$FindBin::Bin/../ui-src/lib/ConfigServer/UI/Proto.pm";
@@ -676,6 +677,214 @@ my $IPTABLES_OUT = join("\n",
 }
 
 ###############################################################################
+# CRITICAL 1 - a counter that did not persist has not been applied
+#
+# The reviewer's reproduction: with the state file present but its directory
+# unwritable, twelve wrong passwords never locked and two hundred mutating calls
+# produced no E_BUSY. Both counters went on answering as though they were still
+# counting. These tests fail against that code and pass against this one.
+###############################################################################
+SKIP: {
+	skip 'root writes through a read-only directory mode, so this cannot be staged as root', 12
+		if $> == 0;
+
+	# --- the §7 mutation cap ---
+	my $fx = fixture();
+	$fx->{ctx}{run} = csf_stub($fx);
+	break_state_write($fx, 'rate_state');
+
+	my $stderr = '';
+	my $response;
+	{
+		local *STDERR;
+		open(STDERR, '>', \$stderr) or die;
+		$response = req($fx, 'deny', { ip => '198.51.100.90', note => 'x' });
+	}
+	is($response->{error}, 'E_UNAVAILABLE',
+		'a mutating request is refused when the rate counter cannot be persisted');
+	like($response->{message}, qr/rate counter/, 'and the message says which limit cannot be held');
+	is(scalar @{ $fx->{calls} }, 0, 'and csf is not run, so the cap is not merely unreported but unbreached');
+	like($stderr, qr/rate\.state cannot be maintained/,
+		'the operator gets a diagnostic instead of silence');
+	like(_read($fx->{path}{audit_log}), qr/cannot be maintained/,
+		'and root\'s own log records it once');
+
+	# --- §5.14's lockout ---
+	$fx = fixture(users => "alice:6:\$6\$salt\$hash:admin:1757548800\n");
+	$fx->{ctx}{auth_verify} = sub { return (0, undef) };
+	break_state_write($fx, 'authfail');
+
+	my @verdicts;
+	{
+		local *STDERR;
+		open(STDERR, '>', \$stderr) or die;
+		push @verdicts, req($fx, 'authenticate', { user => 'alice', pass => 'wrong' }) for 1 .. 12;
+	}
+	is(scalar(grep { ($_->{error} || '') eq 'E_UNAVAILABLE' } @verdicts), 12,
+		'every guess is refused when the failure counter cannot be written');
+	is(scalar(grep { $_->{data} } @verdicts), 0,
+		'and not one of them comes back as a verdict, which is what made it an uncounted oracle');
+	is(_authfail_count($fx, 'alice'), 0, 'nothing was recorded, which is exactly why nothing was answered');
+
+	# --- §5.13's restart interval ---
+	$fx = fixture();
+	$fx->{ctx}{run} = sub { return { exit => 0, status => 0, output => '' } };
+	break_state_write($fx, 'rate_state');
+	{
+		local *STDERR;
+		open(STDERR, '>', \$stderr) or die;
+		$response = req($fx, 'restart', {});
+	}
+	is($response->{error}, 'E_UNAVAILABLE',
+		'restart is refused when the interval between restarts cannot be recorded');
+
+	# --- and the same guard covers a file that cannot even be opened ---
+	$fx = fixture();
+	$fx->{ctx}{run} = csf_stub($fx);
+	chmod 0500, "$fx->{dir}/run";
+	{
+		local *STDERR;
+		open(STDERR, '>', \$stderr) or die;
+		$response = req($fx, 'deny', { ip => '198.51.100.91', note => 'x' });
+	}
+	is($response->{error}, 'E_UNAVAILABLE', 'a state file that cannot be created refuses the request too');
+	chmod 0700, "$fx->{dir}/run";
+
+	# --- the interval is claimed under the lock that checks it ---
+	$fx = fixture();
+	$fx->{ctx}{run} = sub { return { exit => 0, status => 0, output => '' } };
+	ok(${ req($fx, 'restart', {})->{ok} }, 'a restart that runs claims the interval');
+	is(req($fx, 'restart', {})->{error}, 'E_BUSY', 'and the next one inside it is refused');
+}
+
+###############################################################################
+# IMPORTANT 2 - no caller can price their own attempt out of the audit log
+###############################################################################
+{
+	my $fx = fixture();
+	my %args = map { sprintf('k%06d', $_) => 1 } 1 .. 5458;
+	my $request = { op => 'deny', id => 't2', args => \%args };
+	my $line = ConfigServer::UI::Proto::encode($request);
+	cmp_ok(length($line), '>', 60000, 'the probe is a legal request line near the 64 KiB cap');
+
+	my $response = $H->can('handle_request')->($fx->{ctx}, $request, { uid => 1000, pid => 4242 });
+	is($response->{error}, 'E_ARG', 'it is rejected on its first unknown key');
+
+	my $log = _read($fx->{path}{audit_log});
+	ok(length($log), 'and the audit log exists, which it did not before');
+	my @lines = split(/\n/, $log);
+	is(scalar @lines, 1, 'with exactly one line');
+	my $entry = JSON::Tiny::decode_json($lines[0]);
+	is($entry->{id}, 't2', 'naming the request that was made');
+	is($entry->{error}, 'E_ARG', 'and how it was answered');
+	cmp_ok(scalar(keys %{ $entry->{args} }), '<=', 17, 'the logged arguments are capped in number');
+	ok(defined $entry->{args}{_unlogged}, 'and say how many were left out rather than dropping them silently');
+
+	# A key long enough to blow the line on its own is capped too.
+	$fx = fixture();
+	$H->can('handle_request')->($fx->{ctx},
+		{ op => 'deny', id => 't3', args => { ('k' x 60000) => 1 } }, { uid => 1000, pid => 4242 });
+	@lines = split(/\n/, _read($fx->{path}{audit_log}));
+	is(scalar @lines, 1, 'a single enormous key still leaves a line');
+	$entry = JSON::Tiny::decode_json($lines[0]);
+	my ($logged) = grep { $_ ne '_unlogged' } keys %{ $entry->{args} };
+	cmp_ok(length($logged), '<=', 64, 'with the key itself capped');
+
+	# And if an entry is somehow still too large, a minimal line goes out.
+	$fx = fixture();
+	ok($H->can('audit')->($fx->{ctx}, {
+		ts => $NOW, id => 't4', op => 'deny', peer => { uid => 1000, pid => 1 },
+		ok => \0, error => 'E_ARG', detail => 'x', args => { pad => 'y' x 70000 },
+	}), 'an oversize entry is still written');
+	$entry = JSON::Tiny::decode_json((split(/\n/, _read($fx->{path}{audit_log})))[0]);
+	is($entry->{id}, 't4', 'as a minimal line naming the request');
+	is($entry->{detail}, 'the arguments were too large to log', 'that says why it is minimal');
+
+	# A large but legal entry is written whole - a short write would truncate it
+	# and the next entry would concatenate onto the remains.
+	$fx = fixture();
+	$H->can('audit')->($fx->{ctx}, { ts => $NOW, id => 't5', detail => 'z' x 60000 });
+	$H->can('audit')->($fx->{ctx}, { ts => $NOW, id => 't6', detail => 'small' });
+	@lines = split(/\n/, _read($fx->{path}{audit_log}));
+	is(scalar @lines, 2, 'two entries are two lines');
+	is(JSON::Tiny::decode_json($lines[1])->{id}, 't6', 'and the second parses on its own');
+}
+
+###############################################################################
+# IMPORTANT 3 - §7's wall-clock deadline on authenticate
+#
+# Slack today because R17's placeholder never hashes. It stops being slack the
+# moment Task 3 lands a real verify(), and a record carries its own round count,
+# so the cost is not this deployment's to choose.
+###############################################################################
+{
+	my $fx = fixture(users => "alice:6:\$6\$salt\$hash:admin:1757548800\n");
+	$fx->{ctx}{deadline_auth} = 1;
+	$fx->{ctx}{auth_verify} = sub { sleep 10; return (1, undef) };
+
+	my $started = time();
+	my $response = req($fx, 'authenticate', { user => 'alice', pass => 'x' });
+	my $elapsed = time() - $started;
+
+	is($response->{error}, 'E_BACKEND', 'a verifier that outruns its deadline is a backend failure');
+	cmp_ok($elapsed, '<', 8, 'and it is cut off rather than waited on');
+	unlike($response->{message}, qr/x/, 'the message says nothing about the password');
+	is(_authfail_count($fx, 'alice'), 0,
+		'and the counter is untouched: a verifier that never answered did not say the password was wrong');
+
+	$fx = fixture(users => "alice:6:\$6\$salt\$hash:admin:1757548800\n");
+	$fx->{ctx}{deadline_auth} = 5;
+	$fx->{ctx}{auth_verify} = sub { die "the verifier exploded\n" };
+	$response = req($fx, 'authenticate', { user => 'alice', pass => 'x' });
+	is($response->{error}, 'E_BACKEND', 'a verifier that dies is a backend failure, not an internal one');
+	is(_authfail_count($fx, 'alice'), 0, 'and does not count as a wrong password either');
+}
+
+###############################################################################
+# R21 - what the helper execs, and what it reads
+###############################################################################
+{
+	# Perl sets close-on-exec above $^F, so a socketpair made the ordinary way
+	# already has it. Raise $^F and it does not - which is the case the explicit
+	# call exists for, and the one this asserts.
+	my ($near, $far);
+	{
+		local $^F = 255;
+		socketpair($near, $far, Socket::AF_UNIX(), Socket::SOCK_STREAM(), Socket::PF_UNSPEC()) or die $!;
+	}
+	is((fcntl($near, Fcntl::F_GETFD(), 0) & Fcntl::FD_CLOEXEC()), 0,
+		'a descriptor Perl did not mark is inherited across exec');
+	ok($H->can('_set_cloexec')->($near), 'the helper marks it itself');
+	isnt((fcntl($near, Fcntl::F_GETFD(), 0) & Fcntl::FD_CLOEXEC()), 0,
+		'so nothing it execs as root inherits the peer connection');
+
+	SKIP: {
+		skip 'needs a perl to run as the grandchild', 1 unless -x $^X;
+		my $fx = fixture();
+		my $result = $H->can('run_argv')->($fx->{ctx}, 10, $^X, '-e',
+			'print open(my $d, "<&=" . $ARGV[0]) ? "open" : "closed"', fileno($near));
+		is($result->{output}, 'closed', 'measured: the exec\'d grandchild cannot reach that descriptor');
+	}
+	close $near;
+	close $far;
+
+	# A file this helper slurps cannot be grown until it exhausts root's memory.
+	my $fx = fixture();
+	my $previous = $ConfigServer::UI::Helper::MAX_FILE_BYTES;
+	$ConfigServer::UI::Helper::MAX_FILE_BYTES = 1024;
+	_write($fx->{path}{csf_deny}, "198.51.100.1\n" x 200);
+
+	my $response = req($fx, 'list', { which => 'deny' });
+	is($response->{error}, 'E_BACKEND', 'a block list past the cap is refused');
+	like($response->{message}, qr/larger than this helper will read/, 'with a message that says what to do');
+	$response = req($fx, 'counts', {});
+	is($response->{error}, 'E_BACKEND', 'and counts refuses it too rather than reporting a partial read');
+	$ConfigServer::UI::Helper::MAX_FILE_BYTES = $previous;
+	$response = req($fx, 'list', { which => 'deny' });
+	ok(${ $response->{ok} }, 'under the cap the same file reads normally');
+}
+
+###############################################################################
 # Section 8 audit
 ###############################################################################
 {
@@ -815,12 +1024,14 @@ sub fixture {
 	my (%option) = @_;
 	my $dir = tempdir(CLEANUP => 1);
 
+	mkdir "$dir/run";
+	mkdir "$dir/helper";
 	my %path = (
 		socket_dir  => "$dir/run",
 		socket      => "$dir/run/helper.sock",
-		rate_state  => "$dir/rate.state",
+		rate_state  => "$dir/run/rate.state",
 		helper_dir  => "$dir/helper",
-		authfail    => "$dir/authfail.state",
+		authfail    => "$dir/helper/authfail.state",
 		audit_log   => "$dir/audit.log",
 		users       => "$dir/users",
 		csf_bin     => "$dir/csf",
@@ -899,6 +1110,19 @@ sub csf_stub {
 		}
 		return { exit => 0, status => 0, output => '' };
 	};
+}
+
+# Makes _write_state fail the way a full disk, a read-only remount or a wrong
+# mode on the state directory does: the file itself opens and locks, but the
+# temp file the atomic rewrite needs cannot be created beside it.
+sub break_state_write {
+	my ($fx, $which) = @_;
+	my $path = $fx->{path}{$which};
+	_write($path, '{}');
+	my $dir = $path;
+	$dir =~ s{/[^/]+$}{};
+	chmod 0500, $dir;
+	return $dir;
 }
 
 sub req {
