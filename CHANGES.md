@@ -37,6 +37,53 @@ line is added below the original notice; the original stays intact.
 
 ### Unreleased
 
+#### Task 6 fix round 5 — invert the attribute rule, model the script-data escape states, correct a comment that lied about its own guard
+
+- **2026-09-11** — Re-review of fix round 4 verdicted the rewrite sound and both R45 and R46
+  ADDRESSED, re-running all 87 corpus rows plus every earlier review's inputs with no regression,
+  and checking performance (200k `<`, 200k `<!--`, a 20k-attribute tag, a 200KB script body: all
+  under 0.1s). Three findings remained.
+
+  **R47 — the `href`/`src`/`action` enumeration, the last regex-era artifact in the file, is
+  reachable by ordinary markup.** `<button formaction="/api/unblock?ip={{id}}">` is simply how the
+  Block/Unblock screen's two-submit form gets written, and a guarded `action=` two lines above it
+  teaches exactly the wrong lesson. Widening the list invites the next omission — `xlink:href`,
+  `<object data>`, `poster`, `srcset`, `ping`, `background` were all already known, `style=` was
+  forbidden by `Render.pm`'s own header comment yet went unflagged, and `srcdoc=` is worse than all
+  of them, since an `<iframe srcdoc="{{v}}">` re-parses the escaped markup as a document. So the
+  rule was **inverted**, exactly as R42 inverted the raw marker: a quoted attribute value holding
+  `{{` is reported unless the attribute's name is on a closed allowlist of provably inert names
+  (`alt`, `class`, `for`, `id`, `label`, `name`, `placeholder`, `title`, `value`, plus the `aria-`
+  and `data-` prefixes — the hyphen matters, since bare `data` is a URL on `<object>`). The test for
+  admission is stated in the file: the value must never be read as a URL, as CSS, as JavaScript or
+  as markup **in any element**, not merely in the element a screen happens to use it on. `on*` and
+  `href`/`src`/`action` keep their own finding text for the diagnostic, not for the decision.
+
+  **R48 — `<script>`'s escaped and double-escaped tokenizer states were not modelled.**
+  `<script><!--<script>x</script>{{v}}</script>` leaves `{{v}}` as live JavaScript source: `<!--`
+  enters SCRIPT DATA ESCAPED, a following `<script` enters SCRIPT DATA DOUBLE ESCAPED, and in that
+  state `</script>` does not end the element — it only drops back to escaped. The
+  `document.write("<!--<script")` form reaches the same machine. This is a missing *state* rather
+  than a missing name in a list, so R47 does not reach it. `_scan_script_data()` now walks all
+  three states; `<style>` is RAWTEXT, which has no escape states, and keeps the simpler scan.
+
+  **R49 — a comment that misdescribed its own guard,** the fourth time this project has hit one.
+  The note on RCDATA elements (`<title>`, `<textarea>`) claimed the blindness over-reports and so
+  fails closed. It does both: `<textarea><div title="</textarea><button onclick='{{v}}'>">…` is
+  **not** flagged, because a browser ends the textarea at the `</textarea>` inside that quoted
+  value — RCDATA has no notion of attributes — while the scanner is inside an inert `title=` at that
+  point. Verified against the real `render()`, which emits the live `onclick`. Per the round-5
+  brief the behaviour is unchanged and only the sentence is corrected; both directions are now
+  described and both are pinned by tests so the description cannot drift again. The unclosed-tag
+  over-report was judged the right trade by the reviewer and is kept.
+
+  No change to `Render.pm`'s escaping behaviour, to the screens, or to the raw-marker allowlist's
+  contents. All 113 corpus inputs re-run through the real scanner and the real `render()`;
+  the 94 rows inherited from round 4 reproduced identically except for two additive findings on
+  inputs that were already flagged. Performance re-checked including the new script states (12k
+  nested `<script>` pairs, 50k `<!--` inside one body): worst case 0.12s. `t/50-render.t`:
+  153 → 202 assertions. Whole suite: **1609 tests** (was 1560), `prove -I. t/`.
+
 #### Task 6 fix round 4 — the context scanner is no longer built out of regular expressions
 
 - **2026-09-11** — Re-review of fix round 3 found R43's fix unsound: scoping every attribute check

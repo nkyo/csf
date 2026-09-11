@@ -47,7 +47,7 @@ use lib "$FindBin::Bin/..", "$FindBin::Bin/../ui-src/lib";
 
 use File::Find ();
 use File::Temp qw(tempdir);
-use Test::More tests => 153;
+use Test::More tests => 202;
 
 require_ok('ConfigServer::UI::Render');
 
@@ -364,6 +364,16 @@ ok($@, 'escape_html: a coderef dies');
 #               checks a region of just ' title="Count ' and the onclick
 #               went unseen. Confirmed live: not flagged, and render()
 #               emits a real onclick="alert(1)".
+#   round 4  regexes replaced by the scan below
+#            -> R47: the last regex-era artifact, the href/src/action
+#               ENUMERATION, left formaction=, style=, srcdoc= and every
+#               URL attribute nobody had listed unguarded;
+#            -> R48: <script>'s escaped and double-escaped states were
+#               not modelled, so "</script>" was believed to end a body
+#               that a browser keeps open.
+#   round 5  attribute rule inverted to an allowlist (R47); the three
+#            script-data states modelled (R48); the RCDATA note
+#            corrected to describe what it actually does (R49).
 #
 # That is not three careless rounds. HTML is not a regular language, so
 # "where am I in this document" is not a question a regular expression
@@ -420,8 +430,22 @@ ok($@, 'escape_html: a coderef dies');
 #                           a new one - onmouseover is one space away
 #                           (R40). Any attribute, not only the enumerated
 #                           ones - without quotes they are all injectable.
-#   quoted on*=             the value is JavaScript source, not text.
-#   quoted href/src/action= the value is a URL, and "javascript:" is one.
+#   quoted value, any       R47: inverted. A quoted value holding {{ is
+#   attribute NOT on the    reported unless the attribute's name is on
+#   inert allowlist         %INERT_ATTRIBUTES below, because the set of
+#                           dangerous attributes cannot be enumerated -
+#                           on*= is JavaScript, href/src/action= is a URL
+#                           and "javascript:" is one, style= is CSS,
+#                           srcdoc= is a whole nested document, and
+#                           formaction/xlink:href/poster/srcset/ping/
+#                           <object data> are URLs nobody had listed. on*
+#                           and href/src/action keep their own finding
+#                           text for the diagnostic, not for the
+#                           decision.
+#   a <script> body in ANY  R48: <script>, unlike <style>, has three
+#   of its three states     tokenizer states, and "</script>" ends the
+#                           element in only two of them. See
+#                           _scan_script_data().
 #
 # Deliberately NOT reported, each with its reason:
 #
@@ -443,24 +467,46 @@ ok($@, 'escape_html: a coderef dies');
 #                           same quoting rules anyway, so a '>' inside
 #                           one of them cannot desynchronise the scan.
 #                           An end tag's NAME is still reported (R46).
-#   quoted value, ordinary  escape_html() covers it: that is the whole
-#   attribute               point of the escaping, and flagging it would
-#                           block correct work (R43's lesson).
+#   quoted value on an      escape_html() covers it and the name is on
+#   INERT attribute         %INERT_ATTRIBUTES: that is the whole point of
+#                           the escaping, and flagging it would block
+#                           correct work (R43's lesson). Any OTHER
+#                           quoted attribute is now reported - see R47
+#                           below.
 #
 # Known and accepted, stated here rather than left for a re-review:
 #   - RCDATA elements (<title>, <textarea>) are scanned as ordinary
-#     markup, so markup written inside one is parsed as tags here but is
-#     plain text to a browser. That over-reports (fails closed) and no
-#     template in this tree does it.
+#     markup, while a browser treats their content as text that ends at
+#     the first matching end tag, wherever it falls. R49: this was
+#     previously described here as an over-report that "fails closed".
+#     That was wrong, and a comment that misdescribes its own guard is
+#     worse than no comment - it is the fourth time this project has hit
+#     one. The disagreement runs in BOTH directions:
+#
+#       over-reports  <textarea><button onclick="{{v}}"></textarea> is
+#                     flagged though a browser renders it as text.
+#       under-reports <textarea><div title="</textarea><button
+#                     onclick='{{v}}'>">x</div></textarea> is NOT
+#                     flagged. A browser ends the textarea at the
+#                     </textarea> inside that quoted value - RCDATA has
+#                     no notion of attributes - so the <button> after it
+#                     is real markup and the onclick is live. The
+#                     scanner is inside a quoted attribute value at that
+#                     point and sees only an inert title=. Verified
+#                     against the real render(), which emits
+#                     onclick='alert(1)'.
+#
+#     Left as behaviour by the round-5 brief's explicit instruction
+#     ("fix the sentence, not the code"), and no template in this tree
+#     writes markup inside an RCDATA element. Modelling RCDATA is a
+#     contained follow-on - two element names handled the way <style>
+#     already is - and it would close both directions at once.
 #   - a tag with no closing '>' at all is still reported, though a
 #     browser discards it. Over-reporting again, and such a template is
 #     visibly broken anyway.
-#   - the URL-bearing set is an enumeration (href/src/action) and
-#     therefore incomplete by construction - formaction, xlink:href and
-#     friends are not in it. Left exactly as rounds 1-3 had it rather
-#     than widened on a guess; the real rule this codebase follows is
-#     that a URL in a template is a literal it wrote, never a
-#     substituted value.
+#   - (was: "the URL-bearing set is an enumeration and therefore
+#     incomplete by construction". R47 removed that limitation by
+#     inverting the rule - see %INERT_ATTRIBUTES.)
 ###############################################################################
 
 # _find_unsafe_placeholders($html) -> @findings
@@ -539,9 +585,18 @@ sub _find_unsafe_placeholders {
 			# RAW TEXT: a <script>/<style> body is not markup and not
 			# text - it is program source, where none of the five
 			# characters escape_html() handles means anything at all.
-			if ($name eq 'script' || $name eq 'style') {
-				my ($body, $next) = _scan_raw_text($html, $pos, $len, $name);
-				push @findings, "<$name> block" if index($body, '{{') >= 0;
+			if ($name eq 'script') {
+				# SCRIPT DATA, with the escaped and double-escaped
+				# states a <script> body can enter (R48).
+				my ($body, $next) = _scan_script_data($html, $pos, $len);
+				push @findings, '<script> block' if index($body, '{{') >= 0;
+				$pos = $next;
+			}
+			elsif ($name eq 'style') {
+				# RAWTEXT, which has no escape states at all: </style>
+				# always ends a style element.
+				my ($body, $next) = _scan_raw_text($html, $pos, $len, 'style');
+				push @findings, '<style> block' if index($body, '{{') >= 0;
 				$pos = $next;
 			}
 			next;
@@ -661,11 +716,94 @@ sub _report_attribute {
 		push @$findings, "unquoted attribute '$attr'";
 	}
 	elsif ($attr =~ /\Aon[A-Za-z]+\z/i) {
+		# Kept ahead of the allowlist test purely for the diagnostic:
+		# "event-handler attribute" tells a screen author what is wrong
+		# far better than "not on the allowlist" does. The allowlist
+		# below would catch these anyway.
 		push @$findings, "event-handler attribute '$attr'";
 	}
 	elsif ($attr =~ /\A(?:href|src|action)\z/i) {
 		push @$findings, "URL-bearing attribute '$attr'";
 	}
+	elsif (!_attribute_is_inert($attr)) {
+		# R47: everything that is not provably inert. See
+		# %INERT_ATTRIBUTES above for why this is an allowlist.
+		push @$findings, "attribute '$attr' is not on the inert-attribute allowlist";
+	}
+}
+
+###############################################################################
+# R47 (fix round 5, live-verified): the URL-bearing set used to be the
+# enumeration href/src/action, and rounds 1-4 all left it that way
+# because widening it is a guess. The re-review showed the gap is
+# reachable by ORDINARY markup rather than a contrived case:
+#
+#     <button formaction="/api/unblock?ip={{id}}">
+#
+# is simply how the Block/Unblock screen's two-submit form gets written,
+# and action= two lines above it IS guarded - which teaches exactly the
+# wrong lesson to whoever writes that screen. Widening the list invites
+# the next omission: xlink:href, <object data>, poster, srcset are all
+# already known, style= is forbidden by Render.pm's own header comment
+# yet went unflagged, and srcdoc is worse than all of them
+# (<iframe srcdoc="{{v}}"> is script execution from a value the escaping
+# handled perfectly, because the escaped markup is DECODED again when
+# the srcdoc document is parsed).
+#
+# So the rule is inverted, exactly as R42 inverted the raw marker: a
+# blocklist of dangerous things can never be finished, an allowlist of
+# safe ones can. A quoted attribute value holding {{ is reported unless
+# the attribute's name is on the list below.
+#
+# What earns a place on this list: the value must never be interpreted
+# as a URL, as CSS, as JavaScript, or as markup - in ANY element, not
+# merely in the element a screen happens to use it on today. That last
+# clause is what keeps "data" (a URL on <object>) off the list while
+# "data-*" is on it, and it is the question to ask of any future
+# addition.
+#
+#   class, id, for, name   identifiers and IDREFs. Not fetched, not
+#                          evaluated, not parsed as markup.
+#   title, alt, label,     human-readable text. The browser renders
+#   placeholder            them as characters and nothing else.
+#   value                  form-control data, and the documented home of
+#                          the CSRF nonce
+#                          (<input type="hidden" value="{{csrf}}"> - see
+#                          "How a template obtains the CSRF nonce" in
+#                          task-6-report.md). Caveat stated rather than
+#                          hidden: <param value> on an <object> can be a
+#                          URL in the Flash-era plugin model. Nothing in
+#                          this tree uses <param>, and a screen that
+#                          ever did would be doing something this UI has
+#                          no reason to do.
+#   aria-*                 accessibility strings and IDREFs.
+#   data-*                 author data. Inert to the HTML parser by
+#                          definition; it would take a script reading
+#                          and evaluating one to make it dangerous, and
+#                          this UI ships no scripts at all. NOTE the
+#                          hyphen is required - bare "data" is a URL
+#                          attribute on <object> and is NOT on this list.
+#
+# Adding a name here is a one-line change, and it must arrive WITH the
+# screen that needs it and a justification against the paragraph above,
+# in the same commit - the same discipline %RAW_MARKER_ALLOWLIST is held
+# to.
+###############################################################################
+our %INERT_ATTRIBUTES = map { $_ => 1 } qw(
+	alt class for id label name placeholder title value
+);
+our @INERT_ATTRIBUTE_PREFIXES = qw( aria- data- );
+
+sub _attribute_is_inert {
+	my ($attr) = @_;
+	my $lc = lc $attr;
+
+	return 1 if $INERT_ATTRIBUTES{$lc};
+	for my $prefix (@INERT_ATTRIBUTE_PREFIXES) {
+		return 1 if length($lc) > length($prefix)
+			&& index($lc, $prefix) == 0;
+	}
+	return 0;
 }
 
 # _scan_raw_text($html, $p, $len, $name) -> ($body, $pos_of_end_tag)
@@ -688,6 +826,123 @@ sub _scan_raw_text {
 		next unless $after eq '' || $after =~ m{[\s/>]};
 		return (substr($html, $p, $hit - $p), $hit);
 	}
+	return (substr($html, $p), $len);
+}
+
+# _appropriate_end_tag($html, $lt, $len, $name) -> 1 | undef
+#
+# Is the '<' at $lt the start of an end tag that closes $name? HTML5
+# requires the tag name to match and to be followed by whitespace, '/'
+# or '>' - "</scriptx" is still script source to a browser.
+sub _appropriate_end_tag {
+	my ($html, $lt, $len, $name) = @_;
+
+	return undef unless substr($html, $lt, 2) eq '</';
+	return undef unless lc(substr($html, $lt + 2, length $name)) eq $name;
+	my $at = $lt + 2 + length $name;
+	return 1 if $at >= $len;
+	return substr($html, $at, 1) =~ m{[\s/>]} ? 1 : undef;
+}
+
+# _script_tag_name_at($html, $p, $len) -> $pos_after | undef
+#
+# The temporary-buffer comparison HTML5's script-data double escape
+# start/end states perform: read the run of ASCII letters at $p and
+# answer only if it is exactly "script" and is followed by whitespace,
+# '/' or '>'.
+sub _script_tag_name_at {
+	my ($html, $p, $len) = @_;
+
+	my $at = $p;
+	$at++ while $at < $len && substr($html, $at, 1) =~ /\A[A-Za-z]\z/;
+	return undef unless lc(substr($html, $p, $at - $p)) eq 'script';
+	return undef unless $at < $len && substr($html, $at, 1) =~ m{[\s/>]};
+	return $at;
+}
+
+# _scan_script_data($html, $p, $len) -> ($body, $pos_of_end_tag)
+#
+# R48 (fix round 5, live-verified): a <script> body is not one state, it
+# is three, and only the first of them ends at "</script>".
+#
+#     <script><!--<script>x</script>{{v}}</script>
+#
+# leaves {{v}} as live JavaScript source. Walk it: "<!--" in SCRIPT DATA
+# moves to SCRIPT DATA ESCAPED; a "<script" there moves to SCRIPT DATA
+# DOUBLE ESCAPED; and in THAT state "</script>" does not end the element
+# at all - it only drops back to ESCAPED. The element ends at the second
+# "</script>". Confirmed against the real render(): the value lands
+# inside the script element, where none of the five characters
+# escape_html() handles means anything. The document.write("<!--<script")
+# form is the same machine reached a different way.
+#
+# This is a missing tokenizer STATE, not a missing name in a list, which
+# is why R47's inversion does not reach it - no attribute is involved.
+# It is also the reason a scan that tracks context can be finished while
+# a set of patterns cannot: the states are enumerated by the HTML5 spec,
+# and there are exactly these three.
+#
+# Only <script> has them. <style> is RAWTEXT, which has no escape states,
+# so _scan_raw_text() still serves it.
+sub _scan_script_data {
+	my ($html, $p, $len) = @_;
+
+	my $state = 0;          # 0 = script data, 1 = escaped, 2 = double escaped
+	my $i     = $p;
+
+	# Cached position of the next "-->" (any run of two or more dashes
+	# then '>'), which is what returns states 1 and 2 to state 0. Cached
+	# rather than re-searched per iteration so a body full of '<' cannot
+	# make this quadratic; $i only ever moves forward, so the cache is
+	# refreshed at most once per match.
+	my ($dash_at, $dash_end) = (-1, -1);
+
+	while ($i < $len) {
+		if ($state == 0) {
+			my $lt = index($html, '<', $i);
+			last if $lt < 0;
+			if (substr($html, $lt, 4) eq '<!--') { $state = 1; $i = $lt + 4; next; }
+			return (substr($html, $p, $lt - $p), $lt)
+				if _appropriate_end_tag($html, $lt, $len, 'script');
+			$i = $lt + 1;
+			next;
+		}
+
+		if ($dash_at < $i) {
+			pos($html) = $i;
+			if ($html =~ m{-{2,}>}g) { ($dash_at, $dash_end) = ($-[0], pos($html)) }
+			else                     { ($dash_at, $dash_end) = ($len + 1, $len + 1) }
+		}
+
+		my $lt = index($html, '<', $i);
+		if ($lt < 0 || $dash_at < $lt) {
+			last if $dash_at > $len;        # neither: the rest is script
+			$state = 0;                     # "-->" leaves the escaped states
+			$i     = $dash_end;
+			next;
+		}
+
+		my $c = substr($html, $lt + 1, 1);
+		if ($state == 1) {
+			# ESCAPED: a matching </script> DOES end the element here.
+			return (substr($html, $p, $lt - $p), $lt)
+				if $c eq '/' && _appropriate_end_tag($html, $lt, $len, 'script');
+			if ($c =~ /\A[A-Za-z]\z/) {
+				my $after = _script_tag_name_at($html, $lt + 1, $len);
+				if (defined $after) { $state = 2; $i = $after; next; }
+			}
+			$i = $lt + 1;
+			next;
+		}
+
+		# DOUBLE ESCAPED: </script> only drops back to ESCAPED.
+		if ($c eq '/') {
+			my $after = _script_tag_name_at($html, $lt + 2, $len);
+			if (defined $after) { $state = 1; $i = $after; next; }
+		}
+		$i = $lt + 1;
+	}
+
 	return (substr($html, $p), $len);
 }
 
@@ -1086,6 +1341,126 @@ sub _html_files_under {
 	ok((grep { /\{\{\{v\}\}\}/ } @raw_in_comment),
 		'comment safety does NOT extend to the raw marker: {{{v}}} inside a comment is still flagged');
 }
+###############################################################################
+# R47, R48, R49 (fix round 5).
+#
+# R47 inverts the attribute rule: the href/src/action enumeration was the
+# last regex-era artifact in this file, and the re-review showed its gap
+# is reachable by ORDINARY markup - <button formaction="...{{id}}"> is
+# just how the Block/Unblock screen's two-submit form gets written, with
+# a guarded action= two lines above it teaching the wrong lesson. The
+# fix is the one R42 already established for the raw marker: a blocklist
+# of dangerous things can never be finished, an allowlist of safe ones
+# can.
+#
+# R48 models <script>'s escaped and double-escaped states, which is a
+# missing tokenizer STATE rather than a missing name in a list - R47
+# cannot reach it, because no attribute is involved.
+#
+# R49 is a comment fix, not a code fix, per the round-5 brief. The
+# under-report it now describes is pinned below so the description and
+# the behaviour cannot drift apart again - which is exactly how the
+# sentence came to be wrong in the first place.
+###############################################################################
+{
+	# R47 positives. Every one of these is a quoted value that
+	# escape_html() handles perfectly and that is dangerous anyway,
+	# because the value is read as a URL, as CSS, or as a document.
+	my %must_flag = (
+		'R47: formaction (the re-review\'s own example - ordinary form markup)'
+			=> ['<button formaction="/api/unblock?ip={{id}}">Unblock</button>', qr/formaction/],
+		'R47: style, which Render.pm\'s header comment forbids and no earlier round flagged'
+			=> ['<div style="width:{{max}}%"></div>',                  qr/'style'/],
+		'R47: srcdoc, where the escaping is undone by the nested parse'
+			=> ['<iframe srcdoc="{{v}}"></iframe>',                    qr/srcdoc/],
+		'R47: xlink:href'
+			=> ['<use xlink:href="{{evil}}"/>',                        qr/xlink:href/],
+		'R47: bare "data" is a URL on <object> and is NOT covered by the data-* prefix'
+			=> ['<object data="{{evil}}"></object>',                   qr/'data'/],
+		'R47: poster'   => ['<video poster="{{evil}}"></video>',        qr/poster/],
+		'R47: srcset'   => ['<img srcset="{{evil}} 2x">',               qr/srcset/],
+		'R47: ping'     => ['<a ping="{{evil}}" href="/x">x</a>',       qr/ping/],
+		'R47: background' => ['<table background="{{evil}}"></table>',  qr/background/],
+		'R48: the re-review\'s example - </script> does not end a double-escaped body'
+			=> ['<script><!--<script>x</script>{{v}}</script>',        qr/script/],
+		'R48: the document.write("<!--<script") form reaches the same state'
+			=> ['<script>document.write("<!--<script>");{{v}}</script>', qr/script/],
+		'R48: an escaped body that never double-escapes is still a script body'
+			=> ['<script><!-- x -->{{v}}</script>',                    qr/script/],
+		'R48: double escaped, then --> returns to script data, still inside the element'
+			=> ['<script><!--<script>a-->{{v}}</script>',              qr/script/],
+	);
+
+	for my $name (sort keys %must_flag) {
+		my ($html, $expect) = @{ $must_flag{$name} };
+		my @f = _find_unsafe_placeholders($html);
+		ok((grep { $_ =~ $expect } @f), "context scan: $name")
+			or diag("findings: " . (@f ? join('; ', @f) : '(none)'));
+	}
+
+	# The two that motivated R47 and R48 are reachable, not theoretical -
+	# the same proof method as every round before this one.
+	my $r47 = render('<button formaction="/api/unblock?ip={{id}}">Unblock</button>', { id => '1.2.3.4' });
+	like($r47, qr{formaction="/api/unblock\?ip=1\.2\.3\.4"},
+		'render() confirms R47 is reachable: formaction really is fed from the value');
+	my $r47_style = render('<div style="width:{{pct}}%"></div>', { pct => '50' });
+	like($r47_style, qr/style="width:50%"/,
+		'render() confirms style= is a live CSS context fed from a value, which Render.pm:83 forbids');
+	my $r48 = render('<script><!--<script>x</script>{{v}}</script>', { v => 'alert(1)' });
+	like($r48, qr{<!--<script>x</script>alert\(1\)</script>},
+		'render() confirms R48 is reachable: the value lands after a </script> that does not close the element');
+
+	# R47 negatives: the ordinary Task 7 shapes, checked again because a
+	# broad change to matching behaviour is exactly where the false
+	# positives that got this guard disabled would come back.
+	my %must_not_flag = (
+		'title= carrying a value'          => '<td title="{{id}}">x</td>',
+		'aria-label= carrying a value'     => '<button aria-label="Unblock {{id}}">x</button>',
+		'aria-describedby= IDREF'          => '<input aria-describedby="help-{{id}}">',
+		'data-* carrying values'           => '<tr data-ip="{{id}}" data-state="{{value}}">x</tr>',
+		'the documented CSRF hidden field' => '<input type="hidden" name="_csrf" value="{{value}}">',
+		'label/for/id pairing with a placeholder'
+			=> '<label for="ip-{{id}}">IP</label><input id="ip-{{id}}" placeholder="{{url}}">',
+		'class carrying a status modifier' => '<span class="badge badge-{{value}}">x</span>',
+		'alt text'                         => '<img src="/static/i.png" alt="{{title}}">',
+		'option value and label'           => '<option value="{{id}}">{{title}}</option>',
+		'R48: <style> has no escape states, so </style> still ends it'
+			=> '<style><!--<style>x</style>{{v}}</style>',
+		'R48: in the escaped state a matching </script> DOES still end the element'
+			=> '<script><!-- x </script>{{v}}',
+	);
+
+	for my $name (sort keys %must_not_flag) {
+		my @f = _find_unsafe_placeholders($must_not_flag{$name});
+		is_deeply(\@f, [], "context scan: not flagged - $name")
+			or diag("unexpected findings: " . join('; ', @f));
+	}
+
+	# The allowlist is a list, so it is tested as one rather than only
+	# through the markup above: every name on it, and the two shapes
+	# that must NOT be mistaken for a prefix match.
+	ok(_attribute_is_inert($_), "inert allowlist: '$_' is on it")
+		for qw(alt class for id label name placeholder title value ARIA-LABEL data-ip);
+	ok(!_attribute_is_inert($_), "inert allowlist: '$_' is NOT on it")
+		for qw(data srcdoc style formaction href onclick datafoo ariafoo);
+
+	# R49: the RCDATA under-report the header comment now describes.
+	# Pinned so the sentence and the behaviour cannot drift apart again -
+	# drift is precisely how that sentence came to claim "fails closed"
+	# for something that also fails open.
+	my $rcdata = q{<textarea><div title="</textarea><button onclick='{{v}}'>">x</div></textarea>};
+	is_deeply([ _find_unsafe_placeholders($rcdata) ], [],
+		'R49: the RCDATA under-report is real - the scanner sees an inert title=, not the button');
+	my $rcdata_out = render($rcdata, { v => 'alert(1)' });
+	like($rcdata_out, qr/<button onclick='alert\(1\)'>/,
+		q{R49: ... and render() produces the live handler a browser sees, because RCDATA ends at that </textarea>});
+
+	# The other direction of the same blindness, also now described
+	# rather than claimed to be the only one.
+	ok((grep { /onclick/ } _find_unsafe_placeholders('<textarea><button onclick="{{v}}"></textarea>')),
+		'R49: the over-report direction is real too - inert markup inside a textarea is still flagged');
+}
+
 # R42: the raw-marker allowlist, tested directly against
 # _find_unauthorized_raw_markers() rather than only through real files,
 # plus the exact embedded-</script> scenario that motivated it, run
@@ -1180,7 +1555,7 @@ sub _html_files_under {
 			. "Fix: move the value out of that position, don't reach for the raw {{{ }}} marker instead - "
 			. "neither marker is safe there. A URL should be a literal this codebase wrote, not a substituted "
 			. "value; server-rendered HTML should not have inline event-handler attributes at all; a placeholder "
-			. "must never be the NAME of an attribute nor any part of a TAG name, only (sometimes) an attribute's value; the raw {{{ }}} marker is only "
+			. "must never be the NAME of an attribute nor any part of a TAG name, only the value of an attribute on the inert allowlist in this file; the raw {{{ }}} marker is only "
 			. "authorised for layout.html's own nav/content slots - if a screen genuinely needs to insert raw HTML "
 			. "it built itself, add it to \%RAW_MARKER_ALLOWLIST in this file and say why in the same commit; and "
 			. "dynamic data a <script> needs should be placed OUTSIDE the <script> tag (a data-* attribute the "
