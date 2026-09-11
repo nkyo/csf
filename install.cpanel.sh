@@ -297,6 +297,14 @@ fi
 if [ ! -e "/etc/csf/ui" ]; then
 	cp -avf ui /etc/csf/.
 fi
+# Up to v15.00 the line above also copied a private key that shipped inside the
+# tarball, so every installation served the WebUI with a key anyone could read.
+# That key is gone from the source; this gives the host one of its own. Run
+# unconditionally, not only on a fresh install, so an existing server upgrading
+# from an affected version stops using the public key too.
+cp -avf ui-cert.sh /usr/local/csf/bin/csf-ui-cert.sh
+chmod 0700 /usr/local/csf/bin/csf-ui-cert.sh
+sh /usr/local/csf/bin/csf-ui-cert.sh
 if [ -e "/etc/cron.d/csfcron.sh" ]; then
 	mv -fv /etc/cron.d/csfcron.sh /etc/cron.d/csf-cron
 fi

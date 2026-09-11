@@ -92,6 +92,38 @@ this repository and to refuse anything it cannot verify.
   the tarball is **reproducible**: anyone can rebuild it from the tag and get a
   byte-identical file, then check that against the published signature.
 
+#### The WebUI shipped a private key that everyone had
+
+- **2026-09-11** — **Removed `ui/server.key` and `ui/server.crt` from the source.**
+  Up to and including v15.00 a working private key was shipped inside the
+  tarball, and every installer copied the whole `ui/` directory to `/etc/csf/ui/`
+  (`install.generic.sh:305`), which is exactly where `lfd.pl:9466` reads
+  `SSL_key_file` from. Every server with `UI = "1"` therefore served https with
+  a key that anyone who downloaded csf already had, so that traffic could be read
+  or altered by anyone positioned to see it. The certificate had also expired on
+  **2020-07-17**, which trained administrators to click past the browser warning
+  — the same warning a real interception would raise.
+
+  Verified present with the same key in Black-HOST v15.03 as well, so this
+  affected the wider fork ecosystem, not one distribution of it.
+
+  Mitigating factor: `UI` ships as `"0"`, so only installations that deliberately
+  enabled the built-in WebUI were exposed.
+
+- **2026-09-11** — Added `ui-cert.sh`, installed as
+  `/usr/local/csf/bin/csf-ui-cert.sh`. It generates a 2048-bit RSA certificate
+  for the host it runs on, with the hostname and local addresses in
+  `subjectAltName` (browsers ignore CN), key mode `0600`, valid ten years. It
+  regenerates when the certificate is missing, expired, mismatched with its key,
+  or **is the leaked one** — recognised by SHA-256 fingerprint
+  `2EAB8C4A…119BB29A` — and is otherwise silent, so re-running it is safe.
+  `sh /usr/local/csf/bin/csf-ui-cert.sh --force` rotates on demand.
+
+  All seven installers call it **unconditionally**, not only on a fresh install,
+  so a server upgrading from an affected version stops using the public key as
+  part of the upgrade. If openssl is absent it says so and leaves the install
+  alone rather than failing.
+
 #### Dead links and advice for software that no longer exists
 
 - **2026-08-14** — `ConfigServer/DisplayUI.pm`: removed three promotional panels

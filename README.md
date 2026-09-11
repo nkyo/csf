@@ -78,6 +78,26 @@ git archive --format=tar --prefix=csf/ v<version> | gzip -n -9 | sha256sum
 > back to plain `http://` on servers without `IO::Socket::SSL`. That is fixed
 > here; see [CHANGES.md](CHANGES.md).
 
+## The built-in WebUI
+
+`UI = "0"` by default, and that is the right setting unless you need it.
+
+If you enable it, note what was fixed here: up to v15.00 a **private key shipped
+inside the tarball** and every installer copied it into `/etc/csf/ui/`, so every
+server running the WebUI used a key anyone who downloaded csf already had. Its
+certificate had also expired in 2020. Both are gone from this source; the
+installers now generate a certificate belonging to your host alone.
+
+To rotate it, or if you are unsure what your server is serving:
+
+```bash
+sh /usr/local/csf/bin/csf-ui-cert.sh --force
+openssl x509 -in /etc/csf/ui/server.crt -noout -fingerprint -sha256 -dates
+```
+
+If that fingerprint is `2E:AB:8C:4A:...:11:9B:B2:9A`, the server is still using
+the leaked certificate — rotate it now.
+
 ## Documentation
 
 The upstream manual ships with the source and is still accurate:
