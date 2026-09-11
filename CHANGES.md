@@ -37,6 +37,44 @@ line is added below the original notice; the original stays intact.
 
 ### Unreleased
 
+#### Task 5 fix round 3 — the R36 handshake alarm leaked past a `tls_wrap` that dies
+
+- **2026-09-11** — Fixed `Server.pm`'s `_serve_accepted()` leaving the
+  handshake watchdog armed when `tls_wrap` dies outright, rather than
+  returning or returning false (found in the scoped re-review of fix round
+  2's own R36 change). The cancellation (`Time::HiRes::alarm(0)`) sat on
+  the line textually after the `tls_wrap` call with no `eval` around it, so
+  a die skipped that line along with everything else in the function,
+  leaving the handshake's alarm pending. Harmless today only because
+  `run()` has no `eval` around `_serve_accepted()`, so an uncaught die
+  takes the whole forked child with it and there is no second phase left
+  for the leaked alarm to misfire into - the same "correct only by
+  coincidence" shape R34's flat-8192 read had, where the cap happened to
+  equal the read size. The coincidence here has a name: Task 9's mode-B
+  daemon entry point is the obvious place to wrap this call in an `eval` so
+  one bad connection does not kill the whole process, and the day that
+  lands this stops being inert. The module's own comment, and fix round
+  2's commit message, both also claimed the alarm was "cancelled on
+  success or failure" - true of the code as it read, false of what it did
+  on a die; fixed to match reality rather than left standing.
+
+  `tls_wrap` is now called inside an `eval`; the handshake alarm is
+  cancelled unconditionally immediately afterward regardless of how the
+  `eval` ended, and if it died, the original error is re-raised unchanged
+  - the same fate an uncaught die always had here, just with the alarm
+  already off before it propagates. Verified with a new
+  `t/40-http-parse.t` case: a `tls_wrap` that dies, driven through
+  `_serve_accepted()` from outside its own `eval`, followed immediately by
+  `Time::HiRes::alarm(0)` to both cancel and read back whatever is still
+  pending - a direct, deterministic check (the builtin and
+  `Time::HiRes::alarm()` both return the remaining seconds of any
+  previously scheduled alarm, 0 if none is pending), not an inference from
+  timing. Confirmed by reverting to the unconditional, un-eval'd
+  cancellation and watching the new case fail with the full
+  `handshake_timeout` (5s, chosen long enough that a leak is unmistakable)
+  still reading as pending.
+  (`ui-src/lib/ConfigServer/UI/Server.pm`; `t/40-http-parse.t`)
+
 #### Task 5 fix round 2 — the fix for R31 could itself kill a slow-but-honest client
 
 - **2026-09-11** — Fixed `Server.pm`'s `_serve_accepted()` charging the TLS

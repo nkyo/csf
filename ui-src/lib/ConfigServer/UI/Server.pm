@@ -578,13 +578,25 @@ sub _default_tls_wrap {
 # The fix is two alarms, each covering only what it is named for, with a
 # clean handoff between them: $handshake_timeout (own reasoning at
 # $DEFAULT_HANDSHAKE_TIMEOUT above) covers ONLY tls_wrap; that alarm is
-# cancelled the instant it returns (success or failure), and only then, if
-# the wrap produced real TLS, is a second alarm armed - the same
-# header_timeout + body_timeout + write_timeout sum as before, now
-# starting fresh rather than continuing to run down a clock the handshake
-# already spent from. A peer stuck in either phase is still killed,
-# promptly, by that phase's own budget; a peer that is merely slow, in
-# either phase, and stays within it, is not.
+# cancelled the instant tls_wrap is done with it - on a normal return, on a
+# false/undef return, OR ON A DIE (task-5-review.md R37: an unconditional
+# alarm(0) placed textually after the call is skipped along with everything
+# else once tls_wrap dies, which the eval/die-and-rethrow below exists to
+# prevent) - and only then, if the wrap produced real TLS, is a second
+# alarm armed - the same header_timeout + body_timeout + write_timeout sum
+# as before, now starting fresh rather than continuing to run down a clock
+# the handshake already spent from. A peer stuck in either phase is still
+# killed, promptly, by that phase's own budget; a peer that is merely slow,
+# in either phase, and stays within it, is not.
+#
+# R37: this is inert today only because run() has no eval around
+# _serve_accepted(), so an uncaught die here takes the whole child with it
+# and there is no second phase left for a leaked alarm to misfire into -
+# the same "correct by coincidence" shape R34's flat-8192 read had, and the
+# coincidence has a name: whatever script becomes Task 9's mode-B daemon
+# entry point is the obvious place to wrap this call in an eval so one bad
+# connection does not kill the process, and the day that happens this stops
+# being inert.
 #
 # alarm()/$SIG{ALRM}, not this module's usual select()-based style:
 # select() cannot interrupt a blocking call already inside
@@ -602,10 +614,14 @@ sub _serve_accepted {
 	local $SIG{ALRM} = $self->{watchdog_exit};
 
 	Time::HiRes::alarm($self->{handshake_timeout});
-	my $tls_socket = $self->{tls_wrap}
-		? $self->{tls_wrap}->($connection)
-		: _default_tls_wrap($connection);
-	Time::HiRes::alarm(0); # handshake phase over (however it went); its budget does not carry forward
+	my $tls_socket = eval {
+		$self->{tls_wrap}
+			? $self->{tls_wrap}->($connection)
+			: _default_tls_wrap($connection);
+	};
+	my $handshake_error = $@;
+	Time::HiRes::alarm(0); # handshake phase over - return, false, OR die - its budget never carries forward
+	die $handshake_error if $handshake_error; # rethrow unchanged: same fate as before this eval existed, just with the alarm off first
 
 	# R32: tls_wrap is a constructor injection so tests never need a real
 	# certificate or IO::Socket::SSL installed - but that makes it a seam

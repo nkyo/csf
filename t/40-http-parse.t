@@ -40,7 +40,7 @@ use lib "$FindBin::Bin/..", "$FindBin::Bin/../ui-src/lib";
 use File::Temp qw(tempdir);
 use Socket ();
 use Time::HiRes ();
-use Test::More tests => 128;
+use Test::More tests => 130;
 
 require_ok('ConfigServer::UI::HTTP');
 require_ok('ConfigServer::UI::Server');
@@ -688,6 +688,44 @@ sub _conf {
 	cmp_ok($elapsed, '<', 0.4,
 		"R36: total elapsed ($elapsed s) exceeds what a combined 0.15s budget would ever have allowed, and it still succeeded");
 	is(scalar(@{ $app->{calls} }), 1, 'R36: and the request the client sent was actually served');
+}
+
+###############################################################################
+# ConfigServer::UI::Server->_serve_accepted() - task-5-review.md R37: the
+# handshake alarm must be cancelled on EVERY exit from the handshake phase,
+# including tls_wrap dying outright, not only a normal or false/undef
+# return. An unconditional alarm(0) placed textually after the call is
+# skipped along with everything else once tls_wrap dies - inert today only
+# because run() has no eval around _serve_accepted() (an uncaught die takes
+# the whole child with it), but Task 9's mode-B daemon entry point is the
+# obvious place for that eval to appear, and the day it does this becomes a
+# live, silent leak into whatever the same child does next.
+#
+# alarm(0) itself is the assertion: the builtin (and Time::HiRes::alarm())
+# both return the number of seconds remaining on any previously scheduled
+# alarm, 0 if none is pending - so calling it immediately after
+# _serve_accepted() has died and been caught is a direct, deterministic
+# read of whether the handshake alarm is still armed, not an inference from
+# timing.
+###############################################################################
+{
+	my ($near, $far) = _pair();
+	my $app = FakeApp->new;
+	my $server = $S->new(
+		app               => $app,
+		handshake_timeout => 5, # long enough that a leak would be unmistakable, not a near-miss
+		header_timeout    => 1, body_timeout => 1, write_timeout => 1,
+		tls_wrap          => sub { die "R37 tls_wrap blew up\n" },
+	);
+
+	my $died = eval { $server->_serve_accepted($near, '203.0.113.9'); 1 } ? '' : $@;
+	close $far;
+	my $remaining = Time::HiRes::alarm(0); # query-and-cancel whatever is pending, if anything
+
+	like($died, qr/R37 tls_wrap blew up/,
+		'R37: a tls_wrap that dies still propagates its own die (unchanged behaviour)');
+	is($remaining, 0,
+		"R37: and no handshake alarm survives the die into whatever runs next (found pending: ${remaining}s)");
 }
 
 ###############################################################################
