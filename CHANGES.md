@@ -37,6 +37,72 @@ line is added below the original notice; the original stays intact.
 
 ### Unreleased
 
+#### Task 6 fix round 3 — the fix for R40 itself had two more holes, plus a false positive that would have gotten it disabled
+
+- **2026-09-11** — Re-review of fix round 2's scanner confirmed R40 (`<a href={{evil}}>` now flags,
+  name-agnostic, quoted forms not double-counted) and the "split-brace is unreachable" claim
+  (re-run against the real `render()`), then attacked the guard rather than reading it and found
+  two more live holes plus a false positive urgent enough to fix in the same round, because a
+  guard that blocks correct work is a guard someone disables - and the moment it is disabled, R40
+  and this round's own holes stop being theoretical.
+
+  **R41 — a placeholder used as the attribute NAME, not its value.** `<div {{attr}}="{{val}}">`
+  passed every round-1/round-2 check; `render()` with `attr=>'onclick', val=>'alert(1)'` was
+  confirmed to actually emit `<div onclick="alert(1)">`. `escape_html()` only ever escapes a
+  *value* - nothing it does can make an attacker-influenced attribute *name* safe. Fixed by adding
+  a check for a placeholder-shaped token (`{{key}}` or `{{{key}}}`) sitting immediately before `=`
+  within a tag's attribute region, checked before the value-position checks since a name-position
+  placeholder is dangerous independent of whatever the value turns out to be. Verified against
+  both the scanner and the real `render()` for a quoted value, an unquoted value, and the raw
+  marker used as the name - all three confirmed live before the fix, all three confirmed caught
+  after it.
+
+  **R42 — the raw marker after a `</script>` embedded inside a JS string. Fixed by allowlisting
+  call sites instead of enumerating unsafe contexts, per explicit direction.** A JS string
+  literal's embedded `</script>` ends the `<script>` element from the *browser's* tokenizer's point
+  of view regardless of JS-string context - confirmed live: `{{{v}}}` placed after one renders
+  `<img src=x onerror=alert(1)>` as real, live markup, while the escaped `{{v}}` form in the
+  identical position stays inert text (`escape_html()` already makes a value safe as ordinary
+  element content, which is exactly what it becomes there - confirmed, not assumed, by running both
+  through `render()`). The instruction was explicit and is recorded here because it is the more
+  important fix than the regex: **do not enumerate contexts where the raw marker is unsafe - that
+  set is unbounded, and this hole is the proof. Allowlist the call sites instead.** Added
+  `%RAW_MARKER_ALLOWLIST` and `_find_unauthorized_raw_markers()`: every `{{{key}}}` anywhere under
+  `ui-src/web/` is flagged unless the exact `(file, key)` pair is on the list, regardless of
+  surrounding context. Today's allowlist has exactly two entries, both on `layout.html`: `nav` and
+  `content` - the two slots that file's own header comment already documents as its raw-marker
+  contract with Task 7.
+
+  **R43 — the round-2 unquoted-attribute rule fired on ordinary element text with no tag involved
+  at all** (the reviewer's own examples: `<p>Max attempts = {{max}}</p>`,
+  `<div class="stat">Blocked count = {{count}}</div>` - precisely the shape Task 7's Overview
+  screen needs to write), because it matched against the whole document text with no requirement
+  that it actually sit inside a tag. Fixed by requiring real tag context: every attribute-level
+  check (R41's new name check, `on*`, `href`/`src`/`action`, and R40's unquoted-any) now runs only
+  against the region a `<tagname ...>` opening captures between the tag's name and its own closing
+  `>`, never against text between tags. Confirmed both examples now produce zero findings, and
+  re-ran every prior positive control (R38, R40, R41, all five round-2 evasion candidates) against
+  the amended scanner to confirm the tag-scoping introduced no regressions - all still flag
+  correctly.
+
+  **R44 — the file-traversal regex (`/\.html\z/`) had no `/i`**, so a screen saved as `SCREEN.HTML`
+  (any case) was silently never scanned - the one guard standing between Task 7 and this whole
+  class of mistake, skipping files without a word. Fixed (`/\.html\z/i`); the traversal was also
+  factored into `_html_files_under()` so this has a direct regression test against a synthetic
+  tempdir rather than only exercising it indirectly through whatever currently exists under
+  `ui-src/web` (none of which is uppercase today - exactly how this went unnoticed the first time).
+
+  Method used for all four, per explicit instruction: construct the input, run it through the real
+  scanner *and* the real `render()`, confirm the scanner flags it and that no legitimate case
+  broke - then re-run the full evasion list (including the ones previously found unreachable, since
+  a change to the matcher can make a previously-unreachable pattern reachable) against the amended
+  matcher. Also live-verified against the actual `layout.html`: injected the R41 and R42 examples,
+  watched the real-file enforcement test go red naming the file; injected the R43 examples,
+  confirmed the suite stayed green; reverted all three, confirmed clean again.
+
+  `t/50-render.t`: 97 → 115 assertions. Whole suite: 1522 tests (was 1504), `prove -I. t/`.
+  (`t/50-render.t`)
+
 #### Task 6 fix round 2 — the fix for R38 itself had a hole: unquoted attributes bypassed it entirely
 
 - **2026-09-11** — Re-review of fix round 1's context-boundary scanner (R38) verified it by doing
