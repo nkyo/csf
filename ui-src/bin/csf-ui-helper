@@ -1,0 +1,1952 @@
+#!/usr/bin/perl
+###############################################################################
+# Copyright (C) 2006-2025 Jonathan Michaelson
+#
+# https://github.com/waytotheweb/scripts
+#
+# This program is free software; you can redistribute it and/or modify it under
+# the terms of the GNU General Public License as published by the Free Software
+# Foundation; either version 3 of the License, or (at your option) any later
+# version.
+#
+# This program is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+# FOR A PARTICULAR PURPOSE. See the GNU General Public License for more
+# details.
+#
+# You should have received a copy of the GNU General Public License along with
+# this program; if not, see <https://www.gnu.org/licenses>.
+###############################################################################
+# Added 2026-09-11 in https://github.com/nkyo/csf - see CHANGES.md.
+#
+# csf-ui-helper - the privileged half of the replacement WebUI, and the only
+# part of it that runs as root.
+#
+# It listens on one unix socket, authenticates its peer with SO_PEERCRED, and
+# serves the fourteen operations frozen in docs/WEBUI-RPC.md. There is no
+# operation that takes a file path, a command, a flag or a chain name: every one
+# of those is a constant in this file, which is what makes the privileged
+# surface reviewable rather than "whatever csf can be made to do".
+#
+# Three rules shape everything below.
+#
+#   G2  No shell, ever. Every child is exec'd with an argv LIST through the
+#       block form, which cannot reach /bin/sh even for a one-element list.
+#   G3  Fail closed. A missing dependency, an unverifiable input or an unknown
+#       state is refused with a reason. There is no degraded mode.
+#   G8  The web tier is never trusted for identity. The peer's uid comes from
+#       the kernel; nothing in a message names a user, a role or an address that
+#       this process believes.
+#
+# And one that is easy to miss: csf exits 0 after refusing an operation
+# (csf.pl:1541-1551, one exit 0 at csf.pl:190). So no mutating operation here
+# decides its outcome from an exit status. Each one snapshots the store, runs
+# csf, re-reads the store, and reports the delta.
+###############################################################################
+package ConfigServer::UI::Helper;
+
+use strict;
+use warnings;
+
+use lib '/usr/local/csf-ui/lib', '/usr/local/csf/lib';
+
+use Errno ();
+use Fcntl qw(:DEFAULT :flock);
+use POSIX ();
+use Socket ();
+use Digest::SHA ();
+use Time::HiRes ();
+use JSON::Tiny ();
+use ConfigServer::UI::Proto ();
+
+our $VERSION = '1.00';
+
+my $P = 'ConfigServer::UI::Proto';
+
+###############################################################################
+# Frozen tables. Nothing in this block is configurable and nothing in it can be
+# named by a request (section 9).
+###############################################################################
+
+my %DEFAULT_PATH = (
+	socket_dir   => '/var/run/csf-ui',
+	socket       => '/var/run/csf-ui/helper.sock',
+	rate_state   => '/var/run/csf-ui/rate.state',
+	helper_dir   => '/var/lib/csf-ui/helper',
+	authfail     => '/var/lib/csf-ui/helper/authfail.state',
+	audit_log    => '/var/log/csf-ui-audit.log',
+	users        => '/etc/csf-ui/users',
+	csf_bin      => '/usr/sbin/csf',
+	csf_conf     => '/etc/csf/csf.conf',
+	csf_deny     => '/etc/csf/csf.deny',
+	csf_allow    => '/etc/csf/csf.allow',
+	csf_disable  => '/etc/csf/csf.disable',
+	csf_error    => '/etc/csf/csf.error',
+	csf_version  => '/etc/csf/version.txt',
+	tempban      => '/var/lib/csf/csf.tempban',
+	tempallow    => '/var/lib/csf/csf.tempallow',
+	lfd_pid      => '/var/run/lfd.pid',
+);
+
+# section 7
+my %LIMIT = (
+	max_children        => 16,
+	backlog             => 32,
+	read_timeout        => 5,
+	deadline_status     => 10,
+	deadline_read       => 30,
+	deadline_mutate     => 20,
+	deadline_restart    => 120,
+	deadline_auth       => 10,
+	child_output        => 65536,
+	mutate_per_minute   => 120,
+	auth_per_minute     => 30,
+	auth_concurrent     => 2,
+	restart_interval    => 10,
+	auth_fail_threshold => 5,
+	auth_lock_seconds   => 300,
+	auth_capacity       => 256,
+);
+
+# section 4.5 - 'which' selects a row here. It never becomes part of a path.
+my %WHICH_FILE = (
+	deny  => 'csf_deny',
+	temp  => 'tempban',
+	allow => 'csf_allow',
+);
+
+# section 5.11 - the only chains reconcile looks at, and the only chains
+# reconcile_fix can delete from. Not an argument, on purpose.
+my @SCOPED_CHAINS = qw(DENYIN DENYOUT);
+
+# section 5.7 - always sent, never caller-supplied. An empty comment makes csf
+# run 'host -W 5 <ip>' as root on an address the caller chose (csf.pl:4320,
+# LookUpIP.pm:87).
+my $TEMPDENY_NOTE = 'csf-ui';
+
+# section 5.14 - one crypt() against this record when the username is unknown,
+# so that "no such user" and "wrong password" take the same time.
+my $DUMMY_HASH = '$6$rounds=100000$csfuidummysalt$AK1/yDIgqT1Jb7Z05tdbYU0M43yTcqWaw/4WlJ9/bqxJyAetvLrq5F/R0BXkA9GTI5QXpTM.5AZD/QKakAxIf0';
+
+# The fixed key set read out of csf.conf, with a strict line grammar. The file
+# is parsed, never evaluated (section 2.1).
+my @CONF_KEYS = qw(TESTING IPV6 LF_IPSET LFDSTART IPTABLES IP6TABLES);
+
+my %OPS = (
+	status        => { mutates => 0, child => 1, required => [],              optional => [] },
+	counts        => { mutates => 0, child => 0, required => [],              optional => [] },
+	deny          => { mutates => 1, child => 1, required => [qw(ip note)],   optional => [] },
+	undeny        => { mutates => 1, child => 1, required => [qw(ip)],        optional => [] },
+	allow         => { mutates => 1, child => 1, required => [qw(ip note)],   optional => [] },
+	unallow       => { mutates => 1, child => 1, required => [qw(ip)],        optional => [] },
+	tempdeny      => { mutates => 1, child => 1, required => [qw(ip ttl)],    optional => [qw(ports)] },
+	temprm        => { mutates => 1, child => 1, required => [qw(ip)],        optional => [] },
+	list          => { mutates => 0, child => 0, required => [qw(which)],     optional => [qw(offset limit filter)] },
+	'grep'        => { mutates => 0, child => 1, required => [qw(ip)],        optional => [] },
+	reconcile     => { mutates => 0, child => 1, required => [],              optional => [] },
+	reconcile_fix => { mutates => 1, child => 1, required => [qw(ids)],       optional => [] },
+	restart       => { mutates => 1, child => 1, required => [],              optional => [] },
+	authenticate  => { mutates => 0, child => 0, required => [qw(user pass)], optional => [] },
+);
+
+# Per-operation options for the 'ip' grammar (section 4.1). Removal accepts /0
+# because csf's own checkip does (CheckIP.pm:60-61), and an entry that can exist
+# must be removable. Mutation carries the prefix floor and the loopback rule.
+my %IP_OPT = (
+	deny     => { mutating => 1 },
+	allow    => { mutating => 1 },
+	tempdeny => { mutating => 1 },
+	'grep'   => {},
+	undeny   => { zero_prefix => 1 },
+	unallow  => { zero_prefix => 1 },
+	temprm   => { zero_prefix => 1 },
+);
+
+my %VALIDATOR = (
+	note   => sub { $P->can('validate_note')->(@_) },
+	ttl    => sub { $P->can('validate_ttl')->(@_) },
+	ports  => sub { $P->can('validate_ports')->(@_) },
+	which  => sub { $P->can('validate_which')->(@_) },
+	offset => sub { $P->can('validate_offset')->(@_) },
+	limit  => sub { $P->can('validate_limit')->(@_) },
+	filter => sub { $P->can('validate_filter')->(@_) },
+	ids    => sub { $P->can('validate_ids')->(@_) },
+	user   => sub { $P->can('validate_user')->(@_) },
+	pass   => sub { $P->can('validate_pass')->(@_) },
+);
+
+# csf's own refusals. It prints these and exits 0, so they are recognised by
+# text - but only to choose between E_REFUSED and E_BACKEND, never to decide
+# that something succeeded. Success is always the state delta.
+my @REFUSAL_PATTERNS = (
+	qr/^\s*(?:deny|add|allow|temp\w*)\s+failed:/mi,
+	qr/is already permanently blocked/i,
+	qr/csf and lfd have been disabled/i,
+	qr/You have an unresolved error/i,
+	qr/is not a valid PUBLIC IP/i,
+);
+
+###############################################################################
+# Context
+#
+# One hashref carrying the paths, the clock and the two things a test needs to
+# replace: the child runner and the peer-credential reader. Nothing here is a
+# configuration knob - ui.conf is read by the web tier, not by this process.
+###############################################################################
+sub new_context {
+	my (%override) = @_;
+	my $ctx = {
+		path        => { %DEFAULT_PATH, %{ $override{path} || {} } },
+		now         => $override{now} || sub { time() },
+		run         => $override{run} || \&run_argv,
+		peercred    => $override{peercred} || \&peer_credentials,
+		auth_verify => $override{auth_verify} || \&auth_verify,
+		expect_uid  => $override{expect_uid},
+		group_ready => defined $override{group_ready} ? $override{group_ready} : 1,
+		conf        => undef,
+	};
+	return $ctx;
+}
+
+sub now { my ($ctx) = @_; return $ctx->{now}->(); }
+
+###############################################################################
+# Wire helpers
+###############################################################################
+sub _true  { return \1 }
+sub _false { return \0 }
+sub _bool  { return $_[0] ? \1 : \0 }
+
+sub _ok_response {
+	my ($id, $data) = @_;
+	return { id => $id, ok => _true(), data => $data };
+}
+
+sub _error_response {
+	my ($id, $code, $message) = @_;
+	return {
+		id      => $id,
+		ok      => _false(),
+		error   => $code,
+		message => $P->can('message_text')->($message),
+	};
+}
+
+# Operations return one of these two shapes.
+sub _ok    { my ($data) = @_;            return { ok => 1, data => $data } }
+sub _fail  { my ($code, $message) = @_;  return { ok => 0, error => $code, message => $message } }
+
+###############################################################################
+# csf.conf
+#
+# Strict line grammar over a fixed key set. Never evaluated, and never through a
+# config module that reads more than these six keys.
+###############################################################################
+sub read_csf_conf {
+	my ($ctx) = @_;
+	return $ctx->{conf} if $ctx->{conf};
+	my $path = $ctx->{path}{csf_conf};
+	open(my $fh, '<', $path) or return undef;
+	my %conf;
+	my $wanted = join('|', @CONF_KEYS);
+	while (my $line = <$fh>) {
+		chomp $line;
+		next unless $line =~ /^\s*($wanted)\s*=\s*"([^"]*)"\s*$/;
+		$conf{$1} = $2;
+	}
+	close $fh;
+	$ctx->{conf} = \%conf;
+	return $ctx->{conf};
+}
+
+sub _conf_flag {
+	my ($conf, $key) = @_;
+	my $value = defined $conf->{$key} ? $conf->{$key} : '0';
+	return ($value =~ /^[1-9]/) ? 1 : 0;
+}
+
+###############################################################################
+# Children
+#
+# G2: exec is always the block form with an argv LIST. Perl's one-argument exec
+# would hand a string to /bin/sh; the block form cannot, whatever the list
+# contains. There is no backtick, no qx and no piped open anywhere in this file,
+# and t/11-helper-validate.t asserts that about the source.
+###############################################################################
+sub run_argv {
+	my ($ctx, $deadline, @argv) = @_;
+	return { error => 'no command' } unless @argv;
+
+	my ($reader, $writer);
+	pipe($reader, $writer) or return { error => 'pipe failed' };
+
+	my $pid = fork();
+	return { error => 'fork failed' } unless defined $pid;
+
+	if (!$pid) {
+		close $reader;
+		open(STDIN, '<', '/dev/null');
+		open(STDOUT, '>&', $writer) or POSIX::_exit(127);
+		open(STDERR, '>&', $writer) or POSIX::_exit(127);
+		close $writer;
+		$SIG{CHLD} = 'DEFAULT';
+		{
+			# The block form of exec cannot reach a shell, whatever the list
+			# holds - not even for a one-element list, which the string form
+			# would hand to /bin/sh (G2).
+			no warnings 'exec';
+			exec { $argv[0] } @argv;
+		}
+		POSIX::_exit(127);
+	}
+
+	close $writer;
+	my $output = '';
+	my $expires = Time::HiRes::time() + $deadline;
+	my ($timeout, $overflow) = (0, 0);
+
+	while (1) {
+		my $left = $expires - Time::HiRes::time();
+		if ($left <= 0) { $timeout = 1; last }
+
+		my $rin = '';
+		vec($rin, fileno($reader), 1) = 1;
+		my $rout = $rin;
+		my $ready = select($rout, undef, undef, $left);
+		if (!defined $ready) {
+			next if $!{EINTR};
+			$timeout = 1;
+			last;
+		}
+		next if $ready == 0;
+
+		my $chunk = '';
+		my $read = sysread($reader, $chunk, 8192);
+		if (!defined $read) {
+			next if $!{EINTR};
+			last;
+		}
+		last if $read == 0;
+		$output .= $chunk;
+		if (length($output) > $LIMIT{child_output}) { $overflow = 1; last }
+	}
+
+	if ($timeout || $overflow) { kill('KILL', $pid) }
+	close $reader;
+	waitpid($pid, 0);
+	my $raw = $?;
+
+	return {
+		status   => $raw,
+		exit     => ($raw >> 8),
+		signal   => ($raw & 127),
+		output   => $output,
+		timeout  => $timeout,
+		overflow => $overflow,
+	};
+}
+
+sub _child_failed {
+	my ($result) = @_;
+	return 'the command could not be started' if $result->{error};
+	return 'the command exceeded its deadline and was killed' if $result->{timeout};
+	return 'the command produced more output than the 64 KiB cap allows' if $result->{overflow};
+	return 'the command was killed by a signal' if $result->{signal};
+	return undef;
+}
+
+sub _recognised_refusal {
+	my ($text) = @_;
+	return undef unless defined $text && length $text;
+	for my $pattern (@REFUSAL_PATTERNS) {
+		next unless $text =~ $pattern;
+		for my $line (split(/\n/, $text)) {
+			next unless $line =~ $pattern;
+			return $P->can('sanitise')->($line, 400);
+		}
+		return $P->can('sanitise')->($text, 400);
+	}
+	return undef;
+}
+
+###############################################################################
+# File reading
+###############################################################################
+sub _slurp_lines {
+	my ($path) = @_;
+	return ([], 'missing') unless -e $path;
+	open(my $fh, '<', $path) or return ([], 'unreadable');
+	binmode($fh);
+	local $/;
+	my $data = <$fh>;
+	close $fh;
+	$data = '' unless defined $data;
+	my @lines = split(/\n/, $data, -1);
+	pop @lines if @lines && $lines[-1] eq '';
+	return (\@lines, undef);
+}
+
+# A csf.deny / csf.allow line. Include lines are counted, never followed: rows
+# from an included file could not be deleted by csf -dr, which rewrites only the
+# main file (section 5.9).
+sub parse_list_line {
+	my ($raw) = @_;
+	my $line = defined $raw ? $raw : '';
+	$line =~ s/\s+$//;
+	return undef if $line eq '';
+	return undef if $line =~ /^\s*#/;
+	return { include => 1 } if $line =~ /^\s*Include\b/;
+
+	my ($token, $rest) = split(/\s+/, $line, 2);
+	my ($canonical) = $P->can('validate_ip')->($token, zero_prefix => 1);
+	return { unparsable => 1 } unless defined $canonical;
+
+	my $note = defined $rest ? $rest : '';
+	$note =~ s/^\s*#\s*//;
+	$note =~ s/^\s+//;
+	$note =~ s/\s+$//;
+	return { ip => $canonical, note => $note };
+}
+
+# time|ip|port|inout|timeout|comment  (csf.pl:4400)
+sub parse_tempban_line {
+	my ($raw, $now) = @_;
+	my $line = defined $raw ? $raw : '';
+	$line =~ s/\s+$//;
+	return undef if $line eq '';
+	my @field = split(/\|/, $line, 6);
+	return { unparsable => 1 } if @field < 5;
+	my ($start, $ip, $ports, $direction, $timeout, $comment) = @field;
+	return { unparsable => 1 } unless $start =~ /^[0-9]+$/ && $timeout =~ /^[0-9]+$/;
+	my ($canonical) = $P->can('validate_ip')->($ip, zero_prefix => 1);
+	return { unparsable => 1 } unless defined $canonical;
+
+	$direction = 'in' unless defined $direction && length $direction;
+	$direction = 'in' unless $direction eq 'in' || $direction eq 'out' || $direction eq 'inout';
+	my $expires = $start + $timeout;
+	return {
+		ip       => $canonical,
+		ports    => (defined $ports && length $ports) ? $ports : '*',
+		dir      => $direction,
+		expires  => $expires,
+		ttl_left => ($expires - $now > 0 ? $expires - $now : 0),
+		expired  => ($expires - $now > 0 ? 0 : 1),
+		note     => (defined $comment ? $comment : ''),
+	};
+}
+
+sub _entries {
+	my ($ctx, $key) = @_;
+	my ($lines, $error) = _slurp_lines($ctx->{path}{$key});
+	return (undef, $error) if $error && $error eq 'unreadable';
+	my $now = now($ctx);
+	my (@rows, $includes, $unparsable);
+	($includes, $unparsable) = (0, 0);
+	my $number = 0;
+	for my $raw (@$lines) {
+		$number++;
+		my $row = ($key eq 'tempban' || $key eq 'tempallow')
+			? parse_tempban_line($raw, $now)
+			: parse_list_line($raw);
+		next unless defined $row;
+		if ($row->{include})    { $includes++;   next }
+		if ($row->{unparsable}) { $unparsable++; next }
+		$row->{line} = $number;
+		push @rows, $row;
+	}
+	return ({ rows => \@rows, includes => $includes, unparsable => $unparsable }, undef);
+}
+
+sub _matching {
+	my ($set, $canonical, $unexpired_only) = @_;
+	my $key = $P->can('ip_key')->($canonical);
+	my @hit;
+	for my $row (@{ $set->{rows} }) {
+		next if $unexpired_only && $row->{expired};
+		next unless $P->can('ip_key')->($row->{ip}) eq $key;
+		push @hit, $row;
+	}
+	return \@hit;
+}
+
+###############################################################################
+# State files
+#
+# Both are 0600 root:root and both are rewritten temp-file-and-rename under an
+# exclusive lock. Because rename replaces the inode the lock is held on, every
+# reader re-checks that the handle it locked is still the file at that path and
+# retries if it is not; without that check a writer could rename a new file into
+# place while another process holds a lock on the old inode and reads stale
+# counters, which for a lockout counter means a bypass.
+###############################################################################
+sub _lock_state {
+	my ($path) = @_;
+	for (1 .. 10) {
+		sysopen(my $fh, $path, O_RDWR | O_CREAT, 0600) or return undef;
+		flock($fh, LOCK_EX) or do { close $fh; return undef };
+		my @on_handle = stat($fh);
+		my @on_path   = stat($path);
+		if (@on_path && @on_handle && $on_handle[0] == $on_path[0] && $on_handle[1] == $on_path[1]) {
+			return $fh;
+		}
+		close $fh;
+	}
+	return undef;
+}
+
+sub _read_state {
+	my ($fh) = @_;
+	seek($fh, 0, 0);
+	local $/;
+	my $data = <$fh>;
+	return {} unless defined $data && length $data;
+	my $struct = eval { JSON::Tiny::decode_json($data) };
+	return (ref($struct) eq 'HASH') ? $struct : {};
+}
+
+sub _write_state {
+	my ($path, $struct) = @_;
+	my $temp = $path . '.tmp.' . $$;
+	sysopen(my $fh, $temp, O_WRONLY | O_CREAT | O_TRUNC, 0600) or return 0;
+	my $json = eval { JSON::Tiny::encode_json($struct) };
+	unless (defined $json) { close $fh; unlink $temp; return 0 }
+	print $fh $json;
+	close $fh;
+	unless (rename($temp, $path)) { unlink $temp; return 0 }
+	return 1;
+}
+
+sub _with_state {
+	my ($path, $code) = @_;
+	my $fh = _lock_state($path);
+	return undef unless $fh;
+	my $struct = _read_state($fh);
+	my ($result, $dirty) = $code->($struct);
+	_write_state($path, $struct) if $dirty;
+	close $fh;
+	return $result;
+}
+
+# Rolling one-minute windows, counted in whole seconds (section 7).
+sub _rate_admit {
+	my ($ctx, $kind, $limit) = @_;
+	my $now = now($ctx);
+	my $result = _with_state($ctx->{path}{rate_state}, sub {
+		my ($state) = @_;
+		my $bucket = $state->{$kind} || {};
+		for my $second (keys %$bucket) {
+			delete $bucket->{$second} if $second !~ /^[0-9]+$/ || $now - $second >= 60;
+		}
+		my $total = 0;
+		$total += $bucket->{$_} for keys %$bucket;
+		if ($total >= $limit) {
+			$state->{$kind} = $bucket;
+			return (0, 1);
+		}
+		$bucket->{$now}++;
+		$state->{$kind} = $bucket;
+		return (1, 1);
+	});
+	# G3: if the counter cannot be maintained, the limit cannot be enforced, so
+	# the request is refused rather than admitted unmetered.
+	return defined $result ? $result : 0;
+}
+
+sub _restart_gate {
+	my ($ctx) = @_;
+	my $now = now($ctx);
+	my $result = _with_state($ctx->{path}{rate_state}, sub {
+		my ($state) = @_;
+		my $last = $state->{last_restart};
+		if (defined $last && $last =~ /^[0-9]+$/ && $now - $last < $LIMIT{restart_interval}) {
+			return ($LIMIT{restart_interval} - ($now - $last), 0);
+		}
+		return (0, 0);
+	});
+	return defined $result ? $result : $LIMIT{restart_interval};
+}
+
+sub _restart_mark {
+	my ($ctx) = @_;
+	my $now = now($ctx);
+	_with_state($ctx->{path}{rate_state}, sub {
+		my ($state) = @_;
+		$state->{last_restart} = $now;
+		return (1, 1);
+	});
+	return;
+}
+
+sub _auth_slot_take {
+	my ($ctx) = @_;
+	my $now = now($ctx);
+	my $result = _with_state($ctx->{path}{rate_state}, sub {
+		my ($state) = @_;
+		my $active = $state->{auth_active} || {};
+		for my $pid (keys %$active) {
+			my $stamp = $active->{$pid};
+			delete $active->{$pid}
+				if $pid !~ /^[0-9]+$/
+				|| $stamp !~ /^[0-9]+$/
+				|| $now - $stamp > $LIMIT{deadline_auth} + 5
+				|| !kill(0, $pid);
+		}
+		if (scalar(keys %$active) >= $LIMIT{auth_concurrent}) {
+			$state->{auth_active} = $active;
+			return (0, 1);
+		}
+		$active->{$$} = $now;
+		$state->{auth_active} = $active;
+		return (1, 1);
+	});
+	return defined $result ? $result : 0;
+}
+
+sub _auth_slot_release {
+	my ($ctx) = @_;
+	_with_state($ctx->{path}{rate_state}, sub {
+		my ($state) = @_;
+		my $active = $state->{auth_active} || {};
+		delete $active->{$$};
+		$state->{auth_active} = $active;
+		return (1, 1);
+	});
+	return;
+}
+
+###############################################################################
+# The per-username failure counter (section 5.14)
+#
+# The helper's own, on /var/lib so that a reboot does not clear a lockout, and
+# 0600 root so that the web tier can neither read it nor reset it. The capacity
+# rule matters: the key comes from the caller, so without expired-only eviction
+# an attacker cycling invented usernames would either grow the file without
+# bound or flush a real account's lockout.
+###############################################################################
+sub _auth_state_check {
+	my ($ctx, $user) = @_;
+	my $now = now($ctx);
+	my $result = _with_state($ctx->{path}{authfail}, sub {
+		my ($state) = @_;
+		my $users = $state->{users} || {};
+		my $record = $users->{$user};
+		if ($record && ($record->{locked_until} || 0) > $now) {
+			return ({ locked => 1, retry_after => $record->{locked_until} - $now }, 0);
+		}
+		if (!$record && scalar(keys %$users) >= $LIMIT{auth_capacity}) {
+			my @free = grep { ($users->{$_}{locked_until} || 0) <= $now } keys %$users;
+			unless (@free) {
+				my ($earliest) = sort { $a <=> $b } map { $users->{$_}{locked_until} } keys %$users;
+				my $wait = $earliest - $now;
+				$wait = 1 if $wait < 1;
+				return ({ locked => 1, retry_after => $wait, capacity => 1 }, 0);
+			}
+		}
+		return ({ locked => 0, retry_after => 0 }, 0);
+	});
+	return defined $result ? $result : { locked => 1, retry_after => $LIMIT{auth_lock_seconds}, unavailable => 1 };
+}
+
+sub _auth_state_fail {
+	my ($ctx, $user) = @_;
+	my $now = now($ctx);
+	my $result = _with_state($ctx->{path}{authfail}, sub {
+		my ($state) = @_;
+		my $users = $state->{users} || {};
+		if (!$users->{$user} && scalar(keys %$users) >= $LIMIT{auth_capacity}) {
+			my @free = sort { ($users->{$a}{last} || 0) <=> ($users->{$b}{last} || 0) }
+				grep { ($users->{$_}{locked_until} || 0) <= $now } keys %$users;
+			if (@free) { delete $users->{ $free[0] } }
+			else {
+				$state->{users} = $users;
+				return ({ locked => 1, retry_after => $LIMIT{auth_lock_seconds} }, 1);
+			}
+		}
+		my $record = $users->{$user} || { fails => 0, locked_until => 0, last => $now };
+		$record->{fails}++;
+		$record->{last} = $now;
+		if ($record->{fails} >= $LIMIT{auth_fail_threshold}) {
+			$record->{locked_until} = $now + $LIMIT{auth_lock_seconds};
+			$record->{fails} = 0;
+		}
+		$users->{$user} = $record;
+		$state->{users} = $users;
+		my $locked = ($record->{locked_until} || 0) > $now ? 1 : 0;
+		return ({ locked => $locked, retry_after => $locked ? $record->{locked_until} - $now : 0 }, 1);
+	});
+	return defined $result ? $result : { locked => 0, retry_after => 0 };
+}
+
+sub _auth_state_clear {
+	my ($ctx, $user) = @_;
+	_with_state($ctx->{path}{authfail}, sub {
+		my ($state) = @_;
+		my $users = $state->{users} || {};
+		delete $users->{$user};
+		$state->{users} = $users;
+		return (1, 1);
+	});
+	return;
+}
+
+###############################################################################
+# Audit (section 8)
+#
+# Written by root, to a file the web tier cannot touch. An attacker who owns
+# csf-ui can forge who asked; they cannot forge or erase what was executed.
+# 'pass' is removed from the logged arguments rather than blanked, so there is
+# no field for a later change to start filling in.
+###############################################################################
+sub _audit_args {
+	my ($args) = @_;
+	my %copy = %{ $args || {} };
+	delete $copy{pass};
+	if (defined $copy{note}) {
+		$copy{note} = $P->can('sanitise')->($copy{note}, 64);
+	}
+	return \%copy;
+}
+
+sub audit {
+	my ($ctx, $entry) = @_;
+	my $line = eval { $P->can('encode')->($entry) };
+	return 0 unless defined $line;
+	sysopen(my $fh, $ctx->{path}{audit_log}, O_WRONLY | O_APPEND | O_CREAT, 0640) or return 0;
+	syswrite($fh, $line);
+	close $fh;
+	return 1;
+}
+
+sub _audit_request {
+	my ($ctx, $peer, $id, $op, $args, $response, $detail) = @_;
+	my $ok = (ref($response->{ok}) && ${ $response->{ok} }) ? 1 : 0;
+	audit($ctx, {
+		ts     => now($ctx),
+		id     => (defined $id ? $id : undef),
+		op     => (defined $op ? $op : undef),
+		args   => _audit_args($args),
+		peer   => { uid => $peer->{uid}, pid => $peer->{pid} },
+		ok     => _bool($ok),
+		error  => ($ok ? undef : $response->{error}),
+		detail => (defined $detail ? $P->can('sanitise')->($detail, 200) : undef),
+	});
+	return;
+}
+
+###############################################################################
+# Peer authentication (section 2.2)
+###############################################################################
+sub peer_credentials {
+	my ($socket) = @_;
+	my $packed = getsockopt($socket, Socket::SOL_SOCKET(), Socket::SO_PEERCRED());
+	return undef unless defined $packed;
+	my @credential = unpack('iii', $packed);
+	return undef unless scalar(@credential) >= 3 && defined $credential[2];
+	return { pid => $credential[0], uid => $credential[1], gid => $credential[2] };
+}
+
+# Returns (undef, $peer) when the peer is acceptable, or ($code, $peer, $reason,
+# $silent) when it is not. $silent means answer nothing at all: a connection the
+# kernel will not vouch for gets no response, only a log line (section 2.2).
+# gid is never used for a decision and pid is recorded for the log only: by the
+# time it is written the pid may already have been reused.
+sub check_peer {
+	my ($ctx, $socket) = @_;
+	my $peer = $ctx->{peercred}->($socket);
+	return ('E_PEER', { uid => undef, pid => undef },
+		'peer credentials are unavailable on this connection', 1)
+		unless $peer;
+
+	return ('E_UNAVAILABLE', $peer,
+		'the csfui group does not exist; run the installer')
+		unless $ctx->{group_ready};
+
+	return ('E_PEER', $peer,
+		'root does not use this socket; run csf directly')
+		if defined $peer->{uid} && $peer->{uid} == 0;
+
+	return ('E_UNAVAILABLE', $peer,
+		'the csfui user does not exist; run the installer')
+		unless defined $ctx->{expect_uid};
+
+	return ('E_PEER', $peer, 'the peer is not the csfui user')
+		unless defined $peer->{uid} && $peer->{uid} == $ctx->{expect_uid};
+
+	return (undef, $peer, undef);
+}
+
+###############################################################################
+# Argument validation (sections 3.2 and 4)
+###############################################################################
+sub validate_args {
+	my ($op, $args) = @_;
+	my $spec = $OPS{$op};
+	my %clean;
+	my %known = map { $_ => 1 } (@{ $spec->{required} }, @{ $spec->{optional} });
+
+	for my $key (sort keys %$args) {
+		return (undef, "$key: is not an argument of $op") unless $known{$key};
+	}
+
+	my %required = map { $_ => 1 } @{ $spec->{required} };
+	for my $name (@{ $spec->{required} }, @{ $spec->{optional} }) {
+		my $present = exists $args->{$name} && defined $args->{$name};
+		return (undef, "$name: is required") if !$present && $required{$name};
+		# Every optional argument's validator answers undef with its documented
+		# default (section 4.3, 4.6, 4.7), so an absent one goes through the same
+		# path as a present one.
+		my $raw = $present ? $args->{$name} : undef;
+		my ($value, $why);
+		if ($name eq 'ip') {
+			($value, $why) = $P->can('validate_ip')->($raw, %{ $IP_OPT{$op} || {} });
+		}
+		else {
+			($value, $why) = $VALIDATOR{$name}->($raw);
+		}
+		return (undef, "$name: $why") unless defined $value;
+		$clean{$name} = $value;
+	}
+	return (\%clean, undef);
+}
+
+###############################################################################
+# Dispatch
+###############################################################################
+sub handle_line {
+	my ($ctx, $line, $peer) = @_;
+
+	my $request = eval { $P->can('decode')->($line) };
+	if (my $error = $@) {
+		my $message = $P->can('is_fault')->($error) ? $error->{message} : 'the request could not be read';
+		my $response = _error_response(undef, 'E_PROTOCOL', $message);
+		_audit_request($ctx, $peer, undef, undef, {}, $response, $message);
+		return $response;
+	}
+	return handle_request($ctx, $request, $peer);
+}
+
+sub handle_request {
+	my ($ctx, $request, $peer) = @_;
+	$peer ||= { uid => undef, pid => undef };
+
+	unless (ref($request) eq 'HASH') {
+		my $response = _error_response(undef, 'E_PROTOCOL', 'the request is not a JSON object');
+		_audit_request($ctx, $peer, undef, undef, {}, $response, 'not an object');
+		return $response;
+	}
+
+	my ($id, $id_why) = $P->can('validate_id')->($request->{id});
+	unless (defined $id) {
+		my $response = _error_response(undef, 'E_PROTOCOL', "id: $id_why");
+		_audit_request($ctx, $peer, undef, undef, {}, $response, 'bad id');
+		return $response;
+	}
+
+	my $op = $request->{op};
+	unless (defined $op && !ref($op) && $OPS{$op}) {
+		my $response = _error_response($id, 'E_UNKNOWN_OP', 'op is not one of the fourteen operations');
+		_audit_request($ctx, $peer, $id, undef, {}, $response, 'unknown op');
+		return $response;
+	}
+
+	my $args = $request->{args};
+	$args = {} unless defined $args;
+	unless (ref($args) eq 'HASH') {
+		my $response = _error_response($id, 'E_ARG', 'args must be an object');
+		_audit_request($ctx, $peer, $id, $op, {}, $response, 'args not an object');
+		return $response;
+	}
+
+	my ($clean, $why) = validate_args($op, $args);
+	unless (defined $clean) {
+		my $response = _error_response($id, 'E_ARG', $why);
+		_audit_request($ctx, $peer, $id, $op, _redacted($op, $args), $response, 'argument rejected');
+		return $response;
+	}
+
+	my $outcome = execute($ctx, $op, $clean, $peer);
+	my $response = $outcome->{ok}
+		? _ok_response($id, $outcome->{data})
+		: _error_response($id, $outcome->{error}, $outcome->{message});
+
+	if ($OPS{$op}{mutates} || $op eq 'authenticate' || !$outcome->{ok}) {
+		_audit_request($ctx, $peer, $id, $op, $clean, $response, $outcome->{detail});
+	}
+	return $response;
+}
+
+# Arguments that failed validation are still logged, so the audit trail shows
+# what was attempted - but 'pass' never is, not even to say it was rejected.
+sub _redacted {
+	my ($op, $args) = @_;
+	my %copy = %{ $args || {} };
+	delete $copy{pass};
+	for my $key (keys %copy) {
+		$copy{$key} = $P->can('sanitise')->($copy{$key}, 200) unless ref $copy{$key};
+		delete $copy{$key} if ref $copy{$key};
+	}
+	return \%copy;
+}
+
+sub execute {
+	my ($ctx, $op, $args, $peer) = @_;
+	my $spec = $OPS{$op};
+
+	if ($spec->{mutates} && !_rate_admit($ctx, 'mutate', $LIMIT{mutate_per_minute})) {
+		return _fail('E_BUSY', 'too many mutating requests; try again shortly');
+	}
+
+	if ($spec->{child} && $op ne 'status') {
+		my $gate = _csf_state_gate($ctx, $op);
+		return $gate if $gate;
+	}
+
+	my %handler = (
+		status        => \&op_status,
+		counts        => \&op_counts,
+		deny          => \&op_deny,
+		undeny        => \&op_undeny,
+		allow         => \&op_allow,
+		unallow       => \&op_unallow,
+		tempdeny      => \&op_tempdeny,
+		temprm        => \&op_temprm,
+		list          => \&op_list,
+		'grep'        => \&op_grep,
+		reconcile     => \&op_reconcile,
+		reconcile_fix => \&op_reconcile_fix,
+		restart       => \&op_restart,
+		authenticate  => \&op_authenticate,
+	);
+
+	my $result = eval { $handler{$op}->($ctx, $args, $peer) };
+	if ($@) {
+		# E_INTERNAL never carries a stack trace, a path or any part of the
+		# request back to the caller (section 3.5). The detail goes to the log.
+		return {
+			ok      => 0,
+			error   => 'E_INTERNAL',
+			message => 'the helper failed to complete the request',
+			detail  => (ref($@) ? 'internal fault' : "$@"),
+		};
+	}
+	return $result;
+}
+
+# section 5.0.5. status is exempt because it is the operation that reports these
+# two states; restart is exempt from csf.error because csf.pl:104 exempts -r and
+# restarting is how that state is cleared.
+sub _csf_state_gate {
+	my ($ctx, $op) = @_;
+	if (-e $ctx->{path}{csf_disable}) {
+		return _fail('E_REFUSED',
+			"csf and lfd have been disabled; re-enable them with 'csf -e' from a shell");
+	}
+	if ($op ne 'restart' && -e $ctx->{path}{csf_error}) {
+		my ($lines) = _slurp_lines($ctx->{path}{csf_error});
+		my $first = (@$lines && defined $lines->[0]) ? $P->can('sanitise')->($lines->[0], 200) : '';
+		return _fail('E_REFUSED',
+			'csf has an unresolved start error; restart csf to clear it: ' . $first);
+	}
+	return undef;
+}
+
+###############################################################################
+# 5.1 status
+###############################################################################
+sub op_status {
+	my ($ctx, $args) = @_;
+	my $conf = read_csf_conf($ctx);
+	return _fail('E_UNAVAILABLE', 'csf.conf could not be read') unless $conf;
+	my $iptables = $conf->{IPTABLES};
+	return _fail('E_UNAVAILABLE', 'IPTABLES is not set in csf.conf')
+		unless defined $iptables && length $iptables;
+
+	my $result = $ctx->{run}->($ctx, $LIMIT{deadline_status}, $iptables, '-S');
+	my $failure = _child_failed($result);
+	# "the firewall is not loaded" and "I could not find out" are different
+	# answers and this must not report the second as the first (section 5.1).
+	return _fail('E_BACKEND', "cannot determine the firewall state: $failure") if $failure;
+	return _fail('E_BACKEND', 'cannot determine the firewall state: iptables exited '
+		. $result->{exit}) if $result->{exit} != 0;
+
+	my $loaded = ($result->{output} =~ /(?:^|\n)-[NA]\s+DENYIN(?:\s|$)/) ? 1 : 0;
+
+	my $version;
+	my ($version_lines) = _slurp_lines($ctx->{path}{csf_version});
+	if (@$version_lines) {
+		my $candidate = $version_lines->[0];
+		$candidate = '' unless defined $candidate;
+		$candidate =~ s/\s+//g;
+		$version = $candidate if $candidate =~ /^[0-9.]{1,16}$/;
+	}
+
+	my $start_error;
+	if (-e $ctx->{path}{csf_error}) {
+		my ($error_lines) = _slurp_lines($ctx->{path}{csf_error});
+		$start_error = $P->can('sanitise')->((@$error_lines ? $error_lines->[0] : ''), 256);
+	}
+
+	my $lfd_running = 0;
+	my ($pid_lines) = _slurp_lines($ctx->{path}{lfd_pid});
+	if (@$pid_lines && defined $pid_lines->[0] && $pid_lines->[0] =~ /^\s*([0-9]{1,10})\s*$/) {
+		$lfd_running = kill(0, $1) ? 1 : 0;
+	}
+
+	return _ok({
+		enabled      => _bool(!-e $ctx->{path}{csf_disable}),
+		rules_loaded => _bool($loaded),
+		testing      => _bool(_conf_flag($conf, 'TESTING')),
+		ipv6         => _bool(_conf_flag($conf, 'IPV6')),
+		lfd_running  => _bool($lfd_running),
+		version      => $version,
+		start_error  => $start_error,
+		ipset_mode   => _bool(_conf_flag($conf, 'LF_IPSET')),
+		generated    => now($ctx) + 0,
+	});
+}
+
+###############################################################################
+# 5.2 counts
+###############################################################################
+sub op_counts {
+	my ($ctx, $args) = @_;
+	my %out;
+	for my $pair ([deny => 'csf_deny'], [allow => 'csf_allow']) {
+		my ($name, $key) = @$pair;
+		my ($set) = _entries($ctx, $key);
+		return _fail('E_BACKEND', "$name list could not be read") unless $set;
+		$out{$name} = scalar @{ $set->{rows} };
+		$out{"${name}_includes"} = $set->{includes};
+	}
+	for my $pair ([temp_deny => 'tempban'], [temp_allow => 'tempallow']) {
+		my ($name, $key) = @$pair;
+		my ($set) = _entries($ctx, $key);
+		return _fail('E_BACKEND', "$name list could not be read") unless $set;
+		$out{$name} = scalar grep { !$_->{expired} } @{ $set->{rows} };
+	}
+	$out{generated} = now($ctx) + 0;
+	return _ok(\%out);
+}
+
+###############################################################################
+# 5.3 - 5.6 permanent deny and allow
+###############################################################################
+sub _add_entry {
+	my ($ctx, $args, $flag, $key) = @_;
+	my ($before) = _entries($ctx, $key);
+	return _fail('E_BACKEND', 'the list could not be read') unless $before;
+	my $present = scalar @{ _matching($before, $args->{ip}) };
+
+	my $result = $ctx->{run}->($ctx, $LIMIT{deadline_mutate},
+		$ctx->{path}{csf_bin}, $flag, $args->{ip}, $args->{note});
+	my $failure = _child_failed($result);
+	return _fail('E_BACKEND', "csf $flag failed: $failure") if $failure;
+
+	my ($after) = _entries($ctx, $key);
+	return _fail('E_BACKEND', 'the list could not be re-read after the change') unless $after;
+	my $now_present = scalar @{ _matching($after, $args->{ip}) };
+
+	if ($now_present > $present) {
+		return { ok => 1, detail => 'added',
+			data => { ip => $args->{ip}, added => _true() } };
+	}
+	if ($present > 0) {
+		return { ok => 1, detail => 'already present',
+			data => { ip => $args->{ip}, added => _false(), already => _true() } };
+	}
+	my $refusal = _recognised_refusal($result->{output});
+	return { ok => 0, error => 'E_REFUSED', message => $refusal, detail => 'refused by csf' }
+		if defined $refusal;
+	return _fail('E_BACKEND', 'csf made no change and gave no reason this helper recognises');
+}
+
+sub _remove_entry {
+	my ($ctx, $args, $flag, $key) = @_;
+	my ($before) = _entries($ctx, $key);
+	return _fail('E_BACKEND', 'the list could not be read') unless $before;
+	my $was = scalar @{ _matching($before, $args->{ip}) };
+
+	my $result = $ctx->{run}->($ctx, $LIMIT{deadline_mutate},
+		$ctx->{path}{csf_bin}, $flag, $args->{ip});
+	my $failure = _child_failed($result);
+	return _fail('E_BACKEND', "csf $flag failed: $failure") if $failure;
+
+	my ($after) = _entries($ctx, $key);
+	return _fail('E_BACKEND', 'the list could not be re-read after the change') unless $after;
+	my $left = _matching($after, $args->{ip});
+	my $removed = $was - scalar(@$left);
+	$removed = 0 if $removed < 0;
+	# csf keeps entries whose note says so (csf.pl:1735), and the count comes
+	# from the file rather than from csf's message text.
+	my $protected = scalar grep { defined $_->{note} && $_->{note} =~ /do not delete/i } @$left;
+
+	return { ok => 1, detail => "removed $removed",
+		data => { ip => $args->{ip}, removed => $removed + 0, protected => $protected + 0 } };
+}
+
+sub op_deny    { my ($ctx, $args) = @_; return _add_entry($ctx, $args, '-d', 'csf_deny') }
+sub op_allow   { my ($ctx, $args) = @_; return _add_entry($ctx, $args, '-a', 'csf_allow') }
+sub op_undeny  { my ($ctx, $args) = @_; return _remove_entry($ctx, $args, '-dr', 'csf_deny') }
+sub op_unallow { my ($ctx, $args) = @_; return _remove_entry($ctx, $args, '-ar', 'csf_allow') }
+
+###############################################################################
+# 5.7 tempdeny
+###############################################################################
+sub op_tempdeny {
+	my ($ctx, $args) = @_;
+	my ($before) = _entries($ctx, 'tempban');
+	return _fail('E_BACKEND', 'the temporary ban list could not be read') unless $before;
+	my $was = scalar @{ _matching($before, $args->{ip}, 1) };
+
+	my @argv = ($ctx->{path}{csf_bin}, '-td', $args->{ip}, $args->{ttl});
+	push @argv, '-p', $args->{ports} if defined $args->{ports} && length $args->{ports};
+	push @argv, $TEMPDENY_NOTE;
+
+	my $result = $ctx->{run}->($ctx, $LIMIT{deadline_mutate}, @argv);
+	my $failure = _child_failed($result);
+	return _fail('E_BACKEND', "csf -td failed: $failure") if $failure;
+
+	my ($after) = _entries($ctx, 'tempban');
+	return _fail('E_BACKEND', 'the temporary ban list could not be re-read') unless $after;
+	my $rows = _matching($after, $args->{ip}, 1);
+
+	if (scalar(@$rows) > $was) {
+		my $row = $rows->[-1];
+		return { ok => 1, detail => 'added', data => {
+			ip      => $args->{ip},
+			added   => _true(),
+			ttl     => $args->{ttl} + 0,
+			ports   => $P->can('sanitise')->($row->{ports}, 120),
+			dir     => $row->{dir},
+			note    => $TEMPDENY_NOTE,
+			expires => $row->{expires} + 0,
+		} };
+	}
+	if ($was > 0) {
+		my $row = $rows->[0];
+		return { ok => 1, detail => 'already present', data => {
+			ip      => $args->{ip},
+			added   => _false(),
+			already => _true(),
+			ttl     => $args->{ttl} + 0,
+			ports   => ($row ? $P->can('sanitise')->($row->{ports}, 120) : '*'),
+			dir     => ($row ? $row->{dir} : 'in'),
+			note    => $TEMPDENY_NOTE,
+			expires => ($row ? $row->{expires} + 0 : 0),
+		} };
+	}
+	my $refusal = _recognised_refusal($result->{output});
+	return { ok => 0, error => 'E_REFUSED', message => $refusal, detail => 'refused by csf' }
+		if defined $refusal;
+	return _fail('E_BACKEND', 'csf made no change and gave no reason this helper recognises');
+}
+
+###############################################################################
+# 5.8 temprm - csf -trd, never csf -tr, which would also delete a temporary
+# allow the operator cannot see on this screen.
+###############################################################################
+sub op_temprm {
+	my ($ctx, $args) = @_;
+	my ($before) = _entries($ctx, 'tempban');
+	return _fail('E_BACKEND', 'the temporary ban list could not be read') unless $before;
+	my $was = scalar @{ _matching($before, $args->{ip}, 1) };
+
+	my $result = $ctx->{run}->($ctx, $LIMIT{deadline_mutate},
+		$ctx->{path}{csf_bin}, '-trd', $args->{ip});
+	my $failure = _child_failed($result);
+	return _fail('E_BACKEND', "csf -trd failed: $failure") if $failure;
+
+	my ($after) = _entries($ctx, 'tempban');
+	return _fail('E_BACKEND', 'the temporary ban list could not be re-read') unless $after;
+	my $removed = $was - scalar @{ _matching($after, $args->{ip}, 1) };
+	$removed = 0 if $removed < 0;
+	return { ok => 1, detail => "removed $removed",
+		data => { ip => $args->{ip}, removed => $removed + 0 } };
+}
+
+###############################################################################
+# 5.9 list
+###############################################################################
+sub op_list {
+	my ($ctx, $args) = @_;
+	my $key = $WHICH_FILE{ $args->{which} };
+	my ($set) = _entries($ctx, $key);
+	return _fail('E_BACKEND', 'the list could not be read') unless $set;
+
+	my $filter = defined $args->{filter} ? $args->{filter} : '';
+	$filter =~ tr/A-Z/a-z/;
+	my @rows;
+	for my $row (@{ $set->{rows} }) {
+		next if $row->{expired};
+		my $note = $P->can('sanitise')->($row->{note}, 200);
+		if (length $filter) {
+			my $haystack = $row->{ip} . ' ' . $note;
+			$haystack =~ tr/A-Z/a-z/;
+			next unless index($haystack, $filter) >= 0;
+		}
+		if ($args->{which} eq 'temp') {
+			push @rows, {
+				ip       => $row->{ip},
+				note     => $note,
+				ports    => $P->can('sanitise')->($row->{ports}, 120),
+				dir      => $row->{dir},
+				expires  => $row->{expires} + 0,
+				ttl_left => $row->{ttl_left} + 0,
+			};
+		}
+		else {
+			push @rows, {
+				ip        => $row->{ip},
+				note      => $note,
+				protected => _bool($note =~ /do not delete/i),
+				line      => $row->{line} + 0,
+			};
+		}
+	}
+
+	my $total = scalar @rows;
+	my $offset = $args->{offset};
+	my $limit = $args->{limit};
+	my @page = ($offset < $total) ? @rows[ $offset .. _min($offset + $limit, $total) - 1 ] : ();
+
+	my ($kept, $truncated) = _fit_rows(\@page);
+	my $returned = scalar @$kept;
+	my $next = ($offset + $returned < $total) ? $offset + $returned : undef;
+
+	my %data = (
+		which       => $args->{which},
+		total       => $total + 0,
+		offset      => $offset + 0,
+		returned    => $returned + 0,
+		next_offset => (defined $next ? $next + 0 : undef),
+		truncated   => _bool($truncated),
+		includes    => $set->{includes} + 0,
+		rows        => $kept,
+	);
+	$data{unparsable} = $set->{unparsable} + 0 if $set->{unparsable};
+	return _ok(\%data);
+}
+
+sub _min { return $_[0] < $_[1] ? $_[0] : $_[1] }
+
+# section 3.4: rows are built against a byte budget and the count reported is
+# what was actually returned, because the caller pages with offset + returned.
+sub _fit_rows {
+	my ($rows) = @_;
+	my $budget = $ConfigServer::UI::Proto::MAXLINE - $ConfigServer::UI::Proto::ENVELOPE_RESERVE;
+	my $used = 0;
+	my @kept;
+	for my $row (@$rows) {
+		my $size = $P->can('bytelen')->(JSON::Tiny::to_json($row)) + 1;
+		if ($used + $size > $budget) {
+			return (\@kept, 1);
+		}
+		$used += $size;
+		push @kept, $row;
+	}
+	return (\@kept, 0);
+}
+
+###############################################################################
+# 5.10 grep
+###############################################################################
+sub op_grep {
+	my ($ctx, $args) = @_;
+	my $result = $ctx->{run}->($ctx, $LIMIT{deadline_read},
+		$ctx->{path}{csf_bin}, '-g', $args->{ip});
+	my $failure = _child_failed($result);
+	return _fail('E_BACKEND', "csf -g failed: $failure") if $failure;
+
+	my @all = split(/\n/, defined $result->{output} ? $result->{output} : '');
+	my $count = scalar @all;
+	my $truncated = 0;
+	if ($count > 200) { $truncated = 1; @all = @all[0 .. 199] }
+
+	my $budget = $ConfigServer::UI::Proto::MAXLINE - $ConfigServer::UI::Proto::ENVELOPE_RESERVE;
+	my $used = 0;
+	my @lines;
+	for my $raw (@all) {
+		my $line = $P->can('sanitise')->($raw, 512);
+		my $size = $P->can('bytelen')->($line) + 8;
+		if ($used + $size > $budget) { $truncated = 1; last }
+		$used += $size;
+		push @lines, $line;
+	}
+
+	return _ok({
+		ip        => $args->{ip},
+		lines     => \@lines,
+		count     => $count + 0,
+		truncated => _bool($truncated),
+	});
+}
+
+###############################################################################
+# 5.11 reconcile
+###############################################################################
+sub _iptables_rules {
+	my ($ctx, $binary, $family) = @_;
+	my $result = $ctx->{run}->($ctx, $LIMIT{deadline_read}, $binary, '-S');
+	my $failure = _child_failed($result);
+	return (undef, "iptables -S failed: $failure") if $failure;
+	return (undef, "iptables -S exited $result->{exit}") if $result->{exit} != 0;
+
+	my %scoped = map { $_ => 1 } @SCOPED_CHAINS;
+	my @rules;
+	for my $line (split(/\n/, defined $result->{output} ? $result->{output} : '')) {
+		$line =~ s/\s+$//;
+		next unless $line =~ /^-A\s+(\S+)\s+(.*)$/;
+		my ($chain, $rest) = ($1, $2);
+		next unless $scoped{$chain};
+		my @tokens = split(/\s+/, $rest);
+		next unless @tokens;
+		my $parsable = 1;
+		for my $token (@tokens) {
+			next if $token =~ /^[A-Za-z0-9_.:\/,=+-]+$/;
+			$parsable = 0;
+			last;
+		}
+		my $address;
+		if ($parsable) {
+			my $wanted = ($chain eq 'DENYOUT') ? '-d' : '-s';
+			for my $index (0 .. $#tokens - 1) {
+				next unless $tokens[$index] eq $wanted;
+				my ($canonical) = $P->can('validate_ip')->($tokens[$index + 1], zero_prefix => 1);
+				$address = $canonical if defined $canonical;
+				last;
+			}
+			next unless defined $address;
+		}
+		push @rules, {
+			chain    => $chain,
+			family   => $family,
+			tokens   => \@tokens,
+			spec     => join(' ', @tokens),
+			ip       => $address,
+			parsable => $parsable,
+		};
+	}
+	return (\@rules, undef);
+}
+
+sub _finding_id {
+	my ($kind, $family, $chain, $spec) = @_;
+	my $material = join("\0", $kind, $family, $chain, $spec);
+	return substr(Digest::SHA::sha256_hex($material), 0, 32);
+}
+
+sub _scan {
+	my ($ctx) = @_;
+	my $conf = read_csf_conf($ctx);
+	return (undef, _fail('E_UNAVAILABLE', 'csf.conf could not be read')) unless $conf;
+	return (undef, _fail('E_UNAVAILABLE',
+		'LF_IPSET is enabled, so blocked addresses are ipset members and a per-rule comparison would report every entry as a ghost'))
+		if _conf_flag($conf, 'LF_IPSET');
+
+	my @families = ([4, $conf->{IPTABLES}]);
+	push @families, [6, $conf->{IP6TABLES}] if _conf_flag($conf, 'IPV6');
+
+	my @rules;
+	for my $family (@families) {
+		my ($number, $binary) = @$family;
+		return (undef, _fail('E_UNAVAILABLE', "the iptables binary for IPv$number is not set in csf.conf"))
+			unless defined $binary && length $binary;
+		my ($found, $error) = _iptables_rules($ctx, $binary, $number);
+		return (undef, _fail('E_BACKEND', $error)) unless $found;
+		push @rules, @$found;
+	}
+
+	my ($deny) = _entries($ctx, 'csf_deny');
+	return (undef, _fail('E_BACKEND', 'csf.deny could not be read')) unless $deny;
+	my ($temp) = _entries($ctx, 'tempban');
+	return (undef, _fail('E_BACKEND', 'the temporary ban list could not be read')) unless $temp;
+
+	my %configured;
+	$configured{ $P->can('ip_key')->($_->{ip}) } = 1 for @{ $deny->{rows} };
+	for my $row (@{ $temp->{rows} }) {
+		next if $row->{expired};
+		$configured{ $P->can('ip_key')->($row->{ip}) } = 1;
+	}
+
+	my (%group, @order);
+	for my $rule (@rules) {
+		my $group_key = join("\0", $rule->{family}, $rule->{chain}, $rule->{spec});
+		unless ($group{$group_key}) {
+			$group{$group_key} = { rule => $rule, count => 0 };
+			push @order, $group_key;
+		}
+		$group{$group_key}{count}++;
+	}
+
+	my %loaded;
+	for my $rule (@rules) {
+		next unless defined $rule->{ip};
+		$loaded{ $P->can('ip_key')->($rule->{ip}) } = 1;
+	}
+
+	my @entries;
+	my %totals = (orphan => 0, ghost => 0, dup => 0);
+
+	for my $group_key (@order) {
+		my $group = $group{$group_key};
+		my $rule = $group->{rule};
+		my ($kind, $fixable, $reason, $deletes);
+
+		if (!$rule->{parsable}) {
+			# Never approximately parsed: section 5.12 turns tokens back into a
+			# delete command, so a rule this helper cannot read is a rule it
+			# will not touch.
+			($kind, $fixable, $reason, $deletes) = ('ORPHAN', 0, 'unparsable', 0);
+		}
+		elsif (!$configured{ $P->can('ip_key')->($rule->{ip}) }) {
+			($kind, $fixable, $reason, $deletes) = ('ORPHAN', 1, undef, $group->{count});
+		}
+		elsif ($group->{count} > 1) {
+			($kind, $fixable, $reason, $deletes) = ('DUP', 1, undef, $group->{count} - 1);
+		}
+		else {
+			next;
+		}
+
+		$totals{ lc $kind }++;
+		push @entries, {
+			id      => _finding_id($kind, $rule->{family}, $rule->{chain}, $rule->{spec}),
+			kind    => $kind,
+			family  => $rule->{family} + 0,
+			chain   => $rule->{chain},
+			ip      => $rule->{ip},
+			spec    => $rule->{spec},
+			fixable => $fixable,
+			reason  => $reason,
+			tokens  => $rule->{tokens},
+			deletes => $deletes,
+		};
+	}
+
+	for my $row (@{ $deny->{rows} }) {
+		my $key = $P->can('ip_key')->($row->{ip});
+		next if $loaded{$key};
+		my $family = ($row->{ip} =~ /:/) ? 6 : 4;
+		next if $family == 6 && !_conf_flag($conf, 'IPV6');
+		$totals{ghost}++;
+		push @entries, {
+			id      => _finding_id('GHOST', $family, '', $row->{ip}),
+			kind    => 'GHOST',
+			family  => $family,
+			chain   => undef,
+			ip      => $row->{ip},
+			spec    => undef,
+			fixable => 0,
+			reason  => 'not loaded; the remedy is a restart',
+			tokens  => undef,
+			deletes => 0,
+		};
+	}
+
+	return ({ totals => \%totals, entries => \@entries }, undef);
+}
+
+sub op_reconcile {
+	my ($ctx, $args) = @_;
+	my ($scan, $failure) = _scan($ctx);
+	return $failure unless $scan;
+
+	my @wire;
+	for my $entry (@{ $scan->{entries} }) {
+		push @wire, {
+			id      => $entry->{id},
+			kind    => $entry->{kind},
+			family  => $entry->{family},
+			chain   => $entry->{chain},
+			ip      => $entry->{ip},
+			spec    => (defined $entry->{spec} ? $P->can('sanitise')->($entry->{spec}, 400) : undef),
+			fixable => _bool($entry->{fixable}),
+			reason  => $entry->{reason},
+		};
+	}
+	my ($kept, $truncated) = _fit_rows(\@wire);
+
+	return _ok({
+		totals    => { map { $_ => $scan->{totals}{$_} + 0 } keys %{ $scan->{totals} } },
+		returned  => scalar(@$kept) + 0,
+		truncated => _bool($truncated),
+		generated => now($ctx) + 0,
+		entries   => $kept,
+	});
+}
+
+###############################################################################
+# 5.12 reconcile_fix
+#
+# The ids are not capabilities. Every call re-runs the whole scan and acts only
+# on ids present in that fresh result and marked fixable, so a fabricated id
+# names nothing: the caller does not name rules, it names findings this helper
+# just made itself.
+###############################################################################
+sub op_reconcile_fix {
+	my ($ctx, $args) = @_;
+	my ($scan, $failure) = _scan($ctx);
+	return $failure unless $scan;
+
+	my $conf = read_csf_conf($ctx);
+	my %binary = (4 => $conf->{IPTABLES}, 6 => $conf->{IP6TABLES});
+	my %fresh = map { $_->{id} => $_ } @{ $scan->{entries} };
+
+	my (@results, $fixed, $stale, $unfixable);
+	($fixed, $stale, $unfixable) = (0, 0, 0);
+
+	for my $id (@{ $args->{ids} }) {
+		my $entry = $fresh{$id};
+		unless ($entry) {
+			$stale++;
+			push @results, { id => $id, outcome => 'stale' };
+			next;
+		}
+		unless ($entry->{fixable}) {
+			$unfixable++;
+			push @results, { id => $id, outcome => 'unfixable' };
+			next;
+		}
+		my $command = $binary{ $entry->{family} };
+		unless (defined $command && length $command) {
+			$unfixable++;
+			push @results, { id => $id, outcome => 'unfixable' };
+			next;
+		}
+
+		my $deleted = 0;
+		my $failed = 0;
+		for (1 .. $entry->{deletes}) {
+			my $result = $ctx->{run}->($ctx, $LIMIT{deadline_mutate},
+				$command, '-D', $entry->{chain}, @{ $entry->{tokens} });
+			if (_child_failed($result) || $result->{exit} != 0) { $failed = 1; last }
+			$deleted++;
+		}
+		if ($deleted && !$failed) {
+			$fixed++;
+			push @results, { id => $id, outcome => 'deleted' };
+		}
+		else {
+			push @results, { id => $id, outcome => 'failed' };
+		}
+	}
+
+	return _fail('E_STALE', 'every id in this request is absent from a fresh scan; the page is out of date')
+		if $stale == scalar @{ $args->{ids} };
+
+	return { ok => 1, detail => "fixed $fixed", data => {
+		fixed     => $fixed + 0,
+		stale     => $stale + 0,
+		unfixable => $unfixable + 0,
+		results   => \@results,
+	} };
+}
+
+###############################################################################
+# 5.13 restart
+###############################################################################
+sub op_restart {
+	my ($ctx, $args) = @_;
+	my $wait = _restart_gate($ctx);
+	return _fail('E_BUSY', "a restart ran less than $LIMIT{restart_interval} seconds ago; try again in $wait seconds")
+		if $wait > 0;
+
+	my $started = Time::HiRes::time();
+	my $result = $ctx->{run}->($ctx, $LIMIT{deadline_restart}, $ctx->{path}{csf_bin}, '-r');
+	my $elapsed = int((Time::HiRes::time() - $started) * 1000);
+
+	if ($result->{timeout}) {
+		return _fail('E_BACKEND',
+			'csf -r exceeded its deadline and was killed; the restart may still have taken effect');
+	}
+	my $failure = _child_failed($result);
+	return _fail('E_BACKEND', "csf -r failed: $failure") if $failure;
+
+	my $output = defined $result->{output} ? $result->{output} : '';
+	return _fail('E_BUSY', 'csf is being restarted by something else; try again in a moment')
+		if $output =~ /being restarted, try again in a moment/i;
+	my $refusal = _recognised_refusal($output);
+	return { ok => 0, error => 'E_REFUSED', message => $refusal, detail => 'refused by csf' }
+		if defined $refusal;
+
+	_restart_mark($ctx);
+
+	my @warnings;
+	for my $line (split(/\n/, $output)) {
+		next unless $line =~ /\*WARNING\*/;
+		push @warnings, $P->can('sanitise')->($line, 400);
+		last if @warnings >= 20;
+	}
+	my $conf = read_csf_conf($ctx);
+
+	return { ok => 1, detail => "restarted in ${elapsed}ms", data => {
+		restarted   => _true(),
+		duration_ms => $elapsed + 0,
+		testing     => _bool($conf ? _conf_flag($conf, 'TESTING') : 0),
+		warnings    => \@warnings,
+	} };
+}
+
+###############################################################################
+# 5.14 authenticate
+#
+# The envelope's ok means the helper answered the question. data.ok means the
+# credentials are valid. A wrong password is a successful call with a negative
+# verdict, never an RPC error - confusing the two is how a web tier treats a
+# backend failure as a login.
+###############################################################################
+sub auth_verify {
+	my ($ctx, $hash, $pass) = @_;
+	# R17: the seam is defined here and filled by Task 3. Until ConfigServer::UI::Auth
+	# exists this fails closed - E_UNAVAILABLE, and it must not burn the failure
+	# counter, because a store the helper cannot verify must not lock out the
+	# administrator who would fix it.
+	my $loaded = eval { local $SIG{__DIE__}; require ConfigServer::UI::Auth; 1 };
+	return (undef, 'the password verifier is not installed; run the installer to add ConfigServer::UI::Auth')
+		unless $loaded && ConfigServer::UI::Auth->can('verify');
+	my $verdict = eval { ConfigServer::UI::Auth::verify($hash, $pass) };
+	return (undef, 'the password verifier could not run') if $@;
+	return ((defined $verdict && $verdict) ? 1 : 0, undef);
+}
+
+sub _auth_store {
+	my ($ctx) = @_;
+	my $path = $ctx->{path}{users};
+	my $remedy = 'create an account with csf-ui-passwd';
+
+	return (undef, "the password store does not exist; $remedy") unless -e $path || -l $path;
+	return (undef, "the password store is a symlink; $remedy") if -l $path;
+	my @stat = stat($path);
+	return (undef, "the password store could not be read; $remedy") unless @stat;
+	return (undef, "the password store is not a regular file; $remedy") unless -f _;
+	# The helper is root in production (a startup precondition), so this is the
+	# 0600-root check; in a test harness it is "owned by whoever runs me".
+	return (undef, 'the password store is not owned by the user this helper runs as')
+		unless $stat[4] == $>;
+	return (undef, 'the password store is readable by group or other; it must be mode 0600')
+		if ($stat[2] & 0077);
+
+	open(my $fh, '<', $path) or return (undef, "the password store could not be opened; $remedy");
+	my %record;
+	my $accounts = 0;
+	while (my $line = <$fh>) {
+		chomp $line;
+		next if $line =~ /^\s*$/ || $line =~ /^\s*#/;
+		my ($user, $algo, $hash, $role, $created) = split(/:/, $line, 5);
+		next unless defined $user && defined $algo && defined $hash && defined $role;
+		next unless $user =~ /^[a-z0-9_-]{1,32}$/;
+		$accounts++;
+		$record{$user} = { user => $user, algo => $algo, hash => $hash, role => $role };
+	}
+	close $fh;
+	return (undef, "the password store contains no accounts; $remedy") unless $accounts;
+	return (\%record, undef);
+}
+
+sub op_authenticate {
+	my ($ctx, $args, $peer) = @_;
+
+	return _fail('E_BUSY', 'too many authentication requests; try again shortly')
+		unless _rate_admit($ctx, 'auth', $LIMIT{auth_per_minute});
+	return _fail('E_BUSY', 'too many authentication requests are in flight; try again shortly')
+		unless _auth_slot_take($ctx);
+
+	my $result = eval { _authenticate_inner($ctx, $args) };
+	my $error = $@;
+	_auth_slot_release($ctx);
+	die $error if $error;
+	return $result;
+}
+
+sub _authenticate_inner {
+	my ($ctx, $args) = @_;
+	my $user = $args->{user};
+
+	my $lock = _auth_state_check($ctx, $user);
+	if ($lock->{locked}) {
+		# Answered without running crypt() at all, which is what makes the
+		# counter a CPU control as well as an anti-guessing one.
+		return { ok => 1, detail => 'locked', data => {
+			ok => _false(), role => undef, locked => _true(),
+			retry_after => $lock->{retry_after} + 0,
+		} };
+	}
+
+	my ($store, $why) = _auth_store($ctx);
+	return { ok => 0, error => 'E_UNAVAILABLE', message => $why, detail => 'store unusable' }
+		unless $store;
+
+	my $record = $store->{$user};
+	my $hash = $record ? $record->{hash} : $DUMMY_HASH;
+
+	if ($record && $record->{algo} ne '6') {
+		# Unverifiable, not wrong: E_UNAVAILABLE and the counter is untouched.
+		return { ok => 0, error => 'E_UNAVAILABLE',
+			message => "the record for this user uses hash algorithm "
+				. $P->can('sanitise')->($record->{algo}, 16)
+				. ", which this helper cannot verify; reset it with csf-ui-passwd",
+			detail => 'unknown algo' };
+	}
+
+	my ($verdict, $unavailable) = $ctx->{auth_verify}->($ctx, $hash, $args->{pass});
+	unless (defined $verdict) {
+		return { ok => 0, error => 'E_UNAVAILABLE', message => $unavailable,
+			detail => 'verifier unavailable' };
+	}
+
+	if ($verdict && $record) {
+		my $role = $record->{role};
+		unless (defined $role && ($role eq 'admin' || $role eq 'support')) {
+			return { ok => 0, error => 'E_UNAVAILABLE',
+				message => 'the record for this user carries no usable role; reset it with csf-ui-passwd',
+				detail => 'bad role' };
+		}
+		_auth_state_clear($ctx, $user);
+		return { ok => 1, detail => 'ok', data => { ok => _true(), role => $role } };
+	}
+
+	my $state = _auth_state_fail($ctx, $user);
+	return { ok => 1, detail => ($state->{locked} ? 'bad, now locked' : 'bad'), data => {
+		ok => _false(), role => undef,
+		locked => _bool($state->{locked}),
+		retry_after => $state->{retry_after} + 0,
+	} };
+}
+
+###############################################################################
+# Startup preconditions (section 2.1). All of them fail closed: the helper never
+# starts in a degraded mode, because a degraded root daemon on this socket is
+# worse than no daemon at all.
+###############################################################################
+sub preflight {
+	my ($ctx) = @_;
+	my @problem;
+
+	push @problem, 'csf-ui-helper must run as root' unless $> == 0;
+
+	push @problem, 'Perl 5.14 or later is required (Socket 1.94 brought inet_pton, inet_ntop and SO_PEERCRED)'
+		unless $] >= 5.014;
+	my $socket_version = eval { $Socket::VERSION } || 0;
+	push @problem, "Socket 1.94 or later is required, found $socket_version"
+		unless $socket_version >= 1.94;
+	for my $symbol (qw(inet_pton inet_ntop SO_PEERCRED SOL_SOCKET)) {
+		push @problem, "Socket::$symbol is not available in this Perl"
+			unless Socket->can($symbol);
+	}
+
+	my $dir = $ctx->{path}{socket_dir};
+	if (-e $dir) {
+		my @stat = stat($dir);
+		push @problem, "$dir is not a directory" unless -d _;
+		push @problem, "$dir is not owned by root" if @stat && $stat[4] != 0;
+		push @problem, "$dir is writable by group or other" if @stat && ($stat[2] & 0022);
+	}
+
+	my $socket = $ctx->{path}{socket};
+	if (-e $socket) {
+		push @problem, "$socket exists and is not a socket" unless -S $socket;
+		my @stat = stat($socket);
+		push @problem, "$socket is not owned by root" if @stat && $stat[4] != 0;
+	}
+
+	push @problem, _check_program($ctx->{path}{csf_bin}, 'csf');
+
+	my $conf = read_csf_conf($ctx);
+	if (!$conf) {
+		push @problem, "$ctx->{path}{csf_conf} could not be read";
+	}
+	else {
+		push @problem, _check_program($conf->{IPTABLES}, 'IPTABLES from csf.conf');
+		push @problem, _check_program($conf->{IP6TABLES}, 'IP6TABLES from csf.conf')
+			if _conf_flag($conf, 'IPV6');
+	}
+
+	return grep { defined $_ && length $_ } @problem;
+}
+
+sub _check_program {
+	my ($path, $label) = @_;
+	return "$label is not set" unless defined $path && length $path;
+	return "$label ($path) is not an absolute path" unless $path =~ m{^/};
+	return "$label ($path) does not exist" unless -e $path;
+	return "$label ($path) is not a regular file" unless -f $path;
+	my @stat = stat($path);
+	return "$label ($path) is not owned by root" unless @stat && $stat[4] == 0;
+	return "$label ($path) is writable by group or other" if $stat[2] & 0022;
+	return undef;
+}
+
+###############################################################################
+# The daemon
+###############################################################################
+sub open_socket {
+	my ($ctx) = @_;
+	my $dir = $ctx->{path}{socket_dir};
+	unless (-d $dir) {
+		mkdir($dir, 0755) or die "csf-ui-helper: cannot create $dir: $!\n";
+	}
+	chmod(0755, $dir);
+	chown(0, 0, $dir);
+
+	my $path = $ctx->{path}{socket};
+	if (-e $path) {
+		die "csf-ui-helper: $path is not a socket\n" unless -S $path;
+		my @stat = stat($path);
+		die "csf-ui-helper: $path is not owned by root\n" unless @stat && $stat[4] == 0;
+		unlink($path) or die "csf-ui-helper: cannot remove $path: $!\n";
+	}
+
+	my $old = umask(0177);
+	socket(my $listener, Socket::PF_UNIX(), Socket::SOCK_STREAM(), 0)
+		or die "csf-ui-helper: socket: $!\n";
+	bind($listener, Socket::pack_sockaddr_un($path))
+		or die "csf-ui-helper: bind $path: $!\n";
+	umask($old);
+
+	my $gid = getgrnam('csfui');
+	if (defined $gid) {
+		chown(0, $gid, $path) or die "csf-ui-helper: cannot set the socket group: $!\n";
+		chmod(0660, $path) or die "csf-ui-helper: cannot set the socket mode: $!\n";
+	}
+	else {
+		# R2 and G3: no permissive fallback. The socket stays root-only and every
+		# connection is refused with a reason until the installer creates the group.
+		chown(0, 0, $path);
+		chmod(0600, $path) or die "csf-ui-helper: cannot set the socket mode: $!\n";
+		$ctx->{group_ready} = 0;
+	}
+
+	listen($listener, $LIMIT{backlog}) or die "csf-ui-helper: listen: $!\n";
+	return $listener;
+}
+
+sub serve_connection {
+	my ($ctx, $connection, $peer) = @_;
+	my $deadline = Time::HiRes::time() + $LIMIT{read_timeout};
+
+	my $request = eval { $P->can('read_message')->($connection, $deadline) };
+	if (my $error = $@) {
+		if ($P->can('is_fault')->($error) && $error->{code} eq 'E_TIMEOUT') {
+			return undef;
+		}
+		my $message = $P->can('is_fault')->($error) ? $error->{message} : 'the request could not be read';
+		my $response = _error_response(undef, 'E_PROTOCOL', $message);
+		_audit_request($ctx, $peer, undef, undef, {}, $response, $message);
+		return $response;
+	}
+	return undef unless defined $request;
+	return handle_request($ctx, $request, $peer);
+}
+
+sub write_response {
+	my ($connection, $response) = @_;
+	my $line = eval { $P->can('encode')->($response) };
+	unless (defined $line) {
+		$line = eval {
+			$P->can('encode')->(_error_response($response->{id}, 'E_INTERNAL',
+				'the response could not be encoded'));
+		};
+	}
+	return unless defined $line;
+	my $written = 0;
+	while ($written < length $line) {
+		my $wrote = syswrite($connection, $line, length($line) - $written, $written);
+		last unless defined $wrote && $wrote > 0;
+		$written += $wrote;
+	}
+	return;
+}
+
+sub main {
+	my $ctx = new_context();
+
+	my @problem = preflight($ctx);
+	if (@problem) {
+		print STDERR "csf-ui-helper refuses to start:\n";
+		print STDERR "  - $_\n" for @problem;
+		exit 1;
+	}
+
+	for my $dir ('/var/lib/csf-ui', $ctx->{path}{helper_dir}) {
+		mkdir($dir, 0700) unless -d $dir;
+	}
+	chmod(0755, '/var/lib/csf-ui') if -d '/var/lib/csf-ui';
+	chmod(0700, $ctx->{path}{helper_dir}) if -d $ctx->{path}{helper_dir};
+
+	my $uid = getpwnam('csfui');
+	$ctx->{expect_uid} = $uid;
+	$ctx->{group_ready} = defined(getgrnam('csfui')) ? 1 : 0;
+
+	my $listener = open_socket($ctx);
+
+	$SIG{PIPE} = 'IGNORE';
+	my %child;
+	my $running = 1;
+	$SIG{TERM} = sub { $running = 0 };
+	$SIG{INT}  = sub { $running = 0 };
+
+	while ($running) {
+		while ((my $done = waitpid(-1, POSIX::WNOHANG())) > 0) { delete $child{$done} }
+
+		my $connection;
+		my $address = accept($connection, $listener);
+		unless ($address) {
+			next if $!{EINTR};
+			next;
+		}
+
+		my ($problem, $peer, $reason, $silent) = check_peer($ctx, $connection);
+		if ($problem) {
+			my $response = _error_response(undef, $problem, $reason);
+			write_response($connection, $response) unless $silent;
+			_audit_request($ctx, $peer, undef, undef, {}, $response, $reason);
+			close $connection;
+			next;
+		}
+
+		if (scalar(keys %child) >= $LIMIT{max_children}) {
+			my $response = _error_response(undef, 'E_BUSY',
+				'the helper is serving as many connections as it will; try again shortly');
+			write_response($connection, $response);
+			_audit_request($ctx, $peer, undef, undef, {}, $response, 'concurrency cap');
+			close $connection;
+			next;
+		}
+
+		my $pid = fork();
+		unless (defined $pid) {
+			my $response = _error_response(undef, 'E_BUSY', 'the helper could not fork; try again shortly');
+			write_response($connection, $response);
+			close $connection;
+			next;
+		}
+
+		if ($pid) {
+			$child{$pid} = 1;
+			close $connection;
+			next;
+		}
+
+		close $listener;
+		$SIG{CHLD} = 'DEFAULT';
+		$SIG{TERM} = 'DEFAULT';
+		$SIG{INT}  = 'DEFAULT';
+		my $child_ctx = new_context(
+			path        => $ctx->{path},
+			expect_uid  => $ctx->{expect_uid},
+			group_ready => $ctx->{group_ready},
+		);
+		my $response = serve_connection($child_ctx, $connection, $peer);
+		write_response($connection, $response) if $response;
+		close $connection;
+		POSIX::_exit(0);
+	}
+
+	close $listener;
+	unlink($ctx->{path}{socket});
+	return 0;
+}
+
+main() unless caller;
+
+1;

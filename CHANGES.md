@@ -102,6 +102,46 @@ line is added below the original notice; the original stays intact.
   does read the password of anyone who logs in while they are there.
   (`docs/WEBUI-RPC.md`)
 
+- **2026-09-11** — Added `csf-ui-helper`, the privileged half of the replacement
+  WebUI and the only part of it that will run as root, together with the wire
+  format and argument grammars both halves share. It listens on one unix socket,
+  authenticates its peer with `SO_PEERCRED` rather than believing anything a
+  message says about who is calling, and serves exactly the fourteen operations
+  frozen in `docs/WEBUI-RPC.md`. No argument names a file, a command, a flag or a
+  chain: `which` selects a row in a table, `reconcile_fix` names findings the
+  helper itself just made, and every other path and program is a constant in the
+  source. That is what makes the privileged surface reviewable, which the 5,071
+  line WebUI it replaces was not.
+
+  Three things in it are worth knowing about before reading the code. **csf exits
+  0 after refusing an operation** (`csf.pl:1541-1551`), so no mutating operation
+  decides its outcome from an exit status: each one snapshots the store, runs
+  `csf`, re-reads the store and reports the delta. **Every child is exec'd with
+  an argv list** through the block form, which cannot reach a shell even for a
+  one-element list — there is no backquote, no `qx` and no piped open in either
+  file, and the tests assert that about the source rather than trusting it.
+  **`tempdeny` always sends the fixed note `csf-ui`**, because an empty comment
+  sends `csf` into `iplookup` (`csf.pl:4320`), which runs `host -W 5 <ip>` as
+  root against an address the caller chose.
+
+  Everything fails closed. The helper refuses to start — naming each failure —
+  if it is not root, if Perl is older than 5.14 or `Socket` older than 1.94, if
+  the socket directory is not root-owned, or if `csf` or `iptables` is not a
+  root-owned regular file. When the `csfui` group does not exist yet the socket
+  is created `0600 root:root` and every connection is answered `E_UNAVAILABLE`;
+  there is no permissive fallback. Root is refused at the door as well: if root
+  wants to run `csf`, root runs `csf`.
+
+  `authenticate` is implemented except for the credential check itself, which is
+  the next task. Argument validation, the per-username failure counter (5 tries,
+  then locked for 300 s, with hashing skipped entirely while locked), the store's
+  own preconditions, the audit behaviour and the response shape are all here; the
+  verifier is called through a module interface that currently answers
+  `E_UNAVAILABLE` and **does not touch the failure counter**, because a store the
+  helper cannot verify must not lock out the administrator who would fix it.
+  (`ui-src/bin/csf-ui-helper`, `ui-src/lib/ConfigServer/UI/Proto.pm`,
+  `t/10-proto.t`, `t/11-helper-validate.t` — new files)
+
 #### The update mechanism — moved to GitHub, and made verifiable
 
 The original update path fetched a tarball and ran `sh install.sh` from it **as
