@@ -45,8 +45,9 @@ use warnings;
 use FindBin ();
 use lib "$FindBin::Bin/..", "$FindBin::Bin/../ui-src/lib";
 
+use File::Find ();
 use File::Temp qw(tempdir);
-use Test::More tests => 70;
+use Test::More tests => 82;
 
 require_ok('ConfigServer::UI::Render');
 
@@ -323,4 +324,139 @@ ok($@, 'escape_html: a coderef dies');
 
 	eval { render_file(undef, {}) };
 	ok($@, 'render_file: an undef path dies');
+}
+
+###############################################################################
+# R38 (fix round 1, spec review): the boundary between where {{ }} is safe
+# and where it is not - documented in Render.pm's and layout.html's own
+# header comments as element content and quoted attributes only, NEVER a
+# <script>/<style> body, an event-handler attribute, or a URL-bearing
+# attribute - was, until this round, enforced by nothing but that comment.
+# Task 7 adds five screens directly on top of this file with nothing
+# stopping any of them from writing {{value}} inside an onclick or an href.
+# The reviewer also punctured the fallback comfort of "tag/quote entities
+# survive inside <script> anyway": a value ending in an unescaped backslash
+# still corrupts a JS string literal there, escaped or not, so the boundary
+# is not merely undefended, it is not as forgiving as it looks when crossed
+# either. This section turns the boundary into a test - the third landmine
+# of this exact shape in the project (an unbound @ROUTES table, a read sized
+# by a literal that happened to equal its cap, now an undefended escaping
+# context boundary), each time ruled into enforcement rather than left as
+# description.
+#
+# _find_unsafe_placeholders() is a text scan, not an HTML parser: <script>/
+# <style> bodies and on*=/href=/src=/action= attribute values are located
+# with regexes, and each is checked only for the literal substring "{{" -
+# deliberately not distinguishing the escaped {{key}} marker from the raw
+# {{{key}}} one, because neither is safe in any of these four positions and
+# a value that only ever needs the raw marker should not have been
+# attacker-reachable text to begin with. This can be fooled by sufficiently
+# contrived markup the way any regex-based scan can (a <script> tag split
+# by an HTML comment, for instance); it is a trip-wire for the ordinary way
+# this gets broken - a screen author reaching for the nearest placeholder
+# while wiring up an onclick - not a proof that the rule can never be
+# violated. Said here plainly rather than left for a re-review to notice:
+# this test's advertised scope is "the ordinary mistake", not "every
+# mistake".
+###############################################################################
+sub _find_unsafe_placeholders {
+	my ($html) = @_;
+	my @findings;
+
+	while ($html =~ m{<script\b[^>]*>(.*?)</script>}gis) {
+		push @findings, '<script> block' if index($1, '{{') >= 0;
+	}
+	while ($html =~ m{<style\b[^>]*>(.*?)</style>}gis) {
+		# Beyond what R38 asked for, added for consistency with the SCOPE
+		# OF THE ESCAPING paragraph in Render.pm's own header comment,
+		# which names <style>/CSS alongside <script> as unsafe - leaving
+		# it out here would mean this module documents a fourth unsafe
+		# context and enforces only three of them.
+		push @findings, '<style> block' if index($1, '{{') >= 0;
+	}
+	while ($html =~ m{\s(on[a-zA-Z]+)\s*=\s*(["'])(.*?)\2}gis) {
+		push @findings, "event-handler attribute '$1'" if index($3, '{{') >= 0;
+	}
+	while ($html =~ m{\s(href|src|action)\s*=\s*(["'])(.*?)\2}gis) {
+		push @findings, "URL-bearing attribute '$1'" if index($3, '{{') >= 0;
+	}
+
+	return @findings;
+}
+
+# Positive controls: prove the scanner actually catches each of the four
+# danger categories, using synthetic markup rather than trusting the regex
+# by inspection alone.
+{
+	my @f;
+
+	@f = _find_unsafe_placeholders('<script>var x = "{{v}}";</script>');
+	ok((grep { /script/ } @f), 'context scan: {{ inside a <script> block is flagged');
+
+	@f = _find_unsafe_placeholders('<style>.x { color: {{v}}; }</style>');
+	ok((grep { /style/ } @f), 'context scan: {{ inside a <style> block is flagged');
+
+	@f = _find_unsafe_placeholders(q{<button onclick="go('{{v}}')">Go</button>});
+	ok((grep { /onclick/ } @f), 'context scan: {{ inside an onclick attribute is flagged');
+
+	@f = _find_unsafe_placeholders('<a href="{{path}}">x</a>');
+	ok((grep { /href/ } @f), 'context scan: {{ inside an href attribute is flagged');
+
+	@f = _find_unsafe_placeholders('<img src="{{img}}">');
+	ok((grep { /src/ } @f), 'context scan: {{ inside a src attribute is flagged');
+
+	@f = _find_unsafe_placeholders('<form action="{{target}}">');
+	ok((grep { /action/ } @f), 'context scan: {{ inside an action attribute is flagged');
+}
+
+# Negative controls: prove the scanner does not flag the ordinary safe
+# usage this codebase actually writes, or attribute names that merely
+# contain "on"/"action" as a substring rather than being one.
+{
+	is_deeply([ _find_unsafe_placeholders('<h1>{{title}}</h1>') ], [],
+		'context scan: {{ as plain element content is not flagged');
+	is_deeply([ _find_unsafe_placeholders('<main>{{{content}}}</main>') ], [],
+		'context scan: {{{ as plain element content is not flagged');
+	is_deeply([ _find_unsafe_placeholders('<a href="/static/path">x</a>') ], [],
+		'context scan: an href with no {{ at all is not flagged');
+	is_deeply([ _find_unsafe_placeholders('<div data-action="{{v}}" data-onload="{{v}}">x</div>') ], [],
+		q{context scan: "data-action"/"data-onload" are not "action"/"onload" - no attribute-name boundary, not flagged});
+}
+
+# The real enforcement: every .html file under ui-src/web, walked
+# recursively so ui-src/web/screens/*.html (Task 7, not yet created) is
+# covered automatically with no second place to remember to add it.
+{
+	my @html_files;
+	File::Find::find({
+		wanted   => sub { push @html_files, $File::Find::name if /\.html\z/ },
+		no_chdir => 1,
+	}, "$FindBin::Bin/../ui-src/web");
+
+	# Guards against the next test passing vacuously because the path
+	# above was wrong and nothing was actually scanned - exactly the
+	# "test passing for the wrong reason" this project has hit before.
+	ok(scalar(@html_files) > 0,
+		'context scan: found at least one .html file under ui-src/web to check (not a vacuous pass)');
+
+	my @all_findings;
+	for my $path (sort @html_files) {
+		open(my $fh, '<:raw', $path) or die "test: cannot open $path: $!\n";
+		local $/;
+		my $html = <$fh>;
+		close $fh;
+
+		my $rel = $path;
+		$rel =~ s{^\Q$FindBin::Bin\E/\.\./}{};
+		push @all_findings, map { "$rel: $_" } _find_unsafe_placeholders($html);
+	}
+
+	is_deeply(\@all_findings, [],
+		'context scan: no ui-src/web/*.html file has {{ inside <script>/<style>, an event-handler attribute, or a URL-bearing attribute')
+		or diag("Found {{ in an unsafe context:\n  " . join("\n  ", @all_findings) . "\n\n"
+			. "Fix: move the value out of that position, don't reach for the raw {{{ }}} marker instead - "
+			. "neither marker is safe there. A URL should be a literal this codebase wrote, not a substituted "
+			. "value; server-rendered HTML should not have inline event-handler attributes at all; and dynamic "
+			. "data a <script> needs should be placed OUTSIDE the <script> tag (a data-* attribute the script "
+			. "reads) rather than interpolated into its source text.");
 }

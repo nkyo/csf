@@ -506,8 +506,16 @@ textarea:focus,
 	background: var(--color-bg-alt);
 }
 
+/* R39 (fix round 1): this used to shrink min-height below --touch-min,
+   contradicting this file's own "every interactive element ... has a
+   minimum 44x44px hit area" claim - on exactly the row actions
+   (.row-actions, in a Lists table) where a mis-tap has consequences
+   (undeny/unallow on the wrong row). "Small" is visual density only
+   (padding, font-size); the hit area stays the full 44px floor, same
+   as .btn's own min-height, so a stated guarantee is never one this
+   stylesheet itself breaks. */
 .btn-small {
-	min-height: calc(var(--touch-min) - 8px);
+	min-height: var(--touch-min);
 	padding: var(--space-1) var(--space-3);
 	font-size: 0.875rem;
 }

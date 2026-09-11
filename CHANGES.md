@@ -37,6 +37,59 @@ line is added below the original notice; the original stays intact.
 
 ### Unreleased
 
+#### Task 6 fix round 1 — the escaping-context boundary was a comment, not a guard; a stated touch-target guarantee was 8px short
+
+- **2026-09-11** — Spec review (R38) found that `Render.pm`'s and
+  `layout.html`'s header comments correctly document that HTML-escaping
+  covers element content and quoted attributes but not a `<script>`/
+  `<style>` body, an event-handler attribute, or a URL-bearing attribute
+  (`href`/`src`/`action`) — and that nothing besides those comments
+  stopped Task 7's five screens, added directly on top of this file,
+  from putting `{{value}}` in one of those positions anyway. The
+  reviewer also named the specific way the "entities happen to survive
+  inside `<script>` anyway" fallback comfort fails: a value ending in an
+  unescaped backslash still corrupts a `<script>` string literal there,
+  escaped or not, so the undefended boundary is also less forgiving than
+  it looks. This is the third landmine of the same shape in the project
+  — an `@ROUTES` table nothing bound to the contract, a read sized by a
+  literal that happened to equal its cap, now an escaping-context
+  boundary enforced only by prose — each ruled into a test rather than
+  left as description.
+
+  Added a text scan (`t/50-render.t`) that walks every `.html` file
+  under `ui-src/web/` — recursively, so `ui-src/web/screens/*.html`
+  (Task 7, not yet written) is covered automatically with no second
+  place to remember to add it — and fails if `{{` appears inside a
+  `<script>` body, a `<style>` body (beyond what R38 asked for, added
+  for consistency with `Render.pm`'s own documented scope), an
+  `on*="..."` attribute, or an `href=`/`src=`/`action=` attribute. It
+  bars both the escaped and the raw marker in all four positions alike,
+  since neither is safe there. Proved against six synthetic positive
+  controls (one per danger category) and four negative controls
+  (ordinary safe placeholder usage, plus `data-action=`/`data-onload=`
+  to confirm the attribute-name match requires a real attribute
+  boundary rather than a hyphenated substring), then run for real
+  against `ui-src/web/layout.html` — which passes clean, having never
+  put a substitution in any of those four positions — with a companion
+  assertion that at least one `.html` file was actually found, so the
+  enforcement test cannot pass vacuously from a wrong path the way a
+  prior task's traversal test once did from an accident in its fixture.
+  Confirmed live: injecting `<a href="{{evil}}">` into `layout.html` and
+  re-running turns the enforcement test red; reverting turns it green
+  again.
+
+  Separately (R39), `app.css`'s `.btn-small` set `min-height:
+  calc(var(--touch-min) - 8px)` — 36px against the file's own stated
+  "every interactive element ... has a minimum 44x44px hit area" — on
+  exactly the row actions (`.row-actions`, a Lists table's
+  undeny/unallow buttons) where a mis-tap has real consequences. Fixed
+  to the full 44px floor; "small" is now visual density only (padding,
+  font-size), never a shorter hit area than the guarantee promises.
+
+  `t/50-render.t` grew from 70 to 82 assertions; the whole suite is now
+  1489 tests (was 1477), `prove -I. t/`.
+  (`t/50-render.t`, `ui-src/web/app.css`)
+
 #### Task 6 — the rendering layer and stylesheet the five screens will use
 
 - **2026-09-11** — Added `ConfigServer::UI::Render` (`ui-src/lib/ConfigServer/UI/Render.pm`),
