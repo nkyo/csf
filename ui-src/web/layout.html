@@ -1,0 +1,112 @@
+<!--
+Copyright (C) 2006-2025 Jonathan Michaelson
+
+https://github.com/waytotheweb/scripts
+
+This program is free software; you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation; either version 3 of the License, or (at your option) any later
+version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT
+ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+FOR A PARTICULAR PURPOSE. See the GNU General Public License for more
+details.
+
+You should have received a copy of the GNU General Public License along with
+this program; if not, see <https://www.gnu.org/licenses>.
+-->
+<!--
+Added 2026-09-11 in https://github.com/nkyo/csf - see CHANGES.md.
+
+The authenticated app shell. Every one of the five screens (Task 7:
+Overview, Block/Unblock, Lists, IP lookup, Health) is rendered by loading
+this file with ConfigServer::UI::Render::render_file() and supplying
+exactly the five variables below - render() dies on a missing one rather
+than silently leaving a blank in the page (task-6-brief.md), so this list
+IS the contract; there is no version of "forgot one" that ships quietly.
+
+  {{title}}    escaped. Plain text - no markup. Used both in <title> and
+               as the visible <h1>.
+  {{user}}     escaped. The signed-in session's username
+               ($session->{user} - ui-src/bin/csf-ui's _gate() hands every
+               non-anonymous route the session object it loaded).
+  {{role}}     escaped. "admin" or "support" ($session->{role}, same
+               source).
+  {{{nav}}}    RAW - see ConfigServer::UI::Render's header comment for
+               what that means and what it does not mean. Screen-to-screen
+               navigation, and this shell's only sensible place for a
+               "log out" action. Raw, and entirely Task 7's, for two
+               reasons together: which link is "current" and which links
+               exist at all (support sees only IP lookup and Lists per
+               docs/WEBUI-PLAN.md S7) depends on the route table Task 6
+               must not touch; and logout is itself the mutating
+               POST /api/logout route ui-src/bin/csf-ui already defines
+               (mutates => 1) - a plain HTML form posting to it needs a
+               CSRF hidden field carrying $session->{csrf}, the same
+               nonce value a handler already has in hand (see
+               ConfigServer::UI::Render's header comment on {{{...}}} vars,
+               and ui-src/bin/csf-ui's own comment on where a template
+               gets this value) and the same nonce whatever screen this
+               layout wraps needs for ITS OWN forms. This file does not
+               reference {csrf} directly for exactly that reason: it has
+               no form of its own to put it in. Build {{{nav}}} BY CALLING
+               render()/escape_html() on every piece of it that is not a
+               literal string this codebase wrote (a label like
+               "Overview" is fine as a literal; a value that ever
+               originated from a request is not) and pass the finished,
+               already-safe string in - never pass an unescaped fragment
+               here believing this layout will escape it, because
+               {{{...}}} never does.
+  {{{content}}} RAW, same rule as {{{nav}}}: the screen's own body,
+               already rendered (and therefore already escaped, piece by
+               piece, wherever it holds a value that did not originate as
+               a literal in this codebase) by the screen's own template
+               pass before it ever reaches this file.
+
+Structural elements below are landmarks by native HTML semantics, not by
+added ARIA roles (a <header>/<footer> that is not nested inside sectioning
+content is implicitly "banner"/"contentinfo"; <nav> is "navigation";
+<main> is "main") - preferring native semantics over role="" is the
+standard accessibility guidance for exactly this shape of page. The skip
+link, the visible focus styling it relies on, and the responsive rules
+tables are expected to use are all in app.css, not here.
+
+This layout is for the signed-in app shell only. It is not meant for the
+pre-authentication login screen (Task 7): a page with no session has no
+user or role of an authenticated kind to put in this header, and a login
+form's chrome needs are simpler than this shell's - Task 7's login screen
+should render its own minimal document rather than force placeholder
+values through these five variables.
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{title}} - ConfigServer Firewall</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="site-header">
+	<div class="site-header-row">
+		<p class="site-brand">ConfigServer Firewall</p>
+		<p class="site-identity">
+			<span class="site-user">{{user}}</span>
+			<span class="site-role">{{role}}</span>
+		</p>
+	</div>
+	<nav class="site-nav" aria-label="Primary">
+		{{{nav}}}
+	</nav>
+</header>
+<main id="main-content" tabindex="-1">
+	<h1 class="page-title">{{title}}</h1>
+	{{{content}}}
+</main>
+<footer class="site-footer">
+	<p>ConfigServer Security &amp; Firewall &mdash; administrative interface.</p>
+</footer>
+</body>
+</html>

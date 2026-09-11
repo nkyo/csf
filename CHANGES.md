@@ -37,6 +37,126 @@ line is added below the original notice; the original stays intact.
 
 ### Unreleased
 
+#### Task 6 — the rendering layer and stylesheet the five screens will use
+
+- **2026-09-11** — Added `ConfigServer::UI::Render` (`ui-src/lib/ConfigServer/UI/Render.pm`),
+  a template substitutor for the replacement WebUI's server-rendered HTML
+  (docs/WEBUI-PLAN.md S8). It replaces `{{key}}` with the HTML-escaped
+  value of `$vars{key}` — escaping `& < > " '`, in that order, so the `&`
+  the other four introduce is never re-escaped — and never with anything
+  else: the default is escaped, and a raw, byte-for-byte insert requires
+  the visibly different `{{{key}}}` marker, so a screen that forgets to
+  think about escaping still gets it. A key absent from the vars
+  hashref, or present with an `undef` or reference value, is a `die()`
+  naming the key, on both the escaped and the raw path — never a blank
+  landing silently in the page, which is the specific failure mode
+  task-6-brief.md calls out as how a broken template ships unnoticed.
+  Substitution runs as a single `s///ge` pass, so a substituted value
+  that is itself the literal text `{{key}}` (an IP-block note that
+  happens to contain double braces, say) is inserted as inert text and
+  never re-scanned for placeholders of its own — proved rather than
+  assumed: an earlier draft that looped substitution until no
+  placeholder matched (the naive way to write a template expander) does
+  not merely mis-render a value shaped like `{{a}}` sitting inside its
+  own substitution, it never terminates, which is a strictly worse
+  failure for a request-handling process to hit than a wrong render. A
+  thin `render_file()` wrapper reads a template from disk as raw bytes —
+  no `:encoding` layer, so Perl's internal UTF-8 flag is never set on
+  the result, matching the byte-in/byte-out convention
+  docs/WEBUI-RPC.md S14.2 already states for the request/response
+  structures this sits inside; escape_html()'s byte-level scan for the
+  five ASCII characters it looks for cannot misfire on a multi-byte
+  UTF-8 sequence, because every continuation and lead byte of one is
+  `>= 0x80`.
+
+  `escape_html()` covers both element content and quoted attribute
+  values with the same five characters — every attribute in every
+  template in this tree is quoted, and `"`/`'` are exactly what keep a
+  quoted value from being broken out of. It does **not** cover
+  `<script>` bodies, inline event-handler attributes, `javascript:`
+  URLs, or `<style>`/CSS values: an HTML tokenizer ends a `<script>`
+  element on a literal `</script` byte sequence without decoding
+  entities first, so an escaped `<` does not stop it, and none of
+  `&<>"'` is what JavaScript or CSS syntax needs escaped in the first
+  place. No template in this tree places a substitution in any of those
+  four positions; a future one that needs to will need a different
+  escaping function, not a misuse of this one. Written down in
+  `Render.pm`'s own header comment so Task 7 reads it before adding a
+  screen, not after.
+
+  Added `ui-src/web/layout.html`, the authenticated app shell all five
+  screens (Task 7) load via `render_file()`: a skip link, and `<header>`/
+  `<nav>`/`<main>`/`<footer>` as native HTML5 landmarks rather than added
+  `role=""` attributes. Its five-variable contract (`title`, `user`,
+  `role`, the raw `{{{nav}}}`, the raw `{{{content}}}`) is documented at
+  the top of the file itself, including why `{{{nav}}}`, not this file,
+  is where a logout action belongs: which screens exist and which link
+  is "current" is route-table knowledge, and logout is itself the
+  mutating `POST /api/logout` `ui-src/bin/csf-ui` already defines —
+  both are Task 7's, not this task's, and Task 6 does not add routes.
+
+  Added `ui-src/web/app.css`: one plain stylesheet, no build step, no
+  framework, nothing from a CDN — served from disk exactly as written,
+  because a production firewall host frequently has no outbound Internet
+  access and a tightened `TCP_OUT` blocks it anyway. One breakpoint at
+  768px, below which any table wrapped in `.table-responsive` becomes
+  one stacked card per row (the `<thead>` stays in the DOM, moved
+  offscreen with the same clip-rect technique as the `.visually-hidden`
+  utility, rather than removed, so a screen reader still gets it once;
+  a sighted narrow-viewport reader gets the column name from each
+  `<td>`'s own `data-label` attribute instead, a markup contract
+  documented at the top of the file for Task 7). Every interactive
+  element (`.btn`, nav links, pagination, form controls) keeps a 44px
+  minimum hit area. `:focus-visible` (with a plain `:focus` fallback for
+  browsers without it) draws a visible, high-contrast outline on every
+  focusable element and is never suppressed anywhere in the file. Status
+  badges, alerts and the diff view pair color with text or a leading
+  glyph, never color alone. The full palette was checked against the
+  WCAG 2 relative-luminance formula rather than eyeballed: body and
+  muted text both clear 7:1 on every background in the palette (AAA,
+  not merely the 4.5:1 this task requires), tinted status text clears
+  7.4:1 on its own tint, and the one color that conveys a form control's
+  boundary on its own clears the separate 3:1 WCAG 1.4.11 non-text
+  threshold — recorded as measurements in the file's own header comment,
+  since a Perl test suite with no headless browser cannot assert what a
+  human eye perceives as contrast.
+
+  **Verification.** `t/50-render.t` (70 assertions) tests the escaping
+  like an adversary rather than a formality: a `<script>` payload
+  substituted into seven distinct positions (start, middle and end of a
+  template, inside both attribute-quoting styles, two placeholders back
+  to back, and as the whole template); double- and single-quote
+  attribute-breakout payloads compared byte-for-byte against a
+  hand-computed expected string, plus a combined quote+tag breakout; a
+  value that is itself `{{a}}`, a raw value containing `{{{b}}}` for a
+  `b` that is not in `%vars` at all (proving the substitution pass never
+  revisits what it just inserted, since a recursive implementation could
+  only be caught missing `b` by trying), and a value spelling another
+  real key's raw marker, proving that other key's value is never pulled
+  in; every fail-closed path (missing key on both markers, present-but-
+  undef, present-but-reference on both the escaped path and the raw
+  path, non-hashref vars, non-string template); and `render_file()`'s
+  byte-safety, including `utf8::is_utf8()` asserted false on its result
+  and a multi-byte UTF-8 sequence surviving both a pure disk round-trip
+  and escaping of adjacent ASCII unchanged. Every one of the ten
+  escaping guards in `Render.pm` (each of the five characters
+  individually; the default marker's call to `escape_html()`; the
+  missing-key check, distinct from the separate undef check it would
+  otherwise be mistaken for; the undef check; the reference check on the
+  raw path, which `escape_html()`'s own reference check cannot cover
+  since raw output never reaches `escape_html()` at all; and the
+  single-pass substitution itself) was removed one at a time, against
+  the running suite, and confirmed to turn a specific named test red
+  before being restored — the single-pass guard's removal (looping the
+  substitution until stable, the naive way to write this) made the
+  suite hang rather than fail, which is the point made concrete: that
+  guard's absence is not a wrong render, it is a request that never
+  completes. Full mapping in
+  `.superpowers/sdd/webui-implementation/task-6-report.md`. The whole
+  suite is 1477 tests (was 1407), `prove -I. t/`.
+  (`ui-src/lib/ConfigServer/UI/Render.pm`, `ui-src/web/layout.html`,
+  `ui-src/web/app.css`, `t/50-render.t`)
+
 #### Task 5 fix round 3 — the R36 handshake alarm leaked past a `tls_wrap` that dies
 
 - **2026-09-11** — Fixed `Server.pm`'s `_serve_accepted()` leaving the

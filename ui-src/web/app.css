@@ -1,0 +1,881 @@
+/*
+ * Copyright (C) 2006-2025 Jonathan Michaelson
+ *
+ * https://github.com/waytotheweb/scripts
+ *
+ * This program is free software; you can redistribute it and/or modify it under
+ * the terms of the GNU General Public License as published by the Free Software
+ * Foundation; either version 3 of the License, or (at your option) any later
+ * version.
+ *
+ * This program is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+ * FOR A PARTICULAR PURPOSE. See the GNU General Public License for more
+ * details.
+ *
+ * You should have received a copy of the GNU General Public License along with
+ * this program; if not, see <https://www.gnu.org/licenses>.
+ */
+/*
+ * Added 2026-09-11 in https://github.com/nkyo/csf - see CHANGES.md.
+ *
+ * The one stylesheet for the whole replacement WebUI (docs/WEBUI-PLAN.md S8):
+ * plain CSS, no build step, no framework, nothing from a CDN, served from
+ * disk exactly as written here - production firewall hosts frequently have
+ * no outbound Internet access, and a tightened TCP_OUT blocks it anyway
+ * (task-6-brief.md). Every one of the five screens (Task 7) and layout.html
+ * (Task 6) link this one file.
+ *
+ * TWO MARKUP CONTRACTS TASK 7 NEEDS TO KNOW BEFORE WRITING A SCREEN:
+ *
+ * 1. Responsive tables. ".table-responsive > table" collapses to one
+ *    stacked card per row below 768px (task-6-brief.md: "tables become
+ *    stacked cards below it"). This requires each <td> to carry
+ *    data-label="Column Name" matching its column's header text - the
+ *    stacked layout has no visual header row to read the column from
+ *    (it is still IN the accessibility tree, just visually hidden, so a
+ *    screen reader user still gets it read once per table; a data-label
+ *    is what a SIGHTED narrow-viewport user gets instead, via
+ *    generated content, which is never exposed to assistive tech on its
+ *    own - hence still needing the real <thead> underneath). Wrap the
+ *    table:
+ *
+ *      <div class="table-responsive">
+ *        <table>
+ *          <thead><tr><th>IP</th><th>Note</th><th>Actions</th></tr></thead>
+ *          <tbody>
+ *            <tr>
+ *              <td data-label="IP">{{ip}}</td>
+ *              <td data-label="Note">{{note}}</td>
+ *              <td data-label="Actions">{{{actions}}}</td>
+ *            </tr>
+ *          </tbody>
+ *        </table>
+ *      </div>
+ *
+ * 2. Current-page nav link. ".site-nav" (used inside layout.html's
+ *    {{{nav}}}) expects each link to be a plain <a href="..."> and the
+ *    CURRENT screen's link to additionally carry aria-current="page" -
+ *    that is both what tells assistive tech which page is active and
+ *    what this file's .site-nav a[aria-current="page"] rule uses to
+ *    draw it, so there is exactly one source of truth for "which link is
+ *    current", not a class name a screen has to keep in sync with an
+ *    aria attribute by hand.
+ *
+ * TOUCH TARGETS. Every interactive element this file styles - .btn,
+ * .site-nav a, table row actions, pagination links, form controls - has
+ * a minimum 44x44px hit area (task-6-brief.md), via --touch-min plus
+ * padding rather than a hard min-height alone, so a short text label
+ * still gets extra clickable padding around it instead of being
+ * stretched.
+ *
+ * FOCUS. Every element a keyboard can land on on this page gets a
+ * visible, high-contrast focus ring from this file - :focus-visible
+ * rules below, never outline: none anywhere in this file, on anything.
+ * If a future rule needs to change how focus looks, it must still
+ * satisfy that.
+ *
+ * COLOR IS NEVER THE ONLY SIGNAL. Status badges, alerts and the diff
+ * view all pair color with a text label or a leading glyph a screen
+ * reader still announces (+/-, the word itself) - never color alone,
+ * per task-6-brief.md's accessibility requirement and WCAG 1.4.1.
+ *
+ * CONTRAST. Every text/background pair in the palette below was checked
+ * against the WCAG 2 relative-luminance formula, not eyeballed - body
+ * text and muted text both exceed 7:1 on both backgrounds in the
+ * palette (AAA, not merely the AA 4.5:1 this task requires); tinted
+ * status text exceeds 7.4:1 on its own tint; the one color used to
+ * convey a UI-component boundary on its own (--color-control-border,
+ * on form inputs) exceeds the separate 3:1 WCAG 1.4.11 non-text
+ * threshold. Decorative-only dividers (--color-border,
+ * --color-border-subtle) do not meet 3:1 and must never be the sole
+ * cue for anything meaningful. None of this is re-verified by a test in
+ * t/: a Perl test suite with no headless browser cannot assert what a
+ * human eye perceives as contrast, so this comment is the record of the
+ * measurement, not a claim that t/50-render.t checks it - if the
+ * palette above is ever changed, recompute before committing rather
+ * than trusting the new values by eye.
+ */
+
+/* ---------------------------------------------------------------------
+ * Design tokens
+ * ------------------------------------------------------------------- */
+:root {
+	--color-bg: #ffffff;
+	--color-bg-alt: #f4f6f8;
+	--color-surface: #ffffff;
+
+	--color-text: #1b1f23;
+	--color-text-muted: #4b535a;
+
+	--color-border: #c7ccd1;         /* decorative dividers only - not a 3:1 boundary */
+	--color-border-subtle: #e1e4e8;  /* decorative dividers only - not a 3:1 boundary */
+	--color-control-border: #6b7280; /* form controls: >= 3:1 on --color-bg and --color-bg-alt */
+
+	--color-link: #0b4f8a;
+	--color-link-hover: #08355c;
+
+	--color-primary: #0b4f8a;
+	--color-primary-hover: #08355c;
+	--color-primary-contrast: #ffffff;
+
+	--color-danger: #8a1f11;
+	--color-danger-hover: #6e190d;
+	--color-danger-contrast: #ffffff;
+
+	--color-success: #256029;
+	--color-success-contrast: #ffffff;
+
+	--color-success-tint: #e6f4ea;
+	--color-success-tint-text: #1e4d23;
+	--color-success-tint-border: #bfe3c8;
+
+	--color-danger-tint: #fdecea;
+	--color-danger-tint-text: #7a1a0e;
+	--color-danger-tint-border: #f3c2bc;
+
+	--color-warning-tint: #fff4e5;
+	--color-warning-tint-text: #7a4100;
+	--color-warning-tint-border: #f5d9a8;
+
+	/* Deliberately not the brand blue: a focus ring drawn in the same
+	   color as a primary button, with no offset, can sit at well under
+	   3:1 against that button's own fill. --focus-ring below always
+	   draws with an offset gap (so the ring's immediate neighbour is
+	   page background, not the control's fill), and this color clears
+	   3:1 against every background token above. */
+	--color-focus: #b45309;
+
+	--space-1: 0.25rem;
+	--space-2: 0.5rem;
+	--space-3: 0.75rem;
+	--space-4: 1rem;
+	--space-5: 1.5rem;
+	--space-6: 2rem;
+	--space-8: 3rem;
+
+	--radius-sm: 4px;
+	--radius: 6px;
+	--radius-lg: 10px;
+
+	--font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+	--font-mono: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", Menlo, monospace;
+
+	--touch-min: 44px;
+
+	--focus-ring: 3px solid var(--color-focus);
+	--focus-ring-offset: 2px;
+
+	--border-width: 1px;
+}
+
+/* ---------------------------------------------------------------------
+ * Reset - minimal, not a framework: box-sizing, margin trim, media
+ * defaults. Nothing here sets outline: none anywhere, ever.
+ * ------------------------------------------------------------------- */
+*, *::before, *::after {
+	box-sizing: border-box;
+}
+
+html {
+	-webkit-text-size-adjust: 100%;
+	text-size-adjust: 100%;
+}
+
+body, h1, h2, h3, h4, p, figure, blockquote, dl, dd, ul, ol {
+	margin: 0;
+}
+
+ul, ol {
+	padding: 0;
+	list-style: none;
+}
+
+img, picture, svg {
+	max-width: 100%;
+	display: block;
+}
+
+input, button, textarea, select {
+	font: inherit;
+	color: inherit;
+}
+
+table {
+	border-collapse: collapse;
+	width: 100%;
+}
+
+@media (prefers-reduced-motion: reduce) {
+	*, *::before, *::after {
+		animation-duration: 0.01ms !important;
+		animation-iteration-count: 1 !important;
+		transition-duration: 0.01ms !important;
+		scroll-behavior: auto !important;
+	}
+}
+
+/* ---------------------------------------------------------------------
+ * Base
+ * ------------------------------------------------------------------- */
+html {
+	font-size: 100%; /* respects the browser's own text-size setting */
+}
+
+body {
+	font-family: var(--font-sans);
+	font-size: 1rem;
+	line-height: 1.5;
+	color: var(--color-text);
+	background: var(--color-bg-alt);
+	min-height: 100vh;
+}
+
+h1, h2, h3, h4 {
+	line-height: 1.25;
+	color: var(--color-text);
+	font-weight: 600;
+}
+
+p {
+	max-width: 70ch;
+}
+
+a {
+	color: var(--color-link);
+	text-decoration: underline;
+	text-underline-offset: 0.15em;
+}
+
+a:hover {
+	color: var(--color-link-hover);
+}
+
+small, .text-muted {
+	color: var(--color-text-muted);
+}
+
+code, kbd, pre, samp {
+	font-family: var(--font-mono);
+	font-size: 0.9em;
+}
+
+/* ---------------------------------------------------------------------
+ * Focus - visible everywhere, never suppressed. :focus-visible is the
+ * primary rule (keyboard/AT focus, not an incidental mouse click); a
+ * plain :focus fallback covers browsers with no :focus-visible support
+ * so a keyboard user is never left with no indicator at all.
+ * ------------------------------------------------------------------- */
+a:focus-visible,
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible,
+[tabindex]:focus-visible {
+	outline: var(--focus-ring);
+	outline-offset: var(--focus-ring-offset);
+}
+
+a:focus,
+button:focus,
+input:focus,
+select:focus,
+textarea:focus,
+[tabindex]:focus {
+	outline: var(--focus-ring);
+	outline-offset: var(--focus-ring-offset);
+}
+
+/* ---------------------------------------------------------------------
+ * Skip link - offscreen until it receives keyboard focus, per
+ * task-6-brief.md's "skip link" requirement. Uses position, not
+ * display/visibility, so it stays reachable by Tab from the very first
+ * press.
+ * ------------------------------------------------------------------- */
+.skip-link {
+	position: absolute;
+	left: -9999px;
+	top: 0;
+	z-index: 1000;
+	background: var(--color-text);
+	color: #ffffff;
+	padding: var(--space-3) var(--space-4);
+	border-radius: 0 0 var(--radius) 0;
+	text-decoration: none;
+	font-weight: 600;
+}
+
+.skip-link:focus {
+	left: 0;
+	top: 0;
+}
+
+/* ---------------------------------------------------------------------
+ * Visually hidden - stays in the accessibility tree, invisible on
+ * screen. For a label that must exist for every control (task-6-brief.md:
+ * "every control labelled") without needing to occupy layout space -
+ * NOT display:none/visibility:hidden, which would remove it from
+ * assistive tech as well as from the screen.
+ * ------------------------------------------------------------------- */
+.visually-hidden {
+	position: absolute;
+	width: 1px;
+	height: 1px;
+	padding: 0;
+	margin: -1px;
+	overflow: hidden;
+	clip: rect(0, 0, 0, 0);
+	white-space: nowrap;
+	border: 0;
+}
+
+/* ---------------------------------------------------------------------
+ * App shell chrome (layout.html)
+ * ------------------------------------------------------------------- */
+.site-header {
+	background: var(--color-surface);
+	border-bottom: var(--border-width) solid var(--color-border);
+	padding: var(--space-4) var(--space-5);
+}
+
+.site-header-row {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	justify-content: space-between;
+	gap: var(--space-3);
+}
+
+.site-brand {
+	font-weight: 700;
+	font-size: 1.125rem;
+	color: var(--color-text);
+}
+
+.site-identity {
+	display: flex;
+	align-items: baseline;
+	gap: var(--space-2);
+	color: var(--color-text-muted);
+	font-size: 0.9375rem;
+}
+
+.site-user {
+	font-weight: 600;
+	color: var(--color-text);
+}
+
+.site-role {
+	text-transform: uppercase;
+	font-size: 0.75rem;
+	letter-spacing: 0.04em;
+}
+
+.site-nav {
+	margin-top: var(--space-3);
+}
+
+.site-nav ul {
+	display: flex;
+	flex-wrap: wrap;
+	gap: var(--space-2);
+}
+
+.site-nav a {
+	display: inline-flex;
+	align-items: center;
+	min-height: var(--touch-min);
+	padding: var(--space-2) var(--space-4);
+	border-radius: var(--radius);
+	color: var(--color-text);
+	text-decoration: none;
+	font-weight: 500;
+}
+
+.site-nav a:hover {
+	background: var(--color-bg-alt);
+}
+
+.site-nav a[aria-current="page"] {
+	background: var(--color-primary);
+	color: var(--color-primary-contrast);
+}
+
+#main-content {
+	display: block;
+	max-width: 72rem;
+	margin: 0 auto;
+	padding: var(--space-6) var(--space-5);
+}
+
+.page-title {
+	font-size: 1.5rem;
+	margin-bottom: var(--space-5);
+}
+
+.site-footer {
+	max-width: 72rem;
+	margin: 0 auto;
+	padding: var(--space-5);
+	color: var(--color-text-muted);
+	font-size: 0.875rem;
+}
+
+/* ---------------------------------------------------------------------
+ * Cards / panels - generic content grouping used by every screen
+ * (an Overview stat block, a Block form, a Health diff panel, ...).
+ * ------------------------------------------------------------------- */
+.panel {
+	background: var(--color-surface);
+	border: var(--border-width) solid var(--color-border);
+	border-radius: var(--radius-lg);
+	padding: var(--space-5);
+	margin-bottom: var(--space-5);
+}
+
+.panel > :last-child {
+	margin-bottom: 0;
+}
+
+.panel-title {
+	font-size: 1.125rem;
+	margin-bottom: var(--space-4);
+}
+
+/* ---------------------------------------------------------------------
+ * Buttons
+ * ------------------------------------------------------------------- */
+.btn {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	gap: var(--space-2);
+	min-height: var(--touch-min);
+	min-width: var(--touch-min);
+	padding: var(--space-2) var(--space-4);
+	border: var(--border-width) solid var(--color-control-border);
+	border-radius: var(--radius);
+	background: var(--color-surface);
+	color: var(--color-text);
+	font-weight: 600;
+	font-size: 1rem;
+	line-height: 1.2;
+	text-decoration: none;
+	cursor: pointer;
+}
+
+.btn:hover {
+	background: var(--color-bg-alt);
+}
+
+.btn:disabled,
+.btn[aria-disabled="true"] {
+	opacity: 0.55;
+	cursor: not-allowed;
+}
+
+.btn-primary {
+	background: var(--color-primary);
+	border-color: var(--color-primary);
+	color: var(--color-primary-contrast);
+}
+
+.btn-primary:hover {
+	background: var(--color-primary-hover);
+	border-color: var(--color-primary-hover);
+}
+
+.btn-danger {
+	background: var(--color-danger);
+	border-color: var(--color-danger);
+	color: var(--color-danger-contrast);
+}
+
+.btn-danger:hover {
+	background: var(--color-danger-hover);
+	border-color: var(--color-danger-hover);
+}
+
+.btn-quiet {
+	background: transparent;
+	border-color: transparent;
+	color: var(--color-text);
+}
+
+.btn-quiet:hover {
+	background: var(--color-bg-alt);
+}
+
+.btn-small {
+	min-height: calc(var(--touch-min) - 8px);
+	padding: var(--space-1) var(--space-3);
+	font-size: 0.875rem;
+}
+
+/* ---------------------------------------------------------------------
+ * Forms. Labels are never hidden by default - only an explicit
+ * .visually-hidden on the <label> itself opts out of a VISIBLE label,
+ * and every control still needs a <label for="..."> or aria-label even
+ * then (task-6-brief.md: "every control labelled").
+ *
+ * font-size is 1rem (16px at the default root size) on every text
+ * input on purpose: mobile Safari zooms the page on focusing a text
+ * input smaller than 16px, which is itself an accessibility papercut
+ * this avoids rather than causes.
+ * ------------------------------------------------------------------- */
+.field {
+	margin-bottom: var(--space-4);
+}
+
+.field label {
+	display: block;
+	font-weight: 600;
+	margin-bottom: var(--space-1);
+}
+
+.field-hint {
+	display: block;
+	color: var(--color-text-muted);
+	font-size: 0.875rem;
+	margin-top: var(--space-1);
+}
+
+.field-error {
+	display: block;
+	color: var(--color-danger);
+	font-size: 0.875rem;
+	margin-top: var(--space-1);
+	font-weight: 600;
+}
+
+input[type="text"],
+input[type="search"],
+input[type="tel"],
+input[type="number"],
+input[type="email"],
+input[type="password"],
+input[type="url"],
+select,
+textarea {
+	width: 100%;
+	min-height: var(--touch-min);
+	padding: var(--space-2) var(--space-3);
+	font-size: 1rem;
+	border: var(--border-width) solid var(--color-control-border);
+	border-radius: var(--radius);
+	background: var(--color-surface);
+	color: var(--color-text);
+}
+
+textarea {
+	min-height: calc(var(--touch-min) * 2);
+	resize: vertical;
+}
+
+input[aria-invalid="true"],
+select[aria-invalid="true"],
+textarea[aria-invalid="true"] {
+	border-color: var(--color-danger);
+}
+
+fieldset {
+	border: var(--border-width) solid var(--color-border);
+	border-radius: var(--radius);
+	padding: var(--space-4);
+	margin: 0 0 var(--space-4);
+}
+
+legend {
+	font-weight: 600;
+	padding: 0 var(--space-2);
+}
+
+.form-actions {
+	display: flex;
+	flex-wrap: wrap;
+	gap: var(--space-3);
+	margin-top: var(--space-4);
+}
+
+/* ---------------------------------------------------------------------
+ * Alerts / flash messages - color is always paired with the message
+ * text itself, never the sole signal.
+ * ------------------------------------------------------------------- */
+.alert {
+	border: var(--border-width) solid var(--color-border);
+	border-left-width: 4px;
+	border-radius: var(--radius);
+	padding: var(--space-3) var(--space-4);
+	margin-bottom: var(--space-4);
+}
+
+.alert-success {
+	background: var(--color-success-tint);
+	border-color: var(--color-success-tint-border);
+	border-left-color: var(--color-success);
+	color: var(--color-success-tint-text);
+}
+
+.alert-error {
+	background: var(--color-danger-tint);
+	border-color: var(--color-danger-tint-border);
+	border-left-color: var(--color-danger);
+	color: var(--color-danger-tint-text);
+}
+
+.alert-warning {
+	background: var(--color-warning-tint);
+	border-color: var(--color-warning-tint-border);
+	border-left-color: #b45309;
+	color: var(--color-warning-tint-text);
+}
+
+/* ---------------------------------------------------------------------
+ * Status badges - e.g. denied / temp-denied / allowed in a Lists row.
+ * Text carries the meaning; the tint is a reinforcing cue only.
+ * ------------------------------------------------------------------- */
+.badge {
+	display: inline-flex;
+	align-items: center;
+	padding: var(--space-1) var(--space-2);
+	border-radius: 999px;
+	font-size: 0.8125rem;
+	font-weight: 600;
+	line-height: 1.4;
+}
+
+.badge-danger {
+	background: var(--color-danger-tint);
+	color: var(--color-danger-tint-text);
+}
+
+.badge-success {
+	background: var(--color-success-tint);
+	color: var(--color-success-tint-text);
+}
+
+.badge-warning {
+	background: var(--color-warning-tint);
+	color: var(--color-warning-tint-text);
+}
+
+/* ---------------------------------------------------------------------
+ * Diff view (Health screen: reconcile's findings before reconcile_fix).
+ * A leading character is expected IN THE MARKUP (+/-), read by a screen
+ * reader regardless of color, per this file's own color-is-never-the-
+ * only-signal rule above.
+ * ------------------------------------------------------------------- */
+.diff-add {
+	color: var(--color-success-tint-text);
+	background: var(--color-success-tint);
+}
+
+.diff-remove {
+	color: var(--color-danger-tint-text);
+	background: var(--color-danger-tint);
+}
+
+.diff-line {
+	display: block;
+	font-family: var(--font-mono);
+	font-size: 0.875rem;
+	padding: var(--space-1) var(--space-2);
+	white-space: pre-wrap;
+	word-break: break-word;
+}
+
+/* ---------------------------------------------------------------------
+ * Tables. Header row styling for the normal, wide-viewport case; the
+ * responsive collapse is in the 768px breakpoint below. See this
+ * file's header comment for the data-label markup contract.
+ * ------------------------------------------------------------------- */
+.table-responsive {
+	width: 100%;
+	overflow-x: auto;
+}
+
+table th,
+table td {
+	text-align: left;
+	padding: var(--space-3) var(--space-3);
+	border-bottom: var(--border-width) solid var(--color-border-subtle);
+	vertical-align: top;
+}
+
+table thead th {
+	font-weight: 600;
+	color: var(--color-text-muted);
+	border-bottom: 2px solid var(--color-border);
+	white-space: nowrap;
+}
+
+table tbody tr:hover {
+	background: var(--color-bg-alt);
+}
+
+/* Row-level actions (undeny/unallow/etc.) always keep their 44px hit
+   area even packed side by side in a cell. */
+.row-actions {
+	display: flex;
+	flex-wrap: wrap;
+	gap: var(--space-2);
+}
+
+/* ---------------------------------------------------------------------
+ * Pagination (Lists screen).
+ * ------------------------------------------------------------------- */
+.pagination {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: var(--space-2);
+	margin-top: var(--space-4);
+}
+
+.pagination a,
+.pagination span {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	min-height: var(--touch-min);
+	min-width: var(--touch-min);
+	padding: var(--space-1) var(--space-3);
+	border: var(--border-width) solid var(--color-control-border);
+	border-radius: var(--radius);
+	text-decoration: none;
+	color: var(--color-text);
+}
+
+.pagination a:hover {
+	background: var(--color-bg-alt);
+}
+
+.pagination [aria-current="page"] {
+	background: var(--color-primary);
+	border-color: var(--color-primary);
+	color: var(--color-primary-contrast);
+	font-weight: 700;
+}
+
+/* ---------------------------------------------------------------------
+ * Stat tiles (Overview screen counts).
+ * ------------------------------------------------------------------- */
+.stat-grid {
+	display: grid;
+	grid-template-columns: repeat(auto-fit, minmax(12rem, 1fr));
+	gap: var(--space-4);
+}
+
+.stat-tile {
+	background: var(--color-surface);
+	border: var(--border-width) solid var(--color-border);
+	border-radius: var(--radius-lg);
+	padding: var(--space-4);
+}
+
+.stat-tile .stat-value {
+	display: block;
+	font-size: 2rem;
+	font-weight: 700;
+	line-height: 1.1;
+}
+
+.stat-tile .stat-label {
+	display: block;
+	color: var(--color-text-muted);
+	font-size: 0.875rem;
+	margin-top: var(--space-1);
+}
+
+/* =======================================================================
+ * One breakpoint, 768px (task-6-brief.md). Below it: nav stacks, the
+ * shell's side padding shrinks, and any .table-responsive table becomes
+ * one stacked card per row.
+ * ===================================================================== */
+@media (max-width: 768px) {
+	.site-header {
+		padding: var(--space-3) var(--space-4);
+	}
+
+	#main-content,
+	.site-footer {
+		padding-left: var(--space-4);
+		padding-right: var(--space-4);
+	}
+
+	.site-nav ul {
+		flex-direction: column;
+	}
+
+	.site-nav a {
+		width: 100%;
+	}
+
+	.stat-grid {
+		grid-template-columns: 1fr;
+	}
+
+	/* Stacked-card tables. The real <thead> stays in the DOM (still
+	   read once by a screen reader navigating the table) but is moved
+	   fully offscreen; a sighted narrow-viewport reader gets the
+	   column name from each cell's own data-label via ::before
+	   instead. */
+	.table-responsive table,
+	.table-responsive thead,
+	.table-responsive tbody,
+	.table-responsive th,
+	.table-responsive td,
+	.table-responsive tr {
+		display: block;
+		width: 100%;
+	}
+
+	.table-responsive thead {
+		position: absolute;
+		width: 1px;
+		height: 1px;
+		padding: 0;
+		margin: -1px;
+		overflow: hidden;
+		clip: rect(0, 0, 0, 0);
+		white-space: nowrap;
+		border: 0;
+	}
+
+	.table-responsive tbody tr {
+		border: var(--border-width) solid var(--color-border);
+		border-radius: var(--radius);
+		margin-bottom: var(--space-3);
+		padding: var(--space-2) var(--space-3);
+	}
+
+	.table-responsive tbody tr:hover {
+		background: var(--color-surface);
+	}
+
+	.table-responsive td {
+		display: flex;
+		align-items: baseline;
+		justify-content: space-between;
+		gap: var(--space-3);
+		text-align: right;
+		border-bottom: var(--border-width) solid var(--color-border-subtle);
+		padding: var(--space-2) 0;
+	}
+
+	.table-responsive td:last-child {
+		border-bottom: 0;
+	}
+
+	.table-responsive td::before {
+		content: attr(data-label);
+		text-align: left;
+		font-weight: 600;
+		color: var(--color-text-muted);
+		padding-right: var(--space-3);
+	}
+
+	.row-actions {
+		justify-content: flex-end;
+	}
+}
