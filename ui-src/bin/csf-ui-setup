@@ -146,6 +146,16 @@ our $SETUP_CLI = '/usr/local/csf-ui/bin/csf-ui-setup';
 our $ABSOLUTE_LIFETIME = 1800;
 our $IDLE_LIFETIME     = 600;
 
+# How long an apply may take AFTER the operator pressed the button, for the
+# purpose of judging a state record's age when the owner's identity cannot be
+# confirmed (R74). It has to cover a full csf stop-and-start, which on a host
+# with a large blocklist is not quick. Deliberately generous: the cost of it
+# being too large is a slightly longer window in which a REUSED pid could be
+# mistaken for a live wizard on a platform with no /proc; the cost of it
+# being too small is locking out a legitimate operator, which is the failure
+# this whole task exists to prevent.
+our $APPLY_GRACE = 600;
+
 our $COOKIE_NAME = 'csfui_setup';
 our $TOKEN_BYTES = 32;
 
@@ -862,8 +872,12 @@ sub reassert_temporary_port {
 	# R71: only a LIVE session's port gets re-opened. See _state_is_live().
 	my ($live, $why_not) = $self->_state_is_live($spec);
 	unless ($live) {
+		# Worded as what was actually established, not as a claim about a
+		# session this code may not be able to see (R74): every branch of
+		# _state_is_live() reports what it checked, and that is what is
+		# passed through here.
 		return { ok => 0, stale => 1,
-			reason => "the temporary-port record was left by a session that is no longer running ($why_not), "
+			reason => "no live wizard session owns the temporary-port record ($why_not), "
 				. 'so it has not been acted on. Run csf-ui-setup --cleanup to clear it.' };
 	}
 
@@ -972,6 +986,19 @@ sub confirm_outcome {
 			. ' && systemctl daemon-reload',
 		1)
 		if $armed;
+
+	# R76: the unit FILES being gone is not the same as the cancel having
+	# worked. systemctl stop, disable or daemon-reload can each fail while
+	# both unlinks succeed - and a failed daemon-reload in particular leaves
+	# systemd holding a timer it has already loaded, which can still fire
+	# with no file on disk to explain it. armed() cannot see that; only
+	# confirm()'s own result can, so both are consulted.
+	return ('THE ROLLBACK MAY STILL FIRE - its unit files are gone, but systemd was not told cleanly.',
+		'Cancelling reported: ' . (length $detail ? $detail : 'an unspecified failure')
+			. '. Make sure by running: systemctl stop ' . $ConfigServer::UI::Rollback::TIMER_UNIT
+			. ' && systemctl daemon-reload',
+		1)
+		unless $result->{ok};
 
 	return ('Nothing was armed to cancel.',
 		(length $detail ? $detail : 'No rollback timer was installed by this wizard.'), 0);
@@ -1207,6 +1234,23 @@ sub _do_apply {
 	my $result = $self->{firewall}->run($self->{setup_cli}, '--answers', $path, '--yes');
 	my $ok = (!$result->{error} && !$result->{timeout} && !$result->{signal}
 		&& defined $result->{exit} && $result->{exit} == 0) ? 1 : 0;
+
+	# EVERYTHING THE CHILD SAID ALSO GOES TO THE TERMINAL THE WIZARD WAS
+	# STARTED FROM, and this is not belt and braces - it is the only copy
+	# that can be relied on to arrive.
+	#
+	# The page carrying this output travels back over the very port the
+	# apply may have just closed: a re-assertion that failed means the
+	# browser's next connection - and quite possibly this response - has
+	# nowhere to land, so the one message telling the operator their route
+	# is gone would be lost down the route that is gone. The terminal is on
+	# the SSH session they started this from, which the apply cannot break
+	# (a rule flush does not close an established connection).
+	my $said = defined $result->{output} ? $result->{output} : '';
+	if (length $said) {
+		print STDERR "csf-ui-setup: apply said:\n";
+		print STDERR "  $_\n" for split(/\n/, $said);
+	}
 
 	my $session = $self->{session};
 	my %var = (
@@ -1487,6 +1531,48 @@ sub _tls_wrap {
 	);
 }
 
+###############################################################################
+# write_response_to($socket, $response, $request) -> undef | $line_to_print
+#
+# R75: THE FIX FOR A DISCARDED RESULT WAS ITSELF A DISCARDED RESULT. The
+# previous round wrapped the write in eval { ...; 1 } and read the eval's
+# value - but ConfigServer::UI::HTTP::write_response() NEVER DIES. Every
+# failure path in its _write_all() is a return, not a die, so it returns 0
+# and the eval returned 1 regardless, and the "now reported" this was
+# supposed to deliver reported nothing, ever.
+#
+# So the RETURN VALUE is what is read. The eval stays only so that a die from
+# somewhere unforeseen cannot take the accept loop down with it.
+#
+# Extracted from serve() for the same reason listen_plan() and stop_reason()
+# were: the loop needs a real listening socket and is untested by design, and
+# a fix that lives only inside it is a fix nothing can hold to account - which
+# is exactly how the version this replaces survived a round.
+#
+# There is nothing to retry: one request per connection, and the peer has
+# gone or the deadline expired. What there is, is an operator looking at a
+# page that never arrived, who deserves to find the reason on the terminal
+# they started the wizard from rather than a wizard that appears healthy and
+# is silently failing to answer.
+###############################################################################
+sub write_response_to {
+	my ($self, $socket, $response, $request) = @_;
+
+	my $written = eval {
+		$H->can('write_response')->($socket, $response,
+			timeout => $ConfigServer::UI::HTTP::WRITE_TIMEOUT);
+	};
+	my $died = $@;
+	return undef if $written;
+
+	my $why = (defined $died && length $died) ? $died
+		: 'the peer went away or the write deadline expired';
+	$why =~ s/\s+\z//;
+	my $method = (ref($request) eq 'HASH' && defined $request->{method}) ? $request->{method} : '?';
+	my $path   = (ref($request) eq 'HASH' && defined $request->{path})   ? $request->{path}   : '?';
+	return "csf-ui-setup: the response to $method $path never reached the browser ($why)\n";
+}
+
 # The loop's whole stopping policy, extracted so both lifetimes are testable
 # without a real listening socket - the same thing Server.pm did with
 # _accept_backoff() for exactly the same reason. Returns the reason to stop,
@@ -1503,6 +1589,16 @@ sub serve {
 	my ($self, %opt) = @_;
 
 	my $plan = ref($opt{plan}) eq 'HASH' ? $opt{plan} : $self->listen_plan(undef);
+
+	# Without this, writing to a socket the browser has already closed
+	# raises SIGPIPE and the default disposition KILLS THIS PROCESS - which
+	# would take the wizard down mid-session and, worse, skip the cleanup
+	# that removes the temporary firewall rule. The same line, for the same
+	# reason, is in ConfigServer::UI::Server::run(). It also has to come
+	# before any of the reporting above can matter: a signal that kills the
+	# process gets there first (task-8-review.md R75).
+	local $SIG{PIPE} = 'IGNORE';
+
 	my $listener = $self->_listen_on($plan->{bind});
 	my $deadline = $self->{now}->() + $ABSOLUTE_LIFETIME;
 	my $idle_since = $self->{now}->();
@@ -1587,13 +1683,8 @@ sub serve {
 		# deserves to find the reason on the terminal they started this
 		# from, rather than a wizard that looks perfectly healthy and is
 		# silently failing to answer.
-		my $written = eval {
-			$H->can('write_response')->($socket, $response,
-				timeout => $ConfigServer::UI::HTTP::WRITE_TIMEOUT);
-			1;
-		};
-		print STDERR "csf-ui-setup: a response to $request->{method} $request->{path} could not be written"
-			. (defined $@ && length $@ ? ": $@" : "\n") unless $written;
+		my $note = $self->write_response_to($socket, $response, $request);
+		print STDERR $note if defined $note;
 		close $socket;
 	}
 
@@ -1691,12 +1782,39 @@ sub _proc_started {
 	open(my $fh, '<', "/proc/$pid/stat") or return '';
 	my $line = <$fh>;
 	close $fh;
+	return _parse_proc_stat($line);
+}
+
+###############################################################################
+# _parse_proc_stat($line) -> the start time, or ''
+#
+# Split out so it is testable without a process whose name contains a
+# parenthesis, which is the case this exists to survive and which no test can
+# conveniently create.
+#
+# Field 2 of /proc/<pid>/stat is the executable name in parentheses, and it
+# is NOT escaped: a process can be called "evil) 1 2 3 4" and every field
+# after it will appear to move. The only reliable landmark is the LAST ')'
+# in the line, because everything after it is fixed-format numbers.
+#
+# The previous version used a regex whose comment claimed exactly this and
+# whose behaviour was the opposite (task-8-review.md R77): /\)\s+(.*)\z/
+# with a greedy .* still matches at the FIRST ') ' the engine reaches, since
+# (.*)\z succeeds from anywhere. Harmless for a paren-free name and wrong
+# precisely for the crafted one - a guard at its weakest exactly where it is
+# needed, which is not a guard.
+###############################################################################
+sub _parse_proc_stat {
+	my ($line) = @_;
 	return '' unless defined $line;
-	# The second field is the executable name in parentheses and may itself
-	# contain spaces and parentheses, so the split starts after the LAST ')'.
-	my $tail = ($line =~ /\)\s+(.*)\z/s) ? $1 : return '';
+
+	my $close = rindex($line, ')');
+	return '' if $close < 0;
+
+	my $tail = substr($line, $close + 1);
+	$tail =~ s/^\s+//;
 	my @field = split(/\s+/, $tail);
-	# $tail begins at field 3 (state), so field 22 is index 19.
+	# $tail begins at field 3 (state), so field 22 (starttime) is index 19.
 	return (defined $field[19] && $field[19] =~ /^[0-9]+\z/) ? $field[19] : '';
 }
 
@@ -1732,18 +1850,55 @@ sub _state_is_live {
 	return (0, 'the record carries no creation time, so its age cannot be judged')
 		unless defined $created;
 
-	my $age = $self->{now}->() - $created;
-	return (0, "the record is ${age}s old, older than the $ABSOLUTE_LIFETIME s a wizard session can live, so the session that made it is gone")
-		if $age > $ABSOLUTE_LIFETIME;
-
+	# THE OWNER IS ASKED FIRST, AND A LIVE OWNER SETTLES IT (R74).
+	#
+	# The pid being gone is the one fact that is never ambiguous, so it is
+	# the first refusal.
 	return (0, "the process that made the record (pid $spec->{pid}) is no longer running")
 		unless kill(0, $spec->{pid});
 
+	# The pid is alive. Is it the SAME process? /proc's start time answers
+	# that exactly, and when it does, that answer OUTRANKS THE CLOCK - see
+	# the age cap below for why that ordering is not a nicety.
 	my $started_now = _proc_started($spec->{pid});
-	if (defined $spec->{started} && length $spec->{started} && length $started_now
-		&& $spec->{started} ne $started_now) {
-		return (0, "pid $spec->{pid} is running but is not the process that made the record; the number has been reused");
+	my $identity_confirmed = 0;
+	if (defined $spec->{started} && length $spec->{started} && length $started_now) {
+		return (0, "pid $spec->{pid} is running but is not the process that made the record; the number has been reused")
+			if $spec->{started} ne $started_now;
+		$identity_confirmed = 1;
 	}
+
+	# A CONFIRMED LIVE OWNER OUTRANKS AN EXPIRED CLOCK (task-8-review.md
+	# R74). This is the finding that mattered, and it is worth spelling out
+	# because getting it backwards locks out exactly the operator this whole
+	# task exists to protect:
+	#
+	# The wizard lives $ABSOLUTE_LIFETIME (1800s). An operator who presses
+	# Apply at second 1790 is inside their session and entitled to be. The
+	# apply then forks this program, which snapshots, arms, writes two
+	# config files and runs csf -r - and csf -r is a full stop-and-start
+	# of the firewall, which takes as long as it takes. By the time the
+	# re-assertion runs, the RECORD is past 1800 seconds old while the
+	# wizard that owns it is alive, in waitpid, waiting for this very
+	# process to return.
+	#
+	# Refusing there closed the operator's route back in, silently (the
+	# stale branch suppresses the warning), and told them a session that is
+	# running is "no longer running". The record's age was never the
+	# question; whether its owner is still there was. So when /proc has
+	# confirmed the owner's identity, age is not consulted at all.
+	return (1, undef) if $identity_confirmed;
+
+	# No /proc, or a record written before start times were kept: identity
+	# cannot be confirmed, and pids are reused. The age cap is the only
+	# reuse guard left, so it applies here and only here - with a grace
+	# allowance, because the window that matters is "could the owning wizard
+	# still have been alive when this apply STARTED", and an apply is not
+	# instantaneous: csf -r sits in the middle of it.
+	my $age = $self->{now}->() - $created;
+	my $cap = $ABSOLUTE_LIFETIME + $APPLY_GRACE;
+	return (0, "the record is ${age}s old, past the ${cap}s a wizard session and the apply it starts can take together, and this platform cannot confirm that pid $spec->{pid} is still the process that made it")
+		if $age > $cap;
 
 	return (1, undef);
 }

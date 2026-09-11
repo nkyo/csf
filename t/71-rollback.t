@@ -36,7 +36,8 @@ use FindBin ();
 use lib "$FindBin::Bin/..", "$FindBin::Bin/../ui-src/lib";
 
 use File::Temp qw(tempdir);
-use Test::More tests => 431;
+use Socket ();
+use Test::More tests => 474;
 
 use ConfigServer::UI::Rollback ();
 use ConfigServer::UI::Firewall ();
@@ -156,7 +157,11 @@ sub world {
 		unit_dir       => "$root/units",
 		csf_conf       => "$root/etc/csf.conf",
 		ui_conf        => "$root/etc/ui.conf",
-		setup_bin      => '/usr/local/csf-ui/bin/csf-ui-setup',
+		# The REAL file, not the installed path, so that every arm() in this
+		# file is armed against something that must actually be exec'able -
+		# which makes the R73 check load-bearing in every test that arms,
+		# not only in the ones written for it.
+		setup_bin      => ($opt{setup_bin} || $SETUP_PATH),
 		systemd_marker => "$root/run-systemd",
 		firewall       => $firewall,
 		gid_for        => sub {
@@ -381,7 +386,11 @@ sub mode_of {
 # text rather than trusted from a comment.
 ###############################################################################
 {
-	my $w = world(systemd => 1);
+	# unit_text() is a pure function of its inputs and does not care whether
+	# the binary exists - that is arm()'s check (R73) - so this one uses the
+	# frozen installed path from docs/WEBUI-RPC.md S2.3, which is what a
+	# real unit file will contain.
+	my $w = world(systemd => 1, setup_bin => '/usr/local/csf-ui/bin/csf-ui-setup');
 	my ($service, $timer) = $w->{rollback}->unit_text('/var/lib/csf-ui/rollback/123-456');
 
 	like($service, qr/^\[Service\]$/m, 'the service unit has a [Service] section');
@@ -431,6 +440,65 @@ sub mode_of {
 		my ($service) = $w->{rollback}->unit_text('/var/lib/csf-ui/rollback/1');
 		is($service, undef, 'a window of undef is refused');
 	}
+}
+
+###############################################################################
+# R73: arm() REFUSES A ExecStart IT CANNOT EXEC.
+#
+# The mode test above guards ui-src/ - the repository. The timer arms against
+# the INSTALLED path, and until this check nothing verified that at all. So
+# the exact failure that killed this rescue mechanism in fix round 1 could
+# still arrive at the only path that matters at runtime: a bad install, a
+# partial upgrade, or Task 9, which is the task that does the installing.
+#
+# A timer that will 203/EXEC is worse than no timer, because the operator is
+# told they are covered.
+###############################################################################
+{
+	my $w = world(systemd => 1, setup_bin => "$FindBin::Bin/../no-such-binary");
+	my $snap = $w->{rollback}->snapshot;
+	my $armed = $w->{rollback}->arm($snap->{dir});
+	is($armed->{ok}, 0, 'arming against a binary that does not exist is refused');
+	is($armed->{code}, 'E_EXEC', 'with its own code');
+	like($armed->{reason}, qr/does not exist/, 'saying which of the three things is wrong with it');
+	like($armed->{reason}, qr/203\/EXEC/, 'naming the failure it would have produced');
+	ok(!-e "$w->{root}/units/csf-ui-rollback.timer", 'and no unit file is written');
+	is($w->{runner}->ran(qr/systemctl/), 0, 'and systemctl is never called');
+}
+{
+	my $w = world(systemd => 1, setup_bin => "$FindBin::Bin/../CHANGES.md");
+	my $snap = $w->{rollback}->snapshot;
+	my $armed = $w->{rollback}->arm($snap->{dir});
+	is($armed->{ok}, 0, 'arming against a file that is not executable is refused');
+	is($armed->{code}, 'E_EXEC', 'with the same code');
+	like($armed->{reason}, qr/not executable \(mode [0-7]{4}\)/,
+		'and the mode it actually has, which is the fact that decides it');
+	ok(!-e "$w->{root}/units/csf-ui-rollback.service", 'and nothing is written');
+}
+{
+	my $w = world(systemd => 1, setup_bin => "$FindBin::Bin/..");
+	my $snap = $w->{rollback}->snapshot;
+	my $armed = $w->{rollback}->arm($snap->{dir});
+	is($armed->{ok}, 0, 'arming against a directory is refused');
+	like($armed->{reason}, qr/not a plain file/, 'saying so');
+}
+{
+	# And the whole point of the refusal: apply() stops, so an operator is
+	# never handed a configuration guarded by a timer that cannot run.
+	my $w = world(systemd => 1, setup_bin => "$FindBin::Bin/../no-such-binary");
+	my $setup = setup_for($w);
+	my ($answer) = $S->can('parse_answers')->(qq{TCP_IN="22,443"\n});
+	my $result = $setup->apply(answers => $answer);
+	is($result->{ok}, 0, 'and apply() will not apply anything without a rollback that can run');
+	is($result->{code}, 'E_EXEC', 'naming why');
+	is(slurp("$w->{root}/etc/csf.conf"), $CSF_CONF_FIXTURE, 'csf.conf untouched');
+}
+{
+	# The live one: armed against the real file, which must be exec'able.
+	my $w = world(systemd => 1);
+	my $snap = $w->{rollback}->snapshot;
+	is($w->{rollback}->arm($snap->{dir})->{ok}, 1,
+		'arming against a real, executable binary succeeds - so every other arm() in this file is load-bearing for R73');
 }
 
 ###############################################################################
@@ -859,6 +927,36 @@ sub cookie_from {
 		'and the web tier itself NEVER TOUCHED csf.conf');
 	like($applied->{body}, qr/Open a NEW ssh connection/,
 		'the page tells the operator to prove a NEW connection works, not to trust the one they have');
+}
+{
+	# EVERYTHING THE APPLY SAID ALSO REACHES THE TERMINAL.
+	#
+	# The page carrying that output travels back over the very port the
+	# apply may have just closed, so a re-assertion that failed would send
+	# the one message saying "your route is gone" down the route that is
+	# gone. The terminal is on the SSH session the wizard was started from,
+	# which a rule flush cannot break.
+	my $w = world(systemd => 1);
+	my $setup = setup_for($w);
+	$w->{runner}->on(qr/--answers/, { exit => 0, output => "csf.conf: written\nWARNING: your route back in is gone\n" });
+	$setup->handle_request(request(method => 'POST', path => '/token', body => 'token=fixture-token'));
+	my ($cookie, $csrf) = ($setup->{session}{id}, $setup->{session}{csrf});
+
+	my $captured = '';
+	{
+		open(my $save, '>&', \*STDERR) or die "dup: $!";
+		close STDERR;
+		open(STDERR, '>', \$captured) or die "reopen: $!";
+		$setup->handle_request(request(method => 'POST', path => '/apply',
+			headers => { cookie => "csfui_setup=$cookie" },
+			body => "_csrf=$csrf&TCP_IN=22&UI_MODE=a&UI_ALLOW=203.0.113.5"));
+		close STDERR;
+		open(STDERR, '>&', $save) or die "restore: $!";
+		close $save;
+	}
+	like($captured, qr/apply said:/, 'the apply output is echoed to the wizard\'s own terminal');
+	like($captured, qr/your route back in is gone/,
+		'including the warning that would otherwise have travelled down the route it is warning about');
 }
 {
 	# A bad answer from the browser comes back as a page, not a crash, and
@@ -1449,6 +1547,147 @@ ANSWERS
 }
 
 ###############################################################################
+# R75: a response that never reaches the browser is REPORTED.
+#
+# The previous round's version read an eval's value instead of
+# write_response()'s, and write_response() never dies - it returns 0 - so the
+# check was always true and nothing was ever reported. These drive the real
+# function over a real socket, in both directions.
+###############################################################################
+{
+	my $w = world();
+	my $setup = setup_for($w);
+	my $request = request(method => 'GET', path => '/wizard');
+	my $response = { status => 200,
+		headers => [['Content-Type', 'text/html']], body => 'hello' };
+
+	# A socket that works: nothing to report.
+	socketpair(my $near, my $far, Socket::AF_UNIX(), Socket::SOCK_STREAM(), 0)
+		or die "socketpair: $!";
+	is($setup->write_response_to($near, $response, $request), undef,
+		'a response that was written reports nothing');
+	close $near; close $far;
+
+	# A socket whose peer has gone. write_response() returns 0 here; it does
+	# not die, which is the whole point of the finding.
+	SKIP: {
+		local $SIG{PIPE} = 'IGNORE';
+
+		# Whether this platform refuses a large write to a socket whose peer
+		# has gone is established INDEPENDENTLY, on a socketpair of this
+		# test's own - never from write_response_to()'s answer. Skipping on
+		# that answer would make this block skip itself into a pass the
+		# moment the guard it exists for was removed, which is the second
+		# time this suite has caught that shape and the reason it is spelled
+		# out here.
+		my $refuses = do {
+			socketpair(my $p, my $q, Socket::AF_UNIX(), Socket::SOCK_STREAM(), 0)
+				or last;
+			close $q;
+			my $failed = 0;
+			my $sent = 0;
+			while ($sent < 8 * 1024 * 1024) {
+				my $wrote = syswrite($p, 'x' x 65536);
+				unless (defined $wrote && $wrote > 0) { $failed = 1; last }
+				$sent += $wrote;
+			}
+			close $p;
+			$failed;
+		};
+		skip 'this platform absorbs writes to a closed peer, so the failure cannot be staged', 3
+			unless $refuses;
+
+		socketpair(my $a, my $b, Socket::AF_UNIX(), Socket::SOCK_STREAM(), 0)
+			or die "socketpair: $!";
+		close $b;
+		my $big = { status => 200, headers => [['Content-Type', 'text/html']],
+			body => 'x' x (8 * 1024 * 1024) };
+		my $note = $setup->write_response_to($a, $big, $request);
+		close $a;
+		ok(defined $note, 'a response that was NOT written is reported');
+		like(($note || ''), qr/never reached the browser \(/, 'saying it never arrived, and why');
+		like(($note || ''), qr/GET \/wizard/, 'naming the request it belonged to');
+	}
+}
+{
+	# The signal that would otherwise get there first. Without SIGPIPE
+	# ignored, writing to a socket the browser has closed kills this process
+	# outright - taking the wizard down mid-session and skipping the cleanup
+	# that removes the temporary firewall rule.
+	open(my $fh, '<', $SETUP_PATH) or die;
+	local $/;
+	my $source = <$fh>;
+	close $fh;
+	like($source, qr/\$SIG\{PIPE\}\s*=\s*'IGNORE'/,
+		'serve() ignores SIGPIPE, as ConfigServer::UI::Server::run() already does');
+}
+
+###############################################################################
+# R76: the unit FILES being gone is not the same as the cancel having worked.
+###############################################################################
+{
+	# stop, disable and daemon-reload all fail; both unlinks succeed. The
+	# files are gone, so armed() says no - but systemd has a timer loaded
+	# that can still fire, and nothing on disk explains it.
+	my $w = world(systemd => 1);
+	my $setup = setup_for($w);
+	my $snap = $w->{rollback}->snapshot;
+	is($w->{rollback}->arm($snap->{dir})->{ok}, 1, 'armed to begin with');
+	$w->{runner}->on(qr{systemctl (?:stop|disable|daemon-reload)}, { exit => 1, output => "Failed.\n" });
+
+	my $result = $setup->confirm;
+	is($w->{rollback}->armed, 0, 'the unit files really are gone');
+	is($result->{ok}, 0, 'but confirm() knows the cancel did not go cleanly');
+
+	my ($headline, $detail, $needs_action) = $setup->confirm_outcome($result);
+	is($needs_action, 1, 'so the operator is told there is something to do');
+	like($headline, qr/MAY STILL FIRE/, 'and the headline says the rollback may still fire');
+	unlike($headline, qr/Nothing was armed to cancel/,
+		'NOT "Nothing was armed to cancel" - which is what it said before, while a loaded timer sat there');
+	like($detail, qr/systemctl daemon-reload/, 'with the command that settles it');
+}
+{
+	# And the genuinely clean nothing-to-do case still reads as such.
+	my $w = world(systemd => 0);
+	my $setup = setup_for($w);
+	my ($headline, undef, $needs_action) = $setup->confirm_outcome($setup->confirm);
+	is($needs_action, 0, 'a clean no-op needs no action');
+	like($headline, qr/Nothing was armed to cancel/, 'and that is the only place that sentence is used');
+}
+
+###############################################################################
+# R77: /proc/<pid>/stat's field 2 is not escaped, so the LAST ')' is the only
+# reliable landmark. The previous regex matched the FIRST - harmless for a
+# paren-free name, and wrong exactly for the crafted one the reused-pid guard
+# exists to catch.
+###############################################################################
+{
+	my $P = 'ConfigServer::UI::Setup';
+
+	# A real line, as Linux writes it. Field 22 (starttime) is 9876543.
+	my @after_comm = ('S', 1, 1000, 1000, 0, -1, 4194560,
+		100, 200, 0, 0, 10, 20, 5, 5, 20, 0, 1, 0, 9876543, 12345678, 999);
+	my $ordinary = "4242 (perl) " . join(' ', @after_comm) . "\n";
+	is($P->can('_parse_proc_stat')->($ordinary), '9876543', 'an ordinary stat line parses');
+
+	# The same process, named so that its comm contains ") " - which is
+	# legal, and is what an attacker who can name a process would choose.
+	my $hostile = "4242 (evil) 1 2 3 4) " . join(' ', @after_comm) . "\n";
+	is($P->can('_parse_proc_stat')->($hostile), '9876543',
+		'and so does one whose executable name contains ") " - the LAST paren is the landmark');
+
+	# Spaces alone, without a paren, were never the problem but must survive.
+	my $spaced = "4242 (my program) " . join(' ', @after_comm) . "\n";
+	is($P->can('_parse_proc_stat')->($spaced), '9876543', 'a name with spaces parses');
+
+	is($P->can('_parse_proc_stat')->('4242 perl S 1 2 3'), '',
+		'a line with no parenthesis at all yields nothing, rather than a wrong number');
+	is($P->can('_parse_proc_stat')->("4242 (perl) S 1 2\n"), '',
+		'and so does a line too short to hold field 22');
+	is($P->can('_parse_proc_stat')->(undef), '', 'undef yields nothing');
+}
+
+###############################################################################
 # R71: A STALE RECORD MUST NOT RE-OPEN A FIREWALL PORT.
 #
 # A leftover session.state would otherwise make a later shell
@@ -1508,20 +1747,83 @@ ANSWERS
 	my %rule = (kind => 'iptables', binary => '/sbin/iptables', chain => 'INPUT',
 		port => 8444, address => '203.0.113.5', canonical => $RENDERED);
 
-	# Owned by THIS process, which is certainly alive - so the only thing
-	# left to disqualify it is age.
+	# Owned by THIS process, which is certainly alive.
 	$setup->save_state(\%rule);
-	$clock += 1801;    # one second past the longest a wizard session can live
-	my $old = $setup->reassert_temporary_port;
-	is($old->{ok}, 0, 'a record older than a wizard session can live is stale even if its pid is alive');
-	like($old->{reason}, qr/older than/, 'saying so');
-	is($runner->ran(qr{ -I INPUT 1 }), 0, 'and nothing was opened');
 
-	# Inside the window, owned by a live process: acted on.
-	$clock -= 1801;
 	my $fresh = $setup->reassert_temporary_port;
 	is($fresh->{ok}, 1, 'a live, fresh record IS acted on - this gate only ever refuses');
 	is($fresh->{restored}, 1, 'the flushed rule was put back');
+
+	# R74: A CONFIRMED LIVE OWNER OUTRANKS AN EXPIRED CLOCK.
+	#
+	# This is the operator who pressed Apply at second 1790 of their 1800
+	# second session. The apply forks, snapshots, arms, writes two files and
+	# runs csf -r - and by the time the re-assertion runs the RECORD is past
+	# 1800 seconds old while the wizard that owns it is alive, in waitpid,
+	# waiting for this very process. Refusing there closes their route back
+	# in, silently, and tells them a running session is not running.
+	SKIP: {
+		skip 'no /proc, so the owner\'s identity cannot be confirmed here', 4
+			unless -r "/proc/$$/stat";
+		@rules = ();
+		$clock += 1801;
+		my $late = $setup->reassert_temporary_port;
+		is($late->{ok}, 1,
+			'an expired CLOCK does not disqualify a record whose owner is confirmed alive');
+		is($late->{restored}, 1, 'the operator gets their route back');
+		is($late->{stale}, undef, 'and is never told their live session is stale');
+
+		# And the principle, not just the scenario: a confirmed live owner
+		# outranks the clock at ANY age. Past the grace allowance too -
+		# which is what makes this test bind to the identity branch rather
+		# than to the grace happening to be wide enough.
+		@rules = ();
+		$clock += 5000;
+		my $ancient = $setup->reassert_temporary_port;
+		is($ancient->{ok}, 1,
+			'a record of any age is live while its owner is confirmed to be the process that made it');
+		$clock -= 5000;
+		$clock -= 1801;
+	}
+}
+{
+	# The age cap still exists - it is the reuse guard for a platform where
+	# identity CANNOT be confirmed, which is the only place it now applies.
+	my $w = world(systemd => 1);
+	my $runner = FakeRunner->new
+		->on(qr{is-active firewalld}, { exit => 3, output => "inactive\n" })
+		->on(qr{^/sbin/iptables --version\z}, { output => "iptables v1.8.7 (nf_tables)\n" })
+		->on(qr{ -I INPUT 1 }, { exit => 0, output => '' })
+		->on(qr{ -S INPUT\z}, { output => "-P INPUT ACCEPT\n" });
+	my $clock = 1_757_548_800;
+	# Stateful, so a rule put back can be read back - otherwise the last
+	# assertion below would fail on E_READBACK and look like a refusal.
+	my $RENDERED = '-A INPUT -s 203.0.113.5/32 -p tcp -m comment --comment csf-ui-setup -m tcp --dport 8444 -j ACCEPT';
+	my @rules;
+	$runner->{rules}[2][1] = sub { push @rules, $RENDERED; return { exit => 0, output => '' } };
+	$runner->{rules}[3][1] = sub {
+		return { exit => 0, output => join("\n", '-P INPUT ACCEPT', @rules) . "\n" };
+	};
+	my $firewall = firewall_for($runner, iptables => '/sbin/iptables');
+	my $setup = $S->new(firewall => $firewall, rollback => $w->{rollback},
+		state_dir => "$w->{root}/state", token => 't', now => sub { $clock });
+	ConfigServer::UI::Rollback::make_path("$w->{root}/state", mode => 0700);
+
+	my $body = qq{KIND="iptables"\nBINARY="/sbin/iptables"\nCHAIN="INPUT"\nPORT="8444"\nADDRESS="203.0.113.5"\nCANONICAL="$RENDERED"\nPID="$$"\n};
+
+	# No STARTED field: identity unconfirmable, so the clock is all there is.
+	spew($setup->state_path, $body . qq{CREATED="$clock"\n});
+	$clock += 1800 + 600 + 1;
+	my $too_old = $setup->reassert_temporary_port;
+	is($too_old->{ok}, 0,
+		'without a confirmable identity, a record past the session lifetime PLUS the apply grace is refused');
+	like($too_old->{reason}, qr/cannot confirm/, 'and says that is why the clock had to decide it');
+	is($runner->ran(qr{ -I INPUT 1 }), 0, 'nothing was opened');
+
+	# Inside the grace: the late-apply operator is served even here.
+	$clock -= 601;
+	my $late = $setup->reassert_temporary_port;
+	is($late->{ok}, 1, 'and inside the grace the same record is still acted on');
 }
 {
 	# A record written before this check existed carries no owner at all.

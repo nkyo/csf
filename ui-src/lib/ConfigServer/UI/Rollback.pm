@@ -541,6 +541,38 @@ sub arm {
 	my ($service, $timer) = $self->unit_text($snapshot_dir);
 	return { ok => 0, reason => $timer, code => 'E_UNIT' } unless defined $service;
 
+	# CAN THE THING IN ExecStart ACTUALLY BE EXEC'D? (task-8-review.md R73.)
+	#
+	# The timer arms against an INSTALLED path, and until now nothing
+	# anywhere checked it. t/71's mode test guards the copies in ui-src/,
+	# which is the repository - not the file systemd will run. So the exact
+	# failure that killed this rescue mechanism in fix round 1 could still
+	# arrive at the only path that matters at runtime, from a bad install, a
+	# partial upgrade, or Task 9, which is the task that does the
+	# installing.
+	#
+	# A timer that will 203/EXEC is WORSE THAN NO TIMER, because the
+	# operator is told they are covered and then acts on it - which is the
+	# whole reason this refuses rather than warning: ui-src/bin/
+	# csf-ui-setup's apply() stops dead when arm() refuses, and an operator
+	# who cannot arm a rollback should be applying from a shell they can
+	# watch, not from a browser that has promised them a safety net it does
+	# not have.
+	my $binary = $self->{setup_bin};
+	unless (-e $binary) {
+		return { ok => 0, code => 'E_EXEC',
+			reason => "the rollback timer would run $binary, which does not exist - it would fail with 203/EXEC and restore nothing" };
+	}
+	unless (-f $binary) {
+		return { ok => 0, code => 'E_EXEC',
+			reason => "the rollback timer would run $binary, which is not a plain file - it would fail with 203/EXEC and restore nothing" };
+	}
+	unless (-x $binary) {
+		return { ok => 0, code => 'E_EXEC',
+			reason => sprintf('the rollback timer would run %s, which is not executable (mode %04o) - it would fail with 203/EXEC and restore nothing; docs/WEBUI-RPC.md section 2.3 freezes it at 0750',
+				$binary, ((stat($binary))[2] & 07777)) };
+	}
+
 	my $made = make_path($self->{unit_dir}, mode => 0755, parent_mode => 0755);
 	return { ok => 0, reason => "the unit directory $self->{unit_dir} could not be created: $made", code => 'E_UNIT' }
 		if defined $made;

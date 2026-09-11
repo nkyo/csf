@@ -37,6 +37,70 @@ line is added below the original notice; the original stays intact.
 
 ### Unreleased
 
+#### Task 8 fix round 3 — the class left open at the only path that matters, and a live operator the staleness check could lock out
+
+**2026-09-11** — Five findings. The first is a boundary drawn in the wrong place; the second
+is the failure this whole task exists to prevent, arrived at by the guard added to prevent it.
+
+- **R73 — `arm()` never checked that `ExecStart`'s binary exists and can be exec'd.** Fix
+  round 2 added a test guarding the modes of the copies in `ui-src/` — the repository. The
+  timer arms against the **installed** path, and nothing verified that at all, so the exact
+  failure that killed this rescue mechanism could still arrive from a bad install, a partial
+  upgrade, or Task 9, which is the task that does the installing. The instance was fixed and
+  the class left open at the only path that matters at runtime. `arm()` now refuses — not
+  warns — when the binary is missing, is not a plain file, or is not executable, quoting the
+  mode it actually has; `apply()` stops dead, because a timer that will 203/EXEC is worse
+  than no timer and an operator who cannot arm a rollback should be applying from a shell
+  they can watch. Every `arm()` in the suite now arms against the real file, so the check is
+  load-bearing in thirty tests rather than in the four written for it.
+
+- **R74 — a legitimate operator could be locked out.** The staleness check compared the
+  record's age against the 1800-second session lifetime *before* asking whether the owning
+  process was alive, and nothing overrode it. An operator who pressed Apply at second 1790
+  is inside their session and entitled to be; the apply then snapshots, arms, writes two
+  files and runs `csf -r` — a full stop-and-start of the firewall — and by the time the
+  re-assertion runs, the record is past 1800 seconds old while the wizard that owns it is
+  alive, in `waitpid`, waiting for that very process. It was refused, landed in the branch
+  that deliberately suppresses the warning, and the operator was told a running session was
+  "no longer running" while their route back in closed silently.
+
+  The record's age was never the question; whether its owner is still there was. The owner
+  is now asked first, and **a confirmed live owner outranks the clock at any age**. The age
+  cap survives only where identity *cannot* be confirmed — no `/proc`, or a record predating
+  start times — and there it carries a grace allowance for the apply itself, because `csf -r`
+  sits in the middle of it. The stale message now reports what was actually established
+  rather than asserting something about a session this code may not be able to see.
+
+- **R75 — the fix for a discarded result was itself a discarded result.** The previous round
+  wrapped the response write in `eval { ...; 1 }` and read the eval's value, but
+  `write_response` never dies — every failure path in `_write_all` is a `return 0`. So the
+  check was always true and the "now reported" it promised reported nothing, ever. The
+  return value is read now, the decision is extracted into a function a test can drive over
+  a real socket with a closed peer, and `serve()` ignores `SIGPIPE` — without which the
+  signal kills the wizard mid-session, skipping the cleanup that removes the temporary
+  firewall rule, before any of the reporting could matter.
+
+- **R76 — R70, one branch over.** The unit files being gone is not the same as the cancel
+  having worked: `stop`, `disable` or `daemon-reload` can fail while both unlinks succeed,
+  and a failed `daemon-reload` leaves systemd holding a timer it has already loaded, which
+  can still fire with no file on disk to explain it. `armed()` cannot see that; only
+  `confirm()`'s own result can. Both are consulted now, and that case gets its own headline
+  and its own non-zero exit instead of "Nothing was armed to cancel."
+
+- **R77 — the `/proc` stat regex matched the first `)`, not the last as its comment
+  claimed.** Field 2 is the executable name, unescaped, so a process can be named
+  `evil) 1 2 3 4` and every field after it appears to move. Harmless for a paren-free name
+  and wrong exactly for the crafted one the reused-pid guard exists to catch — a guard at
+  its weakest precisely where it is needed. Now anchored on the last `)`, and split into a
+  function tested against a hostile line directly.
+
+- The apply's whole output is now echoed to the terminal the wizard was started from. The
+  page carrying it travels back over the very port the apply may have just closed, so the
+  one message saying "your route back in is gone" would have gone down the route it was
+  warning about.
+
+`t/71-rollback.t`: 431 → 474. Whole suite: **2521 tests** (was 2478), `prove -I. t/`.
+
 #### Task 8 fix round 2 — the round that hardened the rescue path is the round that killed it, with a file mode
 
 **2026-09-11** — Four findings and three small ones.
