@@ -32,7 +32,7 @@ use FindBin ();
 use lib "$FindBin::Bin/..", "$FindBin::Bin/../ui-src/lib";
 
 use File::Temp ();
-use Test::More tests => 189;
+use Test::More tests => 199;
 
 require_ok('ConfigServer::UI::Proto');
 my $P = 'ConfigServer::UI::Proto';
@@ -160,14 +160,32 @@ for my $case (@IP_HOSTILE) {
 is(scalar($P->can('validate_ip')->('0.0.0.0/0', mutating => 1)), undef, 'ip rejects /0 for a mutating operation');
 is(scalar($P->can('validate_ip')->('::/0', mutating => 1)), undef, 'ip rejects ::/0');
 is(scalar($P->can('validate_ip')->('0.0.0.0/0')), undef, 'ip rejects /0 by default, which is what grep gets');
-is(scalar($P->can('validate_ip')->('0.0.0.0/0', zero_prefix => 1)), '0.0.0.0/0',
+is(scalar($P->can('validate_ip')->('0.0.0.0/0', removal => 1)), '0.0.0.0/0',
 	'ip accepts /0 for removal, because an entry that can exist must be removable');
 is(scalar($P->can('validate_ip')->('127.0.0.1', mutating => 1)), undef, 'ip rejects loopback for a mutating operation');
 is(scalar($P->can('validate_ip')->('127.0.0.0/8', mutating => 1)), undef, 'ip rejects a range covering loopback');
-is(scalar($P->can('validate_ip')->('127.0.0.1', zero_prefix => 1)), '127.0.0.1', 'loopback can still be removed');
+is(scalar($P->can('validate_ip')->('127.0.0.1', removal => 1)), '127.0.0.1', 'loopback can still be removed');
 is(scalar($P->can('validate_ip')->('16.0.0.0/4', mutating => 1)), undef, 'ip rejects a prefix below the IPv4 floor');
 is(scalar($P->can('validate_ip')->('2001:db8::/16', mutating => 1)), undef, 'ip rejects a prefix below the IPv6 floor');
-is(scalar($P->can('validate_ip')->('16.0.0.0/4', zero_prefix => 1)), '16.0.0.0/4', 'the floor does not apply to removal');
+is(scalar($P->can('validate_ip')->('16.0.0.0/4', removal => 1)), '16.0.0.0/4', 'the floor does not apply to removal');
+
+# R18. :: and ::1 sit inside the numeric range the IPv4-mapped rule catches, but
+# they are not aliases of an IPv4 address, and csf's own CLI will write ::1 into
+# csf.deny. Removal and file parsing accept exactly those two; adding does not,
+# and no genuine mapped or compatible form is accepted anywhere.
+is(scalar($P->can('validate_ip')->('::1', removal => 1)), '::1', 'the IPv6 loopback can be removed');
+is(scalar($P->can('validate_ip')->('::', removal => 1)), '::', 'the unspecified address can be removed');
+is(scalar($P->can('validate_ip')->('::1/128', removal => 1)), '::1/128', 'and so can its /128 form');
+is(scalar($P->can('validate_ip')->('::/0', removal => 1)), '::/0', 'and the IPv6 whole-Internet entry');
+is(scalar($P->can('validate_ip')->('::1', mutating => 1)), undef, 'but ::1 still cannot be added');
+is(scalar($P->can('validate_ip')->('::', mutating => 1)), undef, 'and neither can ::');
+is(scalar($P->can('validate_ip')->('::1')), undef, 'and grep, which is neither, still refuses it');
+is(scalar($P->can('validate_ip')->('::ffff:127.0.0.1', removal => 1)), undef,
+	'a genuine IPv4-mapped address is still refused, even for removal');
+is(scalar($P->can('validate_ip')->('::192.0.2.1', removal => 1)), undef,
+	'and so is an IPv4-compatible one');
+is(scalar($P->can('validate_ip')->('::2', removal => 1)), undef,
+	'the carve-out is two literals, not the whole range');
 
 is($P->can('ip_key')->('1.2.3.4/32'), '1.2.3.4', 'a /32 names the same host as a bare address');
 is($P->can('ip_key')->('2001:db8::1/128'), '2001:db8::1', 'a /128 names the same host as a bare address');

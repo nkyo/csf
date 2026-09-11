@@ -265,9 +265,12 @@ sub _plain {
 # --- 4.1 ip -----------------------------------------------------------------
 #
 # %opt:
-#   zero_prefix => 1   accept /0. Removal only: undeny, unallow, temprm.
-#   mutating    => 1   apply the prefix floor and the loopback rule: deny,
-#                      allow, tempdeny.
+#   removal  => 1   the permissive side of section 4.1, for undeny, unallow and
+#                   temprm - and for reading entries back out of the files csf
+#                   wrote. Accepts /0, and accepts the two IPv6 literals :: and
+#                   ::1 that the IPv4-mapped rule would otherwise catch (R18).
+#   mutating => 1   apply the prefix floor and the loopback rule: deny, allow,
+#                   tempdeny.
 #
 # Returns the canonical form - inet_ntop of the packed bytes, lowercased, with
 # /len appended when a prefix was given. That canonical form, not the caller's
@@ -298,7 +301,18 @@ sub ip_info {
 		my $high = substr($packed, 0, 10);
 		my $next = substr($packed, 10, 2);
 		if ($high eq "\0" x 10 && ($next eq "\0\0" || $next eq "\xFF\xFF")) {
-			return _bad('is an IPv4-mapped or IPv4-compatible IPv6 address; send the IPv4 form');
+			# R18: :: and ::1 fall inside the numeric range this rule uses to
+			# catch IPv4-in-IPv6 forms, but they are not aliases of an IPv4
+			# address - they are the unspecified and loopback addresses of their
+			# own family. csf's CLI will put ::1 into csf.deny, so refusing to
+			# read or remove it would leave the UI unable to undo exactly the
+			# self-inflicted state it exists to undo. Removal and file parsing
+			# accept those two literals; adding still rejects them, and every
+			# genuine mapped or compatible form is rejected everywhere.
+			my $carve_out = $opt{removal}
+				&& ($packed eq "\0" x 16 || $packed eq ("\0" x 15) . "\x01");
+			return _bad('is an IPv4-mapped or IPv4-compatible IPv6 address; send the IPv4 form')
+				unless $carve_out;
 		}
 	}
 
@@ -313,7 +327,7 @@ sub ip_info {
 		return _bad('has host bits set; did you mean ' . lc(Socket::inet_ntop($family, $packed & $mask)) . "/$plen")
 			unless ($packed & $mask) eq $packed;
 
-		if ($plen == 0 && !$opt{zero_prefix}) {
+		if ($plen == 0 && !$opt{removal}) {
 			return _bad('a /0 prefix means the whole Internet and is not accepted here');
 		}
 	}

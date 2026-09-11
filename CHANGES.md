@@ -142,6 +142,24 @@ line is added below the original notice; the original stays intact.
   (`ui-src/bin/csf-ui-helper`, `ui-src/lib/ConfigServer/UI/Proto.pm`,
   `t/10-proto.t`, `t/11-helper-validate.t` — new files)
 
+- **2026-09-11** — Three amendments to the frozen contract, found by implementing
+  it and ruled on before the code changed. **`::` and `::1` are now accepted by
+  `undeny`, `unallow` and `temprm`**, and when reading entries back out of the
+  files `csf` wrote: the IPv4-mapped rule as written also caught them, so an
+  entry `csf -d ::1` creates from a shell was invisible to the Lists screen and
+  impossible to remove — leaving the UI unable to undo the most self-inflicted
+  block there is. Adding them is still refused, and every genuine mapped or
+  compatible form stays refused everywhere. **An `iptables -S` rule that does not
+  tokenise is reported as `ORPHAN` with `fixable:false`**, and **a rule spec
+  loaded more than once is one `DUP` finding**, because content-addressed ids
+  would otherwise collide into a duplicate that `reconcile_fix` must reject. Both
+  were gaps the document left open; two later tasks would have filled them two
+  different ways. **Every response write now carries a five second deadline**, so
+  that a peer which opens a connection and never reads cannot stall the accept
+  loop of a root daemon. (`docs/WEBUI-RPC.md`, `ui-src/bin/csf-ui-helper`,
+  `ui-src/lib/ConfigServer/UI/Proto.pm`, `t/10-proto.t`,
+  `t/11-helper-validate.t`)
+
 #### The update mechanism — moved to GitHub, and made verifiable
 
 The original update path fetched a tarball and ran `sh install.sh` from it **as

@@ -34,8 +34,9 @@ use FindBin ();
 use lib "$FindBin::Bin/..", "$FindBin::Bin/../ui-src/lib";
 
 use File::Temp qw(tempdir);
+use Socket ();
 use JSON::Tiny ();
-use Test::More tests => 227;
+use Test::More tests => 238;
 
 my $HELPER_PATH = "$FindBin::Bin/../ui-src/bin/csf-ui-helper";
 my $PROTO_PATH  = "$FindBin::Bin/../ui-src/lib/ConfigServer/UI/Proto.pm";
@@ -278,6 +279,35 @@ my $NOW = 1757548800;
 
 	$response = req($fx, 'undeny', { ip => '0.0.0.0/0' });
 	ok(${ $response->{ok} }, 'the one entry capable of blocking everything can be removed');
+}
+
+###############################################################################
+# R18 - the IPv6 loopback, end to end
+#
+# csf will put ::1 into csf.deny from the command line. If the UI cannot read
+# that row or remove it, the one screen that exists to undo a self-inflicted
+# block cannot undo the most self-inflicted block there is.
+###############################################################################
+{
+	my $fx = fixture(deny => "::1 # someone did this from the shell - date\n");
+	$fx->{ctx}{run} = csf_stub($fx);
+
+	my $response = req($fx, 'list', { which => 'deny' });
+	is($response->{data}{total}, 1, 'a ::1 entry is a row, not an unparsable line');
+	is($response->{data}{rows}[0]{ip}, '::1', 'and it reads back in canonical form');
+
+	$response = req($fx, 'undeny', { ip => '::1' });
+	ok(${ $response->{ok} }, 'and it can be removed');
+	is_deeply($fx->{calls}[0], [$fx->{path}{csf_bin}, '-dr', '::1'],
+		'with the canonical literal passed straight through to csf -dr');
+	is($response->{data}{removed}, 1, 'and the removal is confirmed from the file, not from csf output');
+
+	$response = req($fx, 'deny', { ip => '::1', note => 'x' });
+	is($response->{error}, 'E_ARG', 'but ::1 still cannot be added through this interface');
+	$response = req($fx, 'temprm', { ip => '::' });
+	ok(${ $response->{ok} }, 'the unspecified address can be removed from the temp list too');
+	$response = req($fx, 'undeny', { ip => '::ffff:127.0.0.1' });
+	is($response->{error}, 'E_ARG', 'a genuine IPv4-mapped address is still refused');
 }
 
 ###############################################################################
@@ -733,6 +763,35 @@ SKIP: {
 	$result = $run->($fx->{ctx}, 1, '/bin/sleep', '30');
 	ok($result->{timeout} && time() - $started < 10,
 		'a child that outruns its deadline is killed rather than waited on');
+}
+
+###############################################################################
+# R19 - a response write can never stall the accept loop
+#
+# A peer that opens a connection and never reads is the one case where the
+# parent writes into a buffer that can fill. The deadline is what stops that
+# from being the whole helper hanging on one caller.
+###############################################################################
+SKIP: {
+	my ($near, $far);
+	skip 'socketpair is unavailable here', 3
+		unless eval { socketpair($near, $far, Socket::AF_UNIX(), Socket::SOCK_STREAM(), Socket::PF_UNSPEC()) };
+
+	my $write = $H->can('write_response');
+	is($write->($near, { id => 'x', ok => \1, data => {} }, 5), 1,
+		'a response that fits is written whole and reported as sent');
+
+	# Shrink both ends, then send far more than they can hold with nobody
+	# reading. Without the deadline this call would never return.
+	setsockopt($near, Socket::SOL_SOCKET(), Socket::SO_SNDBUF(), pack('i', 2048));
+	setsockopt($far,  Socket::SOL_SOCKET(), Socket::SO_RCVBUF(), pack('i', 2048));
+	my $started = time();
+	my $sent = $write->($near, { id => 'x', ok => \1, data => { pad => 'x' x 60000 } }, 1);
+	my $elapsed = time() - $started;
+	is($sent, 0, 'a write that cannot complete is reported as not sent, so the caller can log it');
+	cmp_ok($elapsed, '<', 10, 'and it gives up on its deadline instead of blocking the daemon');
+	close $near;
+	close $far;
 }
 
 ###############################################################################

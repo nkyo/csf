@@ -383,7 +383,8 @@ numbers as text; nothing else is coerced.
 | prefix | `^(0|[1-9][0-9]{0,2})$` — no leading zeros, no sign, no whitespace — and ≤32 (v4) or ≤128 (v6) |
 | `/0` | **rejected for `deny`, `allow`, `tempdeny` and `grep`** — it means "the Internet". **Accepted for `undeny`, `unallow` and `temprm`**: `checkip` lets `/0` into `csf.deny` from the command line (`ConfigServer/CheckIP.pm:60-61`), and an entry that can exist must be removable through the UI — refusing to remove the one entry capable of blocking everything would be exactly backwards |
 | host bits | for a CIDR, the address must already be the network address. `192.0.2.10/24` → `E_ARG` ("did you mean 192.0.2.0/24"). We never silently mask: a UI that turns "block this host" into "block this /24" without saying so is how an operator blocks their own office |
-| IPv4-mapped / IPv4-compatible IPv6 | rejected: any v6 address whose first 80 bits are zero and whose next 16 bits are `0x0000` or `0xffff` (`::ffff:127.0.0.1`, `::192.0.2.1`). Send the IPv4 form |
+| IPv4-mapped / IPv4-compatible IPv6 | rejected: any v6 address whose first 80 bits are zero and whose next 16 bits are `0x0000` or `0xffff` (`::ffff:127.0.0.1`, `::192.0.2.1`). Send the IPv4 form. **Two literals are carved out of this rule for `undeny`, `unallow` and `temprm` only: `::` and `::1`** — see below |
+| `::` and `::1` | **rejected for `deny`, `allow`, `tempdeny` and `grep`; accepted for `undeny`, `unallow` and `temprm`**, and accepted when parsing an entry back out of a file csf wrote. They fall inside the numeric range the rule above uses to catch IPv4-in-IPv6 forms, but they are not aliases of an IPv4 address — they are their own family's unspecified and loopback addresses, and `csf -d ::1` will put one of them into `csf.deny` from a shell. Refusing to read or remove it would leave the UI unable to undo the most self-inflicted block there is. The carve-out is those two literals, not the range: `::2` and `::ffff:127.0.0.1` stay rejected everywhere |
 | canonical form | `inet_ntop` of the packed bytes, lowercase, `/len` appended when a prefix was given. **This canonical form — not the caller's text — is what is passed to `csf`, returned in `data`, and written to the audit log** |
 
 Additional rules for the **mutating** operations `deny`, `tempdeny`, `allow`:
@@ -677,11 +678,19 @@ Runs `('/usr/sbin/csf','-dr',$ip)`. Returns
 matches `/do not delete/i` (`csf.pl:1735`). `removed:0, protected:0` is `ok:true`
 — removing something that is not there is not an error.
 
-No prefix floor and, alone with `unallow` and `temprm`, **no `/0` rejection**
-(§4.1): removal is not dangerous, and an entry broad enough to have locked the
-operator out is the one they most need this operation for. `csf -dr 0.0.0.0/0`
-removes such a line; refusing to send it because the value is broad would be
-perverse.
+No prefix floor and, alone with `unallow` and `temprm`, **no `/0` rejection and
+no `::`/`::1` rejection** (§4.1): removal is not dangerous, and an entry broad
+enough — or close enough to home — to have locked the operator out is the one
+they most need this operation for. `csf -dr 0.0.0.0/0` removes such a line;
+refusing to send it because the value is broad would be perverse. The same
+argument decides `::1`, which `csf -d` will happily write from a shell: an entry
+that can exist must be removable here.
+
+Both exceptions rest on the same verified fact, and neither would be safe without
+it: `csf` deletes by **exact string equality** on the canonicalised address
+(`csf.pl:1734`, `:1827`, `:4733`), never by CIDR containment. So an accepted
+literal reaches exactly the line that carries that literal and cannot touch any
+other entry. If that ever changes, both exceptions have to be revisited together.
 
 ### 5.5 `allow(ip, note)` — mutating
 
@@ -834,6 +843,24 @@ A rule whose `iptables -S` line does not tokenise under the strict grammar
 `^[A-Za-z0-9_.:/,=+-]+$` per token — a quoted `--comment`, for instance — is
 reported with `fixable:false` and `reason:"unparsable"`. It is never
 approximately parsed, because §5.12 turns tokens back into a delete command.
+
+**It takes `kind:"ORPHAN"` and counts in `totals.orphan`.** The kind set is
+closed at three, and this is the only one of the three that is not a claim the
+helper would be making falsely: its address could not be read, so it cannot be
+matched to a configured entry, which is what `ORPHAN` says. `GHOST` would be
+wrong — the rule is loaded — and inventing a fourth kind would widen a frozen
+enumeration for a row nothing can act on. Screens must therefore key the fix
+button off `fixable`, never off `kind`: an `ORPHAN` is not necessarily
+deletable, and this is the case that proves it.
+
+**A rule spec loaded more than once in one chain is one `DUP` finding, not one
+per copy**, and `totals.dup` counts findings. The id is a content address over
+`kind`, `family`, `chain` and the canonical rule spec (§4.8), so identical copies
+would otherwise produce identical ids — and a request carrying the same id twice
+is `E_ARG`, which would make the duplicate unfixable through the very operation
+that exists to fix it. Fixing one `DUP` finding deletes copies until one remains.
+The same address orphaned in both `DENYIN` and `DENYOUT` is two findings, because
+those are two different rules in two different chains.
 
 ### 5.12 `reconcile_fix(ids)` — mutating
 
@@ -1124,6 +1151,7 @@ caller says — so they hold for a hostile caller.
 | Requests per connection | 1 | `E_PROTOCOL` on trailing bytes |
 | Line size, each direction | 65536 bytes | `E_PROTOCOL`, close |
 | Time from accept to a complete request line | 5 s | close, no response |
+| Time to write one response line | 5 s | close, and log that the response could not be written |
 | Child deadline — `status` (one `iptables -S`) | 10 s | `SIGKILL`, `E_BACKEND` for the whole call (§5.1) |
 | Child deadline — read ops (`grep`, `reconcile`) | 30 s | `SIGKILL`, `E_BACKEND` |
 | Child deadline — mutating ops except `restart` | 20 s | `SIGKILL`, `E_BACKEND` |
@@ -1423,6 +1451,31 @@ failure counter (§5.14) — a store the helper cannot read must not lock out th
 administrator who would fix it.
 
 **This changes Task 3**, whose brief names Argon2id.
+
+### 11.9 Three amendments made while Task 2 implemented this document
+
+Recorded here because the rest of §11 is departures from the *plan*, and these
+are changes to *this document* — each found by writing the code the document
+describes, and each ruled on before it was implemented.
+
+| Amendment | Section | Why it was needed |
+|---|---|---|
+| `::` and `::1` are accepted by `undeny`, `unallow`, `temprm` and by file parsing | §4.1, §5.4 | the IPv4-mapped rule as written also catches them, which made an entry `csf -d ::1` can create unreadable and unremovable through the UI |
+| An unparsable scoped rule is `kind:"ORPHAN"`, and a repeated rule spec is one `DUP` finding | §5.11 | the document said what to report but not under which kind, and content-addressed ids collide for identical copies. Two tasks reading the gap would have filled it two different ways |
+| Every response write carries a 5 s deadline | §7 | a peer that opens a connection and never reads must not be able to stall the accept loop of a root daemon, however unlikely filling a socket buffer with a few hundred bytes is |
+
+Two things reviewed at the same time were **left exactly as they are**, and are
+written down so that a later reader does not "simplify" them back:
+
+- **Bytes after the first newline are detected within one read.** §3.1 makes them
+  `E_PROTOCOL`, and a single read window catches every pipelined sender. A line
+  that arrives after the response cannot be acted on, because the connection is
+  closed — so a second read with its own timeout would buy nothing.
+- **A trailing `\r` is rejected explicitly, not by the JSON parser.** §3.1 states
+  the outcome, and the vendored `JSON::Tiny` happens to treat `\r` as trailing
+  whitespace and would accept it. What binds is the stated behaviour, so the
+  helper refuses the line itself. Deleting that check on the grounds that "the
+  parser handles it" would silently re-open the case.
 
 ---
 

@@ -93,6 +93,7 @@ my %LIMIT = (
 	max_children        => 16,
 	backlog             => 32,
 	read_timeout        => 5,
+	write_timeout       => 5,
 	deadline_status     => 10,
 	deadline_read       => 30,
 	deadline_mutate     => 20,
@@ -150,16 +151,17 @@ my %OPS = (
 );
 
 # Per-operation options for the 'ip' grammar (section 4.1). Removal accepts /0
-# because csf's own checkip does (CheckIP.pm:60-61), and an entry that can exist
-# must be removable. Mutation carries the prefix floor and the loopback rule.
+# because csf's own checkip does (CheckIP.pm:60-61), and :: and ::1 because csf's
+# CLI will write those too (R18) - an entry that can exist must be removable.
+# Mutation carries the prefix floor and the loopback rule.
 my %IP_OPT = (
 	deny     => { mutating => 1 },
 	allow    => { mutating => 1 },
 	tempdeny => { mutating => 1 },
 	'grep'   => {},
-	undeny   => { zero_prefix => 1 },
-	unallow  => { zero_prefix => 1 },
-	temprm   => { zero_prefix => 1 },
+	undeny   => { removal => 1 },
+	unallow  => { removal => 1 },
+	temprm   => { removal => 1 },
 );
 
 my %VALIDATOR = (
@@ -398,7 +400,7 @@ sub parse_list_line {
 	return { include => 1 } if $line =~ /^\s*Include\b/;
 
 	my ($token, $rest) = split(/\s+/, $line, 2);
-	my ($canonical) = $P->can('validate_ip')->($token, zero_prefix => 1);
+	my ($canonical) = $P->can('validate_ip')->($token, removal => 1);
 	return { unparsable => 1 } unless defined $canonical;
 
 	my $note = defined $rest ? $rest : '';
@@ -418,7 +420,7 @@ sub parse_tempban_line {
 	return { unparsable => 1 } if @field < 5;
 	my ($start, $ip, $ports, $direction, $timeout, $comment) = @field;
 	return { unparsable => 1 } unless $start =~ /^[0-9]+$/ && $timeout =~ /^[0-9]+$/;
-	my ($canonical) = $P->can('validate_ip')->($ip, zero_prefix => 1);
+	my ($canonical) = $P->can('validate_ip')->($ip, removal => 1);
 	return { unparsable => 1 } unless defined $canonical;
 
 	$direction = 'in' unless defined $direction && length $direction;
@@ -1311,7 +1313,7 @@ sub _iptables_rules {
 			my $wanted = ($chain eq 'DENYOUT') ? '-d' : '-s';
 			for my $index (0 .. $#tokens - 1) {
 				next unless $tokens[$index] eq $wanted;
-				my ($canonical) = $P->can('validate_ip')->($tokens[$index + 1], zero_prefix => 1);
+				my ($canonical) = $P->can('validate_ip')->($tokens[$index + 1], removal => 1);
 				$address = $canonical if defined $canonical;
 				last;
 			}
@@ -1838,8 +1840,17 @@ sub serve_connection {
 	return handle_request($ctx, $request, $peer);
 }
 
+# R19. A rejection response is a few hundred bytes and a fresh socket buffer
+# always has room for it - but this is the accept loop of a root daemon, and if
+# that reasoning is ever wrong the failure mode is the whole helper stalling on
+# one peer that opened a connection and never read. So every write carries a
+# deadline. On expiry the caller closes the connection and logs it; nothing is
+# restructured into non-blocking I/O, which would be a larger change than the
+# risk warrants.
+#
+# Returns 1 when the whole line went out, 0 when it did not.
 sub write_response {
-	my ($connection, $response) = @_;
+	my ($connection, $response, $timeout) = @_;
 	my $line = eval { $P->can('encode')->($response) };
 	unless (defined $line) {
 		$line = eval {
@@ -1847,14 +1858,28 @@ sub write_response {
 				'the response could not be encoded'));
 		};
 	}
-	return unless defined $line;
+	return 0 unless defined $line;
+
 	my $written = 0;
-	while ($written < length $line) {
-		my $wrote = syswrite($connection, $line, length($line) - $written, $written);
-		last unless defined $wrote && $wrote > 0;
-		$written += $wrote;
-	}
-	return;
+	my $complete = 0;
+	my $previous = 0;
+	eval {
+		local $SIG{ALRM} = sub { die "write timed out\n" };
+		$previous = alarm($timeout) if $timeout;
+		while ($written < length $line) {
+			my $wrote = syswrite($connection, $line, length($line) - $written, $written);
+			unless (defined $wrote) {
+				next if $!{EINTR};
+				last;
+			}
+			last if $wrote <= 0;
+			$written += $wrote;
+		}
+		$complete = ($written == length $line) ? 1 : 0;
+		1;
+	};
+	alarm(0) if $timeout;
+	return $complete;
 }
 
 sub main {
@@ -1898,8 +1923,10 @@ sub main {
 		my ($problem, $peer, $reason, $silent) = check_peer($ctx, $connection);
 		if ($problem) {
 			my $response = _error_response(undef, $problem, $reason);
-			write_response($connection, $response) unless $silent;
-			_audit_request($ctx, $peer, undef, undef, {}, $response, $reason);
+			my $sent = $silent ? 1
+				: write_response($connection, $response, $LIMIT{write_timeout});
+			_audit_request($ctx, $peer, undef, undef, {}, $response,
+				($sent ? $reason : "$reason (the response could not be written)"));
 			close $connection;
 			next;
 		}
@@ -1907,8 +1934,9 @@ sub main {
 		if (scalar(keys %child) >= $LIMIT{max_children}) {
 			my $response = _error_response(undef, 'E_BUSY',
 				'the helper is serving as many connections as it will; try again shortly');
-			write_response($connection, $response);
-			_audit_request($ctx, $peer, undef, undef, {}, $response, 'concurrency cap');
+			my $sent = write_response($connection, $response, $LIMIT{write_timeout});
+			_audit_request($ctx, $peer, undef, undef, {}, $response,
+				($sent ? 'concurrency cap' : 'concurrency cap (the response could not be written)'));
 			close $connection;
 			next;
 		}
@@ -1916,7 +1944,8 @@ sub main {
 		my $pid = fork();
 		unless (defined $pid) {
 			my $response = _error_response(undef, 'E_BUSY', 'the helper could not fork; try again shortly');
-			write_response($connection, $response);
+			write_response($connection, $response, $LIMIT{write_timeout});
+			_audit_request($ctx, $peer, undef, undef, {}, $response, 'fork failed');
 			close $connection;
 			next;
 		}
@@ -1937,7 +1966,7 @@ sub main {
 			group_ready => $ctx->{group_ready},
 		);
 		my $response = serve_connection($child_ctx, $connection, $peer);
-		write_response($connection, $response) if $response;
+		write_response($connection, $response, $LIMIT{write_timeout}) if $response;
 		close $connection;
 		POSIX::_exit(0);
 	}
