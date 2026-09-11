@@ -777,6 +777,11 @@ sub apply {
 					? 'temporary port: csf -r flushed the wizard rule; it has been put back and read back again'
 					: 'temporary port: the wizard rule survived csf -r and is still in place';
 			}
+			elsif ($again->{stale}) {
+				# Not a failure: there was no live wizard, so this apply came
+				# from a shell and nobody is waiting on a browser session.
+				push @step, 'temporary port: ' . $again->{reason};
+			}
 			else {
 				push @step, 'temporary port: COULD NOT be re-established after csf -r - ' . $again->{reason};
 				push @warning, 'The port you reached this wizard on is now closed, because restarting csf '
@@ -854,6 +859,14 @@ sub reassert_temporary_port {
 
 	my $spec = $self->load_state or return undef;
 
+	# R71: only a LIVE session's port gets re-opened. See _state_is_live().
+	my ($live, $why_not) = $self->_state_is_live($spec);
+	unless ($live) {
+		return { ok => 0, stale => 1,
+			reason => "the temporary-port record was left by a session that is no longer running ($why_not), "
+				. 'so it has not been acted on. Run csf-ui-setup --cleanup to clear it.' };
+	}
+
 	my ($present, $why) = $self->{firewall}->rule_present($spec);
 	unless (defined $present) {
 		return { ok => 0, reason => "whether the wizard rule is still installed could not be determined: $why" };
@@ -865,7 +878,12 @@ sub reassert_temporary_port {
 		return { ok => 0, reason => $again->{reason}, code => $again->{code} };
 	}
 
-	my $saved = $self->save_state($again->{spec});
+	# The OWNER stays the wizard that opened the port, not this child.
+	my $saved = $self->save_state($again->{spec}, owner => {
+		pid     => $spec->{pid},
+		started => $spec->{started},
+		created => $spec->{created},
+	});
 	unless ($saved->{ok}) {
 		my $closed = $self->{firewall}->close_port($again->{spec});
 		return { ok => 0, reason => 'the rule was added again but could not be recorded ('
@@ -909,6 +927,54 @@ sub confirm {
 	my $result = $self->{rollback}->confirm;
 	$self->{confirmed} = 1 if $result->{ok};
 	return $result;
+}
+
+###############################################################################
+# confirm_outcome(\%result) -> ($headline, $detail, $still_armed)
+#
+# THE SENTENCE THE OPERATOR READS AND ACTS ON (task-8-review.md R70).
+#
+# Fix round 1 made confirm()'s DATA honest - cancelled is now the AND of
+# every command it issued - and left this sentence saying "Nothing was armed
+# to cancel" for the case that data was added to describe: a cancel that
+# FAILED while the timer is still sitting there, armed, about to revert the
+# configuration the operator has just been told is theirs to keep.
+#
+# There are three outcomes and they need three different sentences, so the
+# decision lives in one place that both the browser page and the CLI use:
+#
+#   cancelled                -> it is yours to keep
+#   not cancelled, ARMED     -> the timer IS still running. Act now. Here is
+#                               the command.
+#   not cancelled, not armed -> there was genuinely nothing to cancel
+#
+# armed() is a file test, so the third value is answerable even when systemd
+# is not talking - which is exactly the situation where the first two are in
+# doubt.
+###############################################################################
+sub confirm_outcome {
+	my ($self, $result) = @_;
+
+	my $armed = $self->{rollback}->armed;
+	my $detail = defined $result->{reason} ? $result->{reason} : '';
+
+	return ('The rollback timer has been cancelled and its units removed.', '', 0)
+		if $result->{cancelled};
+
+	return ('THE ROLLBACK TIMER IS STILL ARMED - it will restore the previous configuration.',
+		'Cancelling it failed'
+			. (length $detail ? ": $detail" : '')
+			. '. Remove it by hand now: systemctl stop '
+			. $ConfigServer::UI::Rollback::TIMER_UNIT
+			. ' && systemctl disable ' . $ConfigServer::UI::Rollback::TIMER_UNIT
+			. ' && rm -f /etc/systemd/system/' . $ConfigServer::UI::Rollback::TIMER_UNIT
+			. ' /etc/systemd/system/' . $ConfigServer::UI::Rollback::SERVICE_UNIT
+			. ' && systemctl daemon-reload',
+		1)
+		if $armed;
+
+	return ('Nothing was armed to cancel.',
+		(length $detail ? $detail : 'No rollback timer was installed by this wizard.'), 0);
 }
 
 ###############################################################################
@@ -1177,14 +1243,17 @@ HTML
 sub _do_confirm {
 	my ($self) = @_;
 	my $result = $self->confirm;
+	my ($headline, $detail, $still_armed) = $self->confirm_outcome($result);
 	my %var = (
-		note => $result->{cancelled}
-			? 'The rollback timer has been cancelled and its units removed.'
-			: ('Nothing was armed to cancel: ' . (defined $result->{reason} ? $result->{reason} : '')),
+		headline => $headline,
+		detail   => $detail,
+		heading  => ($still_armed ? 'NOT kept' : 'Kept'),
+		class    => ($still_armed ? 'problem' : 'note'),
 	);
 	return _render(200, <<'HTML', \%var);
-<h1>Kept</h1>
-<p>{{note}}</p>
+<h1>{{heading}}</h1>
+<p class="{{class}}"><strong>{{headline}}</strong></p>
+<p>{{detail}}</p>
 <p>csf is still in TESTING mode, which stops the configuration becoming
 permanent on its own. Turn it off with: csf -x, then csf -e - or set
 TESTING = "0" in /etc/csf/csf.conf and restart csf - once you are satisfied.</p>
@@ -1496,9 +1565,14 @@ sub serve {
 		};
 		if (my $error = $@) {
 			if ($H->can('is_fault')->($error) && !$error->{silent}) {
-				$H->can('write_response')->($socket,
-					$H->can('error_response')->($error->{status}, $error->{message}),
-					timeout => $ConfigServer::UI::HTTP::WRITE_TIMEOUT);
+				# Best effort: this connection is being abandoned either way
+				# and there is no second channel to report on. Noted, not
+				# acted on (task-8-review.md R72).
+				eval {
+					$H->can('write_response')->($socket,
+						$H->can('error_response')->($error->{status}, $error->{message}),
+						timeout => $ConfigServer::UI::HTTP::WRITE_TIMEOUT);
+				};
 			}
 			close $socket;
 			next;
@@ -1507,8 +1581,19 @@ sub serve {
 
 		$request->{peer} = defined $peer ? $peer : '127.0.0.1';
 		my $response = $self->handle_request($request);
-		$H->can('write_response')->($socket, $response,
-			timeout => $ConfigServer::UI::HTTP::WRITE_TIMEOUT);
+		# The response write IS noticed. There is nothing to retry - one
+		# request per connection, and the peer has gone or the link has
+		# broken - but an operator staring at a page that never arrived
+		# deserves to find the reason on the terminal they started this
+		# from, rather than a wizard that looks perfectly healthy and is
+		# silently failing to answer.
+		my $written = eval {
+			$H->can('write_response')->($socket, $response,
+				timeout => $ConfigServer::UI::HTTP::WRITE_TIMEOUT);
+			1;
+		};
+		print STDERR "csf-ui-setup: a response to $request->{method} $request->{path} could not be written"
+			. (defined $@ && length $@ ? ": $@" : "\n") unless $written;
 		close $socket;
 	}
 
@@ -1536,7 +1621,27 @@ sub state_path {
 # deeper than a flat string map, and every other config-shaped file in this
 # task uses this grammar.
 sub save_state {
-	my ($self, $spec) = @_;
+	my ($self, $spec, %opt) = @_;
+
+	# WHO OWNS THIS RECORD, AND WHEN IT WAS MADE (task-8-review.md R71).
+	# Without these the file is just a rule, and a rule with no owner is a
+	# rule any later invocation will happily act on - see
+	# reassert_temporary_port() for the hole that opens.
+	#
+	# owner carries the ORIGINAL session's identity forward when the
+	# re-assertion rewrites the record: the wizard is the owner, not the
+	# short-lived --answers child that happens to be doing the writing, and
+	# a record pointing at a pid that exits in a second would be stale
+	# before anyone read it.
+	my $owner = (ref($opt{owner}) eq 'HASH') ? $opt{owner} : {};
+	my %record = (
+		%$spec,
+		pid     => (defined $owner->{pid}     ? $owner->{pid}     : $$),
+		started => (defined $owner->{started} ? $owner->{started} : _proc_started($$)),
+		created => (defined $owner->{created} ? $owner->{created} : $self->{now}->()),
+	);
+	$spec = \%record;
+
 	my $text = '';
 	for my $key (sort keys %$spec) {
 		my $value = $spec->{$key};
@@ -1574,6 +1679,75 @@ sub load_state {
 # front of a directory this program does not own (task-8-review.md C6).
 # ConfigServer::UI::Rollback::make_path() is the one implementation of that
 # distinction; there is no second copy of it here.
+# Linux's /proc/<pid>/stat field 22 - the process start time in clock ticks
+# since boot. Paired with the pid it distinguishes "still running" from "that
+# number belongs to something else now", which plain kill(0) cannot: pids are
+# reused, and on a busy machine they are reused quickly. Returns '' where
+# there is no /proc, in which case the age cap in _state_is_live() is the
+# only defence left and is applied just the same.
+sub _proc_started {
+	my ($pid) = @_;
+	return '' unless defined $pid && $pid =~ /^[1-9][0-9]*\z/;
+	open(my $fh, '<', "/proc/$pid/stat") or return '';
+	my $line = <$fh>;
+	close $fh;
+	return '' unless defined $line;
+	# The second field is the executable name in parentheses and may itself
+	# contain spaces and parentheses, so the split starts after the LAST ')'.
+	my $tail = ($line =~ /\)\s+(.*)\z/s) ? $1 : return '';
+	my @field = split(/\s+/, $tail);
+	# $tail begins at field 3 (state), so field 22 is index 19.
+	return (defined $field[19] && $field[19] =~ /^[0-9]+\z/) ? $field[19] : '';
+}
+
+###############################################################################
+# _state_is_live(\%spec) -> (1) | (0, $why)
+#
+# Does this record belong to a wizard session that is STILL RUNNING?
+#
+# Only reassert_temporary_port() asks, and the reason is specific
+# (task-8-review.md R71): re-opening a firewall port is only ever right while
+# there is a live wizard whose EXIT will close it again. A stale record -
+# left by a session that died badly - would otherwise make a later shell
+# csf-ui-setup --answers FILE --yes open a port inside a process that has
+# no END block for it and exits seconds later, leaving a hole that nothing
+# on the system will ever close. That is precisely the outcome this whole
+# task exists to prevent, arrived at by a leftover file.
+#
+# --cleanup deliberately does NOT ask: acting on leftovers is its entire job,
+# and a stale record is the only thing that can lead it to a stale rule.
+#
+# Three tests, cheapest first, all of them refusals:
+#   * an age past what a wizard session can even live (S6: 30 minutes)
+#   * the pid is gone
+#   * the pid is there but is not the same process it was
+###############################################################################
+sub _state_is_live {
+	my ($self, $spec) = @_;
+
+	return (0, 'the record names no owning process, so it predates this check and cannot be trusted')
+		unless defined $spec->{pid} && $spec->{pid} =~ /^[1-9][0-9]*\z/;
+
+	my $created = (defined $spec->{created} && $spec->{created} =~ /^[0-9]+\z/) ? $spec->{created} + 0 : undef;
+	return (0, 'the record carries no creation time, so its age cannot be judged')
+		unless defined $created;
+
+	my $age = $self->{now}->() - $created;
+	return (0, "the record is ${age}s old, older than the $ABSOLUTE_LIFETIME s a wizard session can live, so the session that made it is gone")
+		if $age > $ABSOLUTE_LIFETIME;
+
+	return (0, "the process that made the record (pid $spec->{pid}) is no longer running")
+		unless kill(0, $spec->{pid});
+
+	my $started_now = _proc_started($spec->{pid});
+	if (defined $spec->{started} && length $spec->{started} && length $started_now
+		&& $spec->{started} ne $started_now) {
+		return (0, "pid $spec->{pid} is running but is not the process that made the record; the number has been reused");
+	}
+
+	return (1, undef);
+}
+
 sub _make_state_dir {
 	my ($dir) = @_;
 	my $why = ConfigServer::UI::Rollback::make_path($dir, mode => 0700, parent_mode => 0755);
@@ -1716,6 +1890,10 @@ sub cmd_answers {
 	}
 
 	print "$_\n" for @{ $result->{steps} || [] };
+	# Warnings go to STDERR and are printed, not merely collected: apply()
+	# raises one when the operator's own route back in has gone, which is
+	# the single most important thing this command can tell them.
+	print STDERR "\nWARNING: $_\n" for @{ $result->{warnings} || [] };
 	print "\nA snapshot is at $result->{snapshot} and a rollback timer will restore it\n";
 	print "in $result->{window} seconds. Open a NEW ssh connection to check you are not\n";
 	print "locked out, then run: csf-ui-setup --confirm\n";
@@ -1727,10 +1905,14 @@ sub cmd_confirm {
 	return 1 if _require_root();
 	my $self = __PACKAGE__->new;
 	my $result = $self->confirm;
-	print $result->{cancelled}
-		? "The rollback timer has been cancelled.\n"
-		: ("Nothing was armed to cancel" . (defined $result->{reason} ? ": $result->{reason}" : '') . "\n");
-	return 0;
+	my ($headline, $detail, $still_armed) = $self->confirm_outcome($result);
+	my $out = $still_armed ? \*STDERR : \*STDOUT;
+	print $out "$headline\n";
+	print $out "$detail\n" if length $detail;
+	# A non-zero exit as well as the words: a confirm that did not cancel is
+	# a failure, and a script that runs this deserves to be told in the one
+	# way a script can read.
+	return $still_armed ? 1 : 0;
 }
 
 sub cmd_cleanup {

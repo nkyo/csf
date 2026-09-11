@@ -37,6 +37,68 @@ line is added below the original notice; the original stays intact.
 
 ### Unreleased
 
+#### Task 8 fix round 2 — the round that hardened the rescue path is the round that killed it, with a file mode
+
+**2026-09-11** — Four findings and three small ones.
+
+- **R69 (CRITICAL) — fix round 1 dropped `csf-ui-setup`'s exec bit, `100755` to `100644`.**
+  The rollback unit's `ExecStart` runs that path directly, so the timer would have fired
+  `203/EXEC` and restored nothing: the one mechanism that exists for when everything else
+  has gone wrong, killed by a permission bit, by the round that hardened it. The web tier's
+  re-exec of its own CLI breaks the same way, and §2.3 freezes these binaries at `0750`.
+
+  Cause: the guard-removal harness restored files from a backup taken before the bit was
+  set, and `shutil.copy` carries the source's mode. Bit restored, harness fixed to preserve
+  modes — and, more to the point, **2,473 tests could not see it**, because they load
+  modules and call functions and never once ask what is on disk. `t/71` now reads the
+  filesystem and checks every file under `ui-src/bin/` and every module under
+  `ui-src/lib/ConfigServer/UI/` against §2.3's table, in both directions: a binary that is
+  not executable, and a module that is. It also refuses any file in `ui-src/bin/` that §2.3
+  does not name, since Task 9 would install it with no agreed mode at all. What a git
+  checkout can carry is the owner-execute bit and "not group- or other-writable"; the
+  literal `0750`/`0644` are the installer's to set, and the test says so rather than
+  pretending otherwise.
+
+- **R70 — a failed cancel printed "Nothing was armed to cancel" exactly when the timer was
+  armed.** Fix round 1 made `confirm`'s data honest and left the sentence saying the
+  opposite of the truth for the case that data was added to describe. An operator reads it,
+  walks away believing their configuration is permanent, and a timer reverts it. There are
+  three outcomes and they now get three sentences from one place both the browser page and
+  the CLI use: cancelled; **not cancelled and still armed** — headline in those words, plus
+  the exact `systemctl` commands to run now, the page titled "NOT kept", and a non-zero
+  exit for anything scripting it; or genuinely nothing to cancel. Whether the timer is
+  still there is read from `armed()`, a file test, which is answerable precisely when
+  systemd is not talking.
+
+- **R71 — a stale `session.state` could re-open a firewall port inside a process that would
+  never close it.** A record left by a session that died badly would have made a later shell
+  `csf-ui-setup --answers FILE --yes` open the port, with no `END` block for it, exiting
+  seconds later — a hole nothing on the system would ever close, arrived at by a leftover
+  file, which is the exact outcome this task exists to prevent. The record now carries its
+  owning pid, that process's start time, and a creation time, and re-assertion refuses
+  unless all three say a wizard session is still running: too old to be one (30 minutes,
+  §6), the pid is gone, or the pid is alive but is not the process that wrote the record —
+  which `kill(0)` alone cannot tell, since pids are reused. Re-assertion carries the
+  *original* owner forward rather than stamping the short-lived child on it. `--cleanup`
+  deliberately does **not** apply the gate: acting on leftovers is its whole job, and a
+  stale record is the only route to a stale rule.
+
+- **R72 — the claim "every remaining ignored return is tabulated" was wrong by two.**
+  `write_response` (twice) and the probe's own write-handle `close`, added by the previous
+  round. The `close` is now checked rather than justified — it is where a deferred write
+  error surfaces, a full filesystem most of all, which is one of the exact conditions the
+  probe exists to find. The response write is now noticed and reported on the terminal the
+  wizard was started from, so an operator looking at a page that never arrived can find out
+  why instead of seeing a wizard that appears healthy and is silently failing to answer.
+
+- `apply`'s `warnings` were collected and never printed — including the one raised when the
+  operator's own route back in has gone, which is the single most important thing that
+  command can say. Now printed to stderr. A dead ternary in `t/71` that emitted an
+  uninitialised-value warning on every run is gone.
+
+`t/70-firewall-detect.t`: 206. `t/71-rollback.t`: 361 → 431. Whole suite: **2478 tests**
+(was 2408), `prove -I. t/`.
+
 #### Task 8 fix round 1 — a gate that ran as the wrong user, and a confirmation route the apply destroyed
 
 **2026-09-11** — Six findings, two of which mean the feature did not work at all.

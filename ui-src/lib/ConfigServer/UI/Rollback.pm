@@ -321,10 +321,21 @@ sub writable_probe {
 		return { ok => 0, reason => "$dir cannot be written to ($!), so $path could not be replaced" };
 	}
 	my $wrote = syswrite($fh, "probe\n");
-	close $fh;
 	unless (defined $wrote) {
+		my $why = "$!";
+		close $fh;
 		unlink $probe;
-		return { ok => 0, reason => "$dir accepted a file but would not take its contents ($!)" };
+		return { ok => 0, reason => "$dir accepted a file but would not take its contents ($why)" };
+	}
+	# close on a WRITE handle is where a deferred write error surfaces - a
+	# full filesystem most of all, which is one of the exact conditions this
+	# probe exists to find. An unchecked close here would have the probe
+	# report a directory usable when the first real write to it is about to
+	# fail (task-8-review.md R72).
+	unless (close $fh) {
+		my $why = "$!";
+		unlink $probe;
+		return { ok => 0, reason => "$dir would not complete a write ($why), which is how a full filesystem shows itself" };
 	}
 	unless (rename($probe, $target)) {
 		my $why = "$!";

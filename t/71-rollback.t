@@ -36,7 +36,7 @@ use FindBin ();
 use lib "$FindBin::Bin/..", "$FindBin::Bin/../ui-src/lib";
 
 use File::Temp qw(tempdir);
-use Test::More tests => 361;
+use Test::More tests => 431;
 
 use ConfigServer::UI::Rollback ();
 use ConfigServer::UI::Firewall ();
@@ -187,6 +187,84 @@ sub mode_of {
 	my ($path) = @_;
 	return undef unless -e $path;
 	return sprintf('%04o', (stat($path))[2] & 07777);
+}
+
+###############################################################################
+# THE INSTALLED ARTIFACTS THEMSELVES (task-8-review.md R69).
+#
+# THE WHOLE SUITE MISSED A DEAD RESCUE MECHANISM BECAUSE IT NEVER LOOKED AT A
+# FILE. Fix round 1 dropped csf-ui-setup's exec bit, 100755 -> 100644. The
+# rollback unit's ExecStart runs that path directly, so the timer would have
+# fired 203/EXEC and restored nothing - the one mechanism that exists for
+# when everything else has gone wrong, killed by a file mode, by the very
+# round that hardened it. Two thousand four hundred tests did not notice,
+# because they load modules and call functions and never once ask what is on
+# disk.
+#
+# So this reads the filesystem, not the git index, and checks every file
+# against docs/WEBUI-RPC.md S2.3's table - which Task 9 installs against too,
+# so the check pays for itself twice.
+#
+# WHAT CAN AND CANNOT BE ASSERTED HERE, stated plainly so the next person
+# does not think this is weaker than it looks by accident. Git records ONE
+# permission bit, owner-execute; a fresh clone's modes are otherwise the
+# umask's business, so asserting a literal 0750 would fail on any machine
+# with a different umask and prove nothing about the installed system. What
+# git does carry - and what actually broke - is exactly the executable /
+# not-executable distinction, and that is what is checked here, against the
+# same table, plus "never writable by group or other", which holds for every
+# umask that is not itself a bug. The literal 0750 and 0644 are the
+# INSTALLER's to set (Task 9); this is the half of S2.3 a repository can
+# keep.
+###############################################################################
+{
+	# docs/WEBUI-RPC.md S2.3, verbatim: path => installed mode.
+	my %S2_3 = (
+		'ui-src/bin/csf-ui'        => 0750,
+		'ui-src/bin/csf-ui-helper' => 0750,
+		'ui-src/bin/csf-ui-passwd' => 0750,
+		'ui-src/bin/csf-ui-setup'  => 0750,
+	);
+
+	my $bin = "$FindBin::Bin/../ui-src/bin";
+	opendir(my $dh, $bin) or die "cannot read $bin: $!";
+	my @found = sort grep { -f "$bin/$_" } grep { !/^\./ } readdir $dh;
+	closedir $dh;
+
+	# Nothing may appear in the installed directory that the frozen table
+	# does not name: a binary S2.3 has never heard of is one Task 9 will
+	# install with no agreed mode at all.
+	is_deeply(\@found, [sort map { m{([^/]+)\z} } keys %S2_3],
+		'every file in ui-src/bin is one docs/WEBUI-RPC.md S2.3 names, and every one it names is there');
+
+	for my $relative (sort keys %S2_3) {
+		my $path = "$FindBin::Bin/../$relative";
+		my $want = $S2_3{$relative};
+		my $mode = (stat($path))[2];
+		ok(defined $mode, "$relative exists on disk");
+		next unless defined $mode;
+		$mode &= 07777;
+
+		# The bit that broke. S2.3 says 0750; the owner-execute bit is the
+		# part of that a git checkout carries, and without it the rollback
+		# timer's ExecStart is 203/EXEC and restores nothing.
+		is((($mode & 0100) ? 1 : 0), (($want & 0100) ? 1 : 0),
+			sprintf('%s is executable by its owner, as S2.3\'s %04o requires', $relative, $want));
+		is(($mode & 0022), 0, "$relative is not writable by group or other");
+	}
+
+	# And the mirror image for the library: S2.3 freezes those at 0644, so
+	# an exec bit there is just as wrong, in the other direction.
+	my $lib = "$FindBin::Bin/../ui-src/lib/ConfigServer/UI";
+	opendir(my $lh, $lib) or die "cannot read $lib: $!";
+	my @module = sort grep { /\.pm\z/ } readdir $lh;
+	closedir $lh;
+	ok(scalar(@module) >= 8, 'the module directory is where it should be (not a vacuous pass)');
+	for my $module (@module) {
+		my $mode = (stat("$lib/$module"))[2] & 07777;
+		is(($mode & 0111), 0, "ConfigServer/UI/$module is NOT executable, per S2.3's 0644");
+		is(($mode & 0022), 0, "ConfigServer/UI/$module is not writable by group or other");
+	}
 }
 
 ###############################################################################
@@ -1062,11 +1140,9 @@ sub flushing_world {
 	my $w = world(systemd => 1);
 	my $snap = $w->{rollback}->snapshot;
 	$w->{rollback}->arm($snap->{dir});
-	$w->{runner}->on(qr{systemctl daemon-reload}, sub {
-		# The reload during arm() must succeed or there is nothing to cancel;
-		# this one is the reload AFTER the units are removed.
-		return { exit => (-e "$_[0]{root_marker}" ? 1 : 1), output => "Failed to reload.\n" };
-	});
+	# Armed already, so this only ever answers the reload that follows the
+	# units being removed.
+	$w->{runner}->on(qr{systemctl daemon-reload}, { exit => 1, output => "Failed to reload.\n" });
 	my $confirmed = $w->{rollback}->confirm;
 	is($confirmed->{cancelled}, 0, 'a daemon-reload that failed after removal is reported, not swallowed');
 	like(join(' ', @{ $confirmed->{problems} }), qr/daemon-reload failed/, 'naming it');
@@ -1299,6 +1375,225 @@ ANSWERS
 	ConfigServer::UI::Rollback::make_path("$w->{root}/theirs/mine", mode => 0700);
 	is(mode_of("$w->{root}/theirs"), '0711',
 		'an existing directory is left alone - this creates directories, it does not have opinions about them');
+}
+
+###############################################################################
+# R70: THE SENTENCE THE OPERATOR READS AND ACTS ON.
+#
+# Fix round 1 made confirm()'s DATA honest and left this sentence saying
+# "Nothing was armed to cancel" for the case the data was added to describe -
+# a cancel that FAILED while the timer is sitting there about to revert the
+# configuration the operator has just been told is theirs to keep. Three
+# outcomes, three sentences.
+###############################################################################
+{
+	my $w = world(systemd => 1);
+	my $setup = setup_for($w);
+	my $snap = $w->{rollback}->snapshot;
+	$w->{rollback}->arm($snap->{dir});
+	$w->{runner}->on(qr{systemctl stop csf-ui-rollback\.timer}, { exit => 1, output => "Failed to stop unit.\n" });
+	chmod 0500, "$w->{root}/units";
+
+	my $result = $setup->confirm;
+	my ($headline, $detail, $still_armed) = $setup->confirm_outcome($result);
+	chmod 0755, "$w->{root}/units";
+
+	SKIP: {
+		skip 'running as root, where a read-only directory is no obstacle', 5 if $> == 0;
+		is($still_armed, 1, 'a failed cancel with the units still on disk is reported as still armed');
+		like($headline, qr/STILL ARMED/,
+			'and the HEADLINE says so - not "Nothing was armed to cancel", which is the opposite of the truth');
+		unlike($headline, qr/Nothing was armed/, 'that sentence does not appear');
+		like($detail, qr/systemctl stop csf-ui-rollback\.timer/,
+			'and the operator is handed the command to run right now');
+		is($w->{rollback}->armed, 1, 'because the timer really is still there');
+	}
+}
+{
+	my $w = world(systemd => 1);
+	my $setup = setup_for($w);
+	my $snap = $w->{rollback}->snapshot;
+	$w->{rollback}->arm($snap->{dir});
+	my ($headline, $detail, $still_armed) = $setup->confirm_outcome($setup->confirm);
+	is($still_armed, 0, 'a cancel that worked is not still armed');
+	like($headline, qr/has been cancelled/, 'and says so');
+}
+{
+	# Nothing was ever armed. Now - and only now - that sentence is true.
+	my $w = world(systemd => 0);
+	my $setup = setup_for($w);
+	my ($headline, $detail, $still_armed) = $setup->confirm_outcome($setup->confirm);
+	is($still_armed, 0, 'with nothing armed, nothing is still armed');
+	like($headline, qr/Nothing was armed to cancel/, 'and THAT is when the sentence is used');
+	is($w->{rollback}->armed, 0, 'which armed() - a file test - confirms independently');
+}
+{
+	# The browser page, end to end, on the dangerous branch.
+	my $w = world(systemd => 1);
+	my $setup = setup_for($w);
+	my $snap = $w->{rollback}->snapshot;
+	$w->{rollback}->arm($snap->{dir});
+	$w->{runner}->on(qr{systemctl stop}, { exit => 1, output => "Failed.\n" });
+	chmod 0500, "$w->{root}/units";
+	$setup->handle_request(request(method => 'POST', path => '/token', body => 'token=fixture-token'));
+	my ($cookie, $csrf) = ($setup->{session}{id}, $setup->{session}{csrf});
+	my $page = $setup->handle_request(request(method => 'POST', path => '/confirm',
+		headers => { cookie => "csfui_setup=$cookie" }, body => "_csrf=$csrf"));
+	chmod 0755, "$w->{root}/units";
+	SKIP: {
+		skip 'running as root', 3 if $> == 0;
+		like($page->{body}, qr/<h1>NOT kept<\/h1>/, 'the page does not say "Kept" when it was not');
+		like($page->{body}, qr/STILL ARMED/, 'it says the timer is still armed');
+		like($page->{body}, qr/systemctl stop/, 'with the command to fix it');
+	}
+}
+
+###############################################################################
+# R71: A STALE RECORD MUST NOT RE-OPEN A FIREWALL PORT.
+#
+# A leftover session.state would otherwise make a later shell
+# csf-ui-setup --answers FILE --yes open a port inside a process that has no
+# END block for it and exits seconds later - a hole nothing on the system
+# will ever close, reached by a leftover file. Which is the exact outcome
+# this whole task exists to prevent.
+###############################################################################
+{
+	my $w = world(systemd => 1);
+	my $runner = FakeRunner->new
+		->on(qr{is-active firewalld}, { exit => 3, output => "inactive\n" })
+		->on(qr{^/sbin/iptables --version\z}, { output => "iptables v1.8.7 (nf_tables)\n" })
+		->on(qr{ -I INPUT 1 }, { exit => 0, output => '' })
+		->on(qr{ -S INPUT\z}, { output => "-P INPUT ACCEPT\n" });   # flushed: our rule is gone
+	my $firewall = firewall_for($runner, iptables => '/sbin/iptables');
+	my $setup = $S->new(firewall => $firewall, rollback => $w->{rollback},
+		state_dir => "$w->{root}/state", token => 't');
+
+	my %rule = (kind => 'iptables', binary => '/sbin/iptables', chain => 'INPUT',
+		port => 8444, address => '203.0.113.5',
+		canonical => '-A INPUT -s 203.0.113.5/32 -j ACCEPT');
+
+	# A record whose owning process is long gone. pid 2 is the kernel's
+	# kthreadd on Linux and is certainly not a csf-ui-setup, so the
+	# start-time check catches it even where the pid is alive.
+	$setup->save_state(\%rule, owner => { pid => 999999, started => '12345', created => time() });
+	my $stale = $setup->reassert_temporary_port;
+	is($stale->{ok}, 0, 'a record from a dead session is not acted on');
+	is($stale->{stale}, 1, 'and is marked stale rather than failed');
+	like($stale->{reason}, qr/no longer running/, 'saying why');
+	like($stale->{reason}, qr/--cleanup/, 'and pointing at the command that does clear it');
+	is($runner->ran(qr{ -I INPUT 1 }), 0,
+		'AND NOT ONE RULE WAS ADDED - a leftover file must never open a port');
+}
+{
+	my $w = world(systemd => 1);
+	my $runner = FakeRunner->new
+		->on(qr{is-active firewalld}, { exit => 3, output => "inactive\n" })
+		->on(qr{^/sbin/iptables --version\z}, { output => "iptables v1.8.7 (nf_tables)\n" })
+		->on(qr{ -I INPUT 1 }, { exit => 0, output => '' })
+		->on(qr{ -S INPUT\z}, { output => "-P INPUT ACCEPT\n" });
+	my $clock = 1_757_548_800;
+	# Stateful, so that a rule this test puts back can actually be read
+	# back - otherwise the re-assertion fails on E_READBACK and the test
+	# would "pass" its refusal for entirely the wrong reason.
+	my @rules;
+	my $RENDERED = '-A INPUT -s 203.0.113.5/32 -p tcp -m comment --comment csf-ui-setup -m tcp --dport 8444 -j ACCEPT';
+	$runner->{rules}[2][1] = sub { push @rules, $RENDERED; return { exit => 0, output => '' } };
+	$runner->{rules}[3][1] = sub {
+		return { exit => 0, output => join("\n", '-P INPUT ACCEPT', @rules) . "\n" };
+	};
+	my $firewall = firewall_for($runner, iptables => '/sbin/iptables');
+	my $setup = $S->new(firewall => $firewall, rollback => $w->{rollback},
+		state_dir => "$w->{root}/state", token => 't', now => sub { $clock });
+
+	my %rule = (kind => 'iptables', binary => '/sbin/iptables', chain => 'INPUT',
+		port => 8444, address => '203.0.113.5', canonical => $RENDERED);
+
+	# Owned by THIS process, which is certainly alive - so the only thing
+	# left to disqualify it is age.
+	$setup->save_state(\%rule);
+	$clock += 1801;    # one second past the longest a wizard session can live
+	my $old = $setup->reassert_temporary_port;
+	is($old->{ok}, 0, 'a record older than a wizard session can live is stale even if its pid is alive');
+	like($old->{reason}, qr/older than/, 'saying so');
+	is($runner->ran(qr{ -I INPUT 1 }), 0, 'and nothing was opened');
+
+	# Inside the window, owned by a live process: acted on.
+	$clock -= 1801;
+	my $fresh = $setup->reassert_temporary_port;
+	is($fresh->{ok}, 1, 'a live, fresh record IS acted on - this gate only ever refuses');
+	is($fresh->{restored}, 1, 'the flushed rule was put back');
+}
+{
+	# A record written before this check existed carries no owner at all.
+	my $w = world(systemd => 1);
+	my $runner = FakeRunner->new->on(qr{ -S INPUT\z}, { output => "-P INPUT ACCEPT\n" });
+	my $firewall = firewall_for($runner, iptables => '/sbin/iptables');
+	my $setup = $S->new(firewall => $firewall, rollback => $w->{rollback},
+		state_dir => "$w->{root}/state", token => 't');
+	ConfigServer::UI::Rollback::make_path("$w->{root}/state", mode => 0700);
+	my $body = qq{KIND="iptables"\nBINARY="/sbin/iptables"\nCHAIN="INPUT"\nPORT="8444"\nADDRESS="203.0.113.5"\nCANONICAL="-A INPUT -s 203.0.113.5/32 -j ACCEPT"\n};
+
+	# The two halves of an owner are checked SEPARATELY. A single test that
+	# accepted either message would pass with one of the two checks deleted,
+	# which is the shape of test this project keeps finding.
+	spew($setup->state_path, $body);
+	my $no_owner = $setup->reassert_temporary_port;
+	is($no_owner->{ok}, 0, 'a record naming no process is refused, not trusted');
+	like($no_owner->{reason}, qr/names no owning process/, 'and says it is the process that is missing');
+
+	spew($setup->state_path, $body . qq{PID="$$"\n});
+	my $no_time = $setup->reassert_temporary_port;
+	is($no_time->{ok}, 0, 'a record with a live pid but no creation time is refused too');
+	like($no_time->{reason}, qr/carries no creation time/, 'and says it is the time that is missing');
+
+	is($runner->ran(qr{ -I INPUT 1 }), 0, 'and neither opened anything');
+
+	# PID REUSE, which kill(0) alone cannot see: the number is alive - it is
+	# this very test - but it is not the process that wrote the record.
+	SKIP: {
+		skip 'no /proc on this platform, so start times cannot be compared', 3
+			unless -r "/proc/$$/stat";
+		spew($setup->state_path, $body . qq{PID="$$"\nSTARTED="1"\nCREATED="} . time() . qq{"\n});
+		my $reused = $setup->reassert_temporary_port;
+		is($reused->{ok}, 0, 'a live pid that is not the process that made the record is refused');
+		like($reused->{reason}, qr/the number has been reused/, 'saying exactly that');
+		is($runner->ran(qr{ -I INPUT 1 }), 0, 'and opens nothing');
+	}
+}
+{
+	# --cleanup does NOT apply the liveness gate: acting on leftovers is its
+	# entire job, and a stale record is the only route to a stale rule.
+	my $w = world();
+	my $runner = FakeRunner->new
+		->on(qr{ -S INPUT\z}, { output => "-P INPUT ACCEPT\n-A INPUT -s 203.0.113.5/32 -j ACCEPT\n" })
+		->on(qr{ -D INPUT }, { exit => 0, output => '' });
+	my $deleted = 0;
+	$runner->{rules}[0][1] = sub { return { exit => 0, output => $deleted
+		? "-P INPUT ACCEPT\n" : "-P INPUT ACCEPT\n-A INPUT -s 203.0.113.5/32 -j ACCEPT\n" } };
+	$runner->{rules}[1][1] = sub { $deleted = 1; return { exit => 0, output => '' } };
+	my $firewall = firewall_for($runner, iptables => '/sbin/iptables');
+	my $setup = $S->new(firewall => $firewall, rollback => $w->{rollback},
+		state_dir => "$w->{root}/state", token => 't');
+	$setup->save_state({ kind => 'iptables', binary => '/sbin/iptables', chain => 'INPUT',
+		canonical => '-A INPUT -s 203.0.113.5/32 -j ACCEPT' },
+		owner => { pid => 999999, started => '12345', created => 1 });
+
+	my $done = $setup->cleanup;
+	like(join("\n", @$done), qr/temporary firewall rule was removed/,
+		'cleanup closes a STALE record\'s port - that is what it is for');
+	ok(!-e $setup->state_path, 'and clears the record');
+}
+{
+	# _proc_started, on this very process: the check has to actually work,
+	# not merely be called.
+	my $mine = ConfigServer::UI::Setup::_proc_started($$);
+	SKIP: {
+		skip 'no /proc on this platform', 3 unless -r "/proc/$$/stat";
+		like($mine, qr/^[0-9]+\z/, 'a start time is read for a live process');
+		is(ConfigServer::UI::Setup::_proc_started(999999), '',
+			'and nothing for a pid that is not there');
+		is(ConfigServer::UI::Setup::_proc_started('not-a-pid'), '', 'or for a non-pid');
+	}
 }
 
 ###############################################################################
