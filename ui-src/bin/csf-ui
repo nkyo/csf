@@ -1,0 +1,613 @@
+#!/usr/bin/perl
+###############################################################################
+# Copyright (C) 2006-2025 Jonathan Michaelson
+#
+# https://github.com/waytotheweb/scripts
+#
+# This program is free software; you can redistribute it and/or modify it under
+# the terms of the GNU General Public License as published by the Free Software
+# Foundation; either version 3 of the License, or (at your option) any later
+# version.
+#
+# This program is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+# FOR A PARTICULAR PURPOSE. See the GNU General Public License for more
+# details.
+#
+# You should have received a copy of the GNU General Public License along with
+# this program; if not, see <https://www.gnu.org/licenses>.
+###############################################################################
+# Added 2026-09-11 in https://github.com/nkyo/csf - see CHANGES.md.
+#
+# csf-ui - the unprivileged web tier's request handler, running as csfui with
+# no shell and no capabilities. This file owns routing, session lookup, CSRF
+# enforcement and role enforcement (docs/WEBUI-RPC.md S1.2: the helper
+# authenticates the PROCESS, not the session, so per-request role checking
+# can only happen here). It never parses HTTP and never touches a listening
+# socket - that is Task 5 (mode B's Server.pm) or a front web server's
+# CGI/FastCGI adapter (mode A). Both hand this module an already-normalised
+# request and relay back exactly what dispatch() returns.
+#
+###############################################################################
+# THE REQUEST STRUCTURE - what Task 5 (or the front web server glue) MUST
+# produce, and the only thing this module ever reads from the network side.
+# Exactly these keys; ConfigServer::UI::App::dispatch() is the sole entry
+# point and takes one of these as its only argument:
+#
+#   {
+#     method  => 'GET' | 'POST',        # matched case-insensitively; supply uppercase
+#     path    => '/api/deny',           # decoded path only - NO query string, always
+#                                        # starts with '/'
+#     query   => { key => 'value', ... },   # the query string, already parsed and
+#                                            # URL-decoded; {} or undef when there is
+#                                            # none. Last value wins on a repeated key.
+#     headers => { 'cookie' => '...', 'content-type' => '...', ... },
+#                                        # header NAMES LOWERCASED, values as received,
+#                                        # one string per name (a repeated header is
+#                                        # the producer's choice how to fold; this
+#                                        # module only ever reads 'cookie',
+#                                        # 'content-type' and 'x-csrf-token')
+#     body    => '...',                 # raw request body bytes, undef/'' for a
+#                                        # bodyless request. Decoded as JSON when
+#                                        # content-type is application/json, otherwise
+#                                        # as application/x-www-form-urlencoded - the
+#                                        # shape a plain HTML <form> POSTs as, which is
+#                                        # what Task 7's screens will use.
+#     peer    => '203.0.113.7',         # the connecting address, text form (v4 or
+#                                        # v6, no port, no brackets). Used only for
+#                                        # the web tier's own login rate limiter
+#                                        # (RateLimit.pm) and the access log - NEVER
+#                                        # forwarded to the helper, which does not
+#                                        # accept an address argument at all
+#                                        # (docs/WEBUI-RPC.md S9). In mode A this is
+#                                        # the front web server's own idea of the
+#                                        # client address (however IT is configured
+#                                        # to determine one), never a value taken from
+#                                        # an X-Forwarded-For header this module
+#                                        # trusts - docs/WEBUI-RPC.md S10 is explicit
+#                                        # that header is untrusted for access control.
+#   }
+#
+# THE RESPONSE STRUCTURE - what dispatch() always returns, and the only
+# thing Task 5 / the front web server glue needs to turn into bytes on the
+# wire:
+#
+#   {
+#     status  => 200,                                   # integer HTTP status
+#     headers => [ ['Content-Type', '...'], ['Set-Cookie', '...'], ... ],
+#                                                         # ORDERED list of [name, value]
+#                                                         # pairs - a list, not a hash,
+#                                                         # because Set-Cookie can appear
+#                                                         # more than once in one response
+#     body    => '...',                                  # raw bytes to send verbatim
+#   }
+#
+# dispatch() never dies: every failure, including one this module did not
+# anticipate, becomes a well-formed response with a 5xx status. A caller
+# never needs to wrap the call in its own eval to stay safe.
+###############################################################################
+package ConfigServer::UI::App;
+
+use strict;
+use warnings;
+
+use lib '/usr/local/csf-ui/lib', '/usr/local/csf/lib';
+
+use Fcntl qw(:DEFAULT);
+use JSON::Tiny ();
+use ConfigServer::UI::Client    ();
+use ConfigServer::UI::Session   ();
+use ConfigServer::UI::RateLimit ();
+
+our $VERSION = '1.00';
+
+our $DEFAULT_UI_CONF    = '/etc/csf-ui/ui.conf';
+our $DEFAULT_ACCESS_LOG = '/var/log/csf-ui-access.log';
+
+###############################################################################
+# The route table. A plain package array, not a lexical, on purpose: Task 7
+# ("handlers in ui-src/csf-ui" per docs/superpowers/plans/webui-implementation.md)
+# adds its screen routes by pushing onto @ROUTES rather than by editing
+# dispatch() - the routing engine below is complete and closed over the
+# fourteen RPC operations; screens are meant to be purely additive to this
+# table.
+#
+# Each row is one of two shapes:
+#
+#   { method, path, op, mutates?, support? }
+#       The generic case: forward to the helper operation named by `op` with
+#       args built from the query string (GET) or the body (POST), after
+#       session, role and (if mutates is true) CSRF checks. `support => 1`
+#       opens the route to the support role as well as admin - every other
+#       route is admin-only, matching docs/WEBUI-RPC.md S5's role mapping
+#       exactly: "support may call grep and list only. Every other
+#       operation is admin."
+#
+#   { method, path, handler, anonymous? }
+#       A custom handler coderef, called as
+#       $handler->($self, $request, $session) and returning the same
+#       4-element list _handle_op returns: ($response, $user, $role, $id).
+#       `anonymous => 1` skips the session lookup before calling it (only
+#       /api/login uses this - authenticate is documented as "pre-session"
+#       in docs/WEBUI-RPC.md S5.14, so it is the one route reachable with no
+#       cookie at all).
+#
+# CSRF is required on exactly the operations docs/WEBUI-RPC.md S5's "Mutates"
+# column marks yes: deny, undeny, allow, unallow, tempdeny, temprm,
+# reconcile_fix, restart. `authenticate` is documented as mutating no
+# firewall state (S5.14), so /api/login carries no CSRF requirement - a
+# forged login POST cannot do anything a legitimate one could not already do
+# on its own account, and it cannot succeed against a victim's account
+# without already knowing the victim's password.
+###############################################################################
+our @ROUTES = (
+	{ method => 'GET',  path => '/api/status',    op => 'status' },
+	{ method => 'GET',  path => '/api/counts',    op => 'counts' },
+	{ method => 'GET',  path => '/api/reconcile', op => 'reconcile' },
+	{ method => 'GET',  path => '/api/list',      op => 'list',  support => 1 },
+	{ method => 'GET',  path => '/api/grep',      op => 'grep',  support => 1 },
+
+	{ method => 'POST', path => '/api/deny',          op => 'deny',          mutates => 1 },
+	{ method => 'POST', path => '/api/undeny',        op => 'undeny',        mutates => 1 },
+	{ method => 'POST', path => '/api/allow',         op => 'allow',         mutates => 1 },
+	{ method => 'POST', path => '/api/unallow',       op => 'unallow',       mutates => 1 },
+	{ method => 'POST', path => '/api/tempdeny',      op => 'tempdeny',      mutates => 1 },
+	{ method => 'POST', path => '/api/temprm',        op => 'temprm',        mutates => 1 },
+	{ method => 'POST', path => '/api/reconcile_fix', op => 'reconcile_fix', mutates => 1 },
+	{ method => 'POST', path => '/api/restart',       op => 'restart',       mutates => 1 },
+
+	{ method => 'POST', path => '/api/login',  handler => \&_route_login,  anonymous => 1 },
+	{ method => 'POST', path => '/api/logout', handler => \&_route_logout },
+);
+
+###############################################################################
+# Construction. Every dependency can be injected - tests build a Session,
+# RateLimit and Client of their own (pointed at temp directories and a temp
+# socket) rather than this module ever hard-coding a path a test cannot
+# redirect.
+#
+# ui_conf_path is read once here, best-effort, for exactly the two keys this
+# module's own job needs: UI_SESSION_IDLE and UI_SESSION_MAX
+# (docs/WEBUI-RPC.md S10). This is the same "read the one key I need, fall
+# back to the default on anything missing or out of range, and leave the
+# full unknown-key/duplicate-key startup contract to whatever owns the
+# long-running process" reasoning ui-src/bin/csf-ui-passwd already applies to
+# UI_CRYPT_ROUNDS - that full contract belongs to Task 5's Server.pm, which
+# actually IS the long-running process this module does not start on its
+# own.
+###############################################################################
+sub new {
+	my ($class, %opt) = @_;
+	my $conf = _read_ui_conf($opt{ui_conf_path} || $DEFAULT_UI_CONF);
+	my ($idle, $max) = _session_timeouts($conf);
+
+	return bless {
+		client     => $opt{client}     || ConfigServer::UI::Client->new,
+		sessions   => $opt{sessions}   || ConfigServer::UI::Session->new(idle => $idle, max => $max),
+		ratelimit  => $opt{ratelimit}  || ConfigServer::UI::RateLimit->new,
+		access_log => $opt{access_log} || $DEFAULT_ACCESS_LOG,
+		now        => $opt{now}        || sub { time() },
+	}, $class;
+}
+
+sub _read_ui_conf {
+	my ($path) = @_;
+	my %conf;
+	open(my $fh, '<', $path) or return \%conf;
+	while (my $line = <$fh>) {
+		next unless $line =~ /^\s*([A-Z][A-Z0-9_]*)\s*=\s*"([^"]*)"\s*$/;
+		$conf{$1} = $2;
+	}
+	close $fh;
+	return \%conf;
+}
+
+sub _session_timeouts {
+	my ($conf) = @_;
+	my $idle = $conf->{UI_SESSION_IDLE};
+	my $max  = $conf->{UI_SESSION_MAX};
+	$idle = (defined $idle && $idle =~ /^[0-9]+$/ && $idle >= 60  && $idle <= 86400)
+		? $idle + 0 : $ConfigServer::UI::Session::DEFAULT_IDLE;
+	$max  = (defined $max  && $max  =~ /^[0-9]+$/ && $max  >= 300 && $max  <= 604800)
+		? $max + 0  : $ConfigServer::UI::Session::DEFAULT_MAX;
+	# docs/WEBUI-RPC.md S10: UI_SESSION_IDLE must be <= UI_SESSION_MAX. A
+	# ui.conf that violates it is refused at startup by whatever fully
+	# validates the file (Task 5); here, falling back to both defaults
+	# together is the fail-closed choice that cannot itself produce a
+	# self-contradictory pair.
+	return ($ConfigServer::UI::Session::DEFAULT_IDLE, $ConfigServer::UI::Session::DEFAULT_MAX)
+		if $idle > $max;
+	return ($idle, $max);
+}
+
+###############################################################################
+# JSON boolean encoding, section-3.3 style: JSON::Tiny's encoder treats any
+# scalar ref as a boolean by its truthiness, the same convention
+# csf-ui-helper's own _true()/_false() rely on - reproduced here rather than
+# imported because these are private helpers of a different package running
+# in a different process.
+###############################################################################
+sub _true  { return \1 }
+sub _false { return \0 }
+
+# A JSON::Tiny-decoded boolean is a blessed scalar ref; a locally
+# synthesised one (ConfigServer::UI::Client's _local_error, for a failure
+# that never reached the wire) is a plain 0/1. Both must read the same way
+# here.
+sub _is_ok {
+	my ($value) = @_;
+	return 0 unless defined $value;
+	return ref($value) ? (${$value} ? 1 : 0) : ($value ? 1 : 0);
+}
+
+###############################################################################
+# dispatch($request) -> $response - see the header comment for both
+# structures. Never dies: _route() does the actual work and anything it
+# raises is caught here and turned into a 500, because a caller of this
+# method must never need its own eval to stay safe.
+###############################################################################
+sub dispatch {
+	my ($self, $request) = @_;
+
+	my ($response, $log_user, $log_role, $log_id) = eval { $self->_route($request) };
+	if (my $error = $@) {
+		print STDERR "csf-ui: unhandled error while handling a request: $error";
+		$response = _json_response(500, { ok => _false(), error => 'WEB_INTERNAL',
+			message => 'an internal error occurred' });
+		($log_user, $log_role, $log_id) = (undef, undef, undef);
+	}
+
+	$self->_log_access($request, $response, $log_user, $log_role, $log_id);
+	return $response;
+}
+
+sub _route {
+	my ($self, $request) = @_;
+
+	unless (ref($request) eq 'HASH') {
+		return (_json_response(400, { ok => _false(), error => 'WEB_BAD_REQUEST',
+			message => 'malformed request' }), undef, undef, undef);
+	}
+
+	my $method = uc(defined $request->{method} ? "$request->{method}" : '');
+	my $path   = defined $request->{path}      ? "$request->{path}"  : '';
+
+	my @matches = grep { $_->{path} eq $path } @ROUTES;
+	unless (@matches) {
+		return (_json_response(404, { ok => _false(), error => 'WEB_NOT_FOUND',
+			message => 'no such path' }), undef, undef, undef);
+	}
+
+	my ($route) = grep { uc($_->{method}) eq $method } @matches;
+	unless ($route) {
+		my $response = _json_response(405, { ok => _false(), error => 'WEB_METHOD_NOT_ALLOWED',
+			message => 'method not allowed' });
+		push @{ $response->{headers} }, ['Allow', join(', ', map { $_->{method} } @matches)];
+		return ($response, undef, undef, undef);
+	}
+
+	my $session = $route->{anonymous} ? undef : $self->_session_for($request);
+
+	return $route->{handler}->($self, $request, $session)
+		if $route->{handler};
+	return $self->_handle_op($request, $route, $session);
+}
+
+###############################################################################
+# The generic RPC-forwarding handler used by every route that just names an
+# `op`. Enforces, in this order: a valid session exists; the session's role
+# may reach this operation; if the operation mutates, the CSRF token
+# submitted with this request matches the session's.
+###############################################################################
+sub _handle_op {
+	my ($self, $request, $route, $session) = @_;
+
+	unless ($session) {
+		return (_json_response(401, { ok => _false(), error => 'WEB_UNAUTHENTICATED',
+			message => 'sign in required' }), undef, undef, undef);
+	}
+
+	my $role = $session->{role};
+	my $allowed = ($role eq 'admin') || ($route->{support} && $role eq 'support');
+	unless ($allowed) {
+		return (_json_response(403, { ok => _false(), error => 'WEB_FORBIDDEN',
+			message => 'this account cannot perform this action' }), $session->{user}, $role, undef);
+	}
+
+	my $args = $self->_args_for($request, $route);
+
+	if ($route->{mutates}) {
+		my $submitted = _csrf_token($request, $args);
+		unless ($self->{sessions}->csrf_ok($session, $submitted)) {
+			return (_json_response(403, { ok => _false(), error => 'WEB_CSRF',
+				message => 'missing or invalid CSRF token' }), $session->{user}, $role, undef);
+		}
+	}
+	delete $args->{_csrf} if ref($args) eq 'HASH';
+
+	my $id = $self->{client}->generate_id;
+	my $result = $self->{client}->call($route->{op}, $args, (defined $id ? (id => $id) : ()));
+	return (_response_for_rpc($result), $session->{user}, $role, $id);
+}
+
+###############################################################################
+# /api/login - the one route reachable with no session. Calls the helper's
+# `authenticate` (docs/WEBUI-RPC.md S5.14) and never opens the users file
+# itself. The web tier's OWN rate limiter (RateLimit.pm) is checked first, so
+# a caller already over either of its caps never reaches the socket for this
+# attempt at all - independent of, and in addition to, the helper's own
+# per-username lockout, which holds even if this whole process is the
+# attacker (S5.14's own words).
+###############################################################################
+sub _route_login {
+	my ($self, $request, undef) = @_;
+	my $peer = defined $request->{peer} ? "$request->{peer}" : '';
+	my $args = _parse_body($request);
+	my $user = (ref($args) eq 'HASH') ? $args->{user} : undef;
+	my $pass = (ref($args) eq 'HASH') ? $args->{pass} : undef;
+
+	unless (defined $user && length $user) {
+		return (_json_response(400, { ok => _false(), error => 'WEB_BAD_REQUEST',
+			message => 'user is required' }), undef, undef, undef);
+	}
+
+	if ($self->{ratelimit}->blocked($peer, $user)) {
+		my $response = _json_response(429, { ok => _false(), error => 'WEB_RATE_LIMITED',
+			message => 'too many attempts from this address or for this account; try again later' });
+		return ($response, $user, undef, undef);
+	}
+
+	my $id = $self->{client}->generate_id;
+	# 'pass' is read once, right above, and handed straight to the helper.
+	# It is never put into $args again after this call, never logged (see
+	# _log_access, which only ever receives $request and never touches
+	# 'body'), and does not appear anywhere else in this function -
+	# docs/WEBUI-RPC.md S4.10 and G9.
+	my $result = $self->{client}->call('authenticate', { user => $user, pass => $pass },
+		(defined $id ? (id => $id) : ()));
+
+	unless (_is_ok($result->{ok})) {
+		# The call itself failed to produce a verdict (E_ARG, E_BUSY,
+		# E_UNAVAILABLE, a client-side timeout, ...). S5.14: a verdict that
+		# was never reached is not a wrong guess, so the web tier's own
+		# counter is not charged here either.
+		return (_response_for_rpc($result), $user, undef, $id);
+	}
+
+	my $data = $result->{data} || {};
+	unless (_is_ok($data->{ok})) {
+		$self->{ratelimit}->record_failure($peer, $user);
+		my $locked = _is_ok($data->{locked});
+		my $response = _json_response($locked ? 429 : 401, {
+			ok      => _false(),
+			error   => $locked ? 'WEB_LOCKED' : 'WEB_AUTH_FAILED',
+			message => $locked ? 'this account is temporarily locked'
+			                    : 'wrong username or password',
+		});
+		push @{ $response->{headers} }, ['Retry-After', ($data->{retry_after} || 300) + 0]
+			if $locked;
+		return ($response, $user, undef, $id);
+	}
+
+	my $role = $data->{role};
+	unless (defined $role && ($role eq 'admin' || $role eq 'support')) {
+		return (_json_response(502, { ok => _false(), error => 'E_BACKEND',
+			message => 'csf-ui-helper reported success with no usable role' }), $user, undef, $id);
+	}
+
+	my $session = eval { $self->{sessions}->create(user => $user, role => $role) };
+	unless ($session) {
+		return (_json_response(500, { ok => _false(), error => 'WEB_INTERNAL',
+			message => 'could not start a session' }), $user, $role, $id);
+	}
+
+	my $response = _json_response(200, { ok => _true(), data => { role => $role } });
+	push @{ $response->{headers} }, ['Set-Cookie', $self->{sessions}->set_cookie_header($session->{id})];
+	return ($response, $user, $role, $id);
+}
+
+sub _route_logout {
+	my ($self, $request, $session) = @_;
+	my $args = _parse_body($request);
+
+	if ($session) {
+		my $submitted = _csrf_token($request, $args);
+		unless ($self->{sessions}->csrf_ok($session, $submitted)) {
+			return (_json_response(403, { ok => _false(), error => 'WEB_CSRF',
+				message => 'missing or invalid CSRF token' }), $session->{user}, $session->{role}, undef);
+		}
+		$self->{sessions}->destroy($session->{id});
+	}
+
+	my $response = _json_response(200, { ok => _true(), data => {} });
+	push @{ $response->{headers} }, ['Set-Cookie', $self->{sessions}->clear_cookie_header];
+	return ($response, ($session ? $session->{user} : undef), ($session ? $session->{role} : undef), undef);
+}
+
+###############################################################################
+# Session lookup: the Cookie header, if any, names an id; a tampered or
+# unknown one is refused identically to a missing one (Session::load's own
+# contract) - this function adds nothing beyond calling it.
+###############################################################################
+sub _session_for {
+	my ($self, $request) = @_;
+	my $headers = (ref($request) eq 'HASH' && ref($request->{headers}) eq 'HASH')
+		? $request->{headers} : {};
+	my $cookie_header = $headers->{cookie};
+	return undef unless defined $cookie_header;
+	my $id = $self->{sessions}->id_from_cookie_header($cookie_header);
+	return undef unless defined $id;
+	return $self->{sessions}->load($id);
+}
+
+###############################################################################
+# Arguments: the query string for GET, the body for everything else.
+###############################################################################
+sub _args_for {
+	my ($self, $request, $route) = @_;
+	my $method = uc(defined $request->{method} ? "$request->{method}"
+		: (ref($route) eq 'HASH' && $route->{method} ? $route->{method} : 'GET'));
+	if ($method eq 'GET') {
+		my $query = $request->{query};
+		return (ref($query) eq 'HASH') ? { %$query } : {};
+	}
+	return _parse_body($request);
+}
+
+sub _parse_body {
+	my ($request) = @_;
+	my $headers = (ref($request) eq 'HASH' && ref($request->{headers}) eq 'HASH')
+		? $request->{headers} : {};
+	my $type = defined $headers->{'content-type'} ? lc($headers->{'content-type'}) : '';
+	my $body = (ref($request) eq 'HASH' && defined $request->{body}) ? $request->{body} : '';
+
+	if ($type =~ m{^application/json\b}) {
+		my $decoded = eval { JSON::Tiny::decode_json($body) };
+		return (ref($decoded) eq 'HASH') ? $decoded : {};
+	}
+
+	# application/x-www-form-urlencoded, and the default when no
+	# content-type is given at all - the shape a plain HTML <form> without
+	# enctype="" POSTs as, which is what Task 7's screens use.
+	my %args;
+	for my $pair (split(/&/, $body)) {
+		next unless length $pair;
+		my ($key, $value) = split(/=/, $pair, 2);
+		$key   = _url_decode(defined $key   ? $key   : '');
+		$value = _url_decode(defined $value ? $value : '');
+		$args{$key} = $value;
+	}
+	return \%args;
+}
+
+sub _url_decode {
+	my ($text) = @_;
+	$text =~ tr/+/ /;
+	$text =~ s/%([0-9A-Fa-f]{2})/chr(hex($1))/ge;
+	return $text;
+}
+
+# The submitted CSRF token: an X-CSRF-Token header takes priority (what a
+# fetch()-based caller would send, never putting it in a URL - G9), falling
+# back to a `_csrf` field in the body (what a plain HTML <form> can do with
+# no JavaScript at all - a hidden input Task 7's templates render from
+# Render.pm). Never read from the query string, which is the one channel
+# G9 singles out by name.
+sub _csrf_token {
+	my ($request, $args) = @_;
+	my $headers = (ref($request) eq 'HASH' && ref($request->{headers}) eq 'HASH')
+		? $request->{headers} : {};
+	return $headers->{'x-csrf-token'}
+		if defined $headers->{'x-csrf-token'} && length $headers->{'x-csrf-token'};
+	return (ref($args) eq 'HASH') ? $args->{_csrf} : undef;
+}
+
+###############################################################################
+# The error -> HTTP status table is docs/WEBUI-RPC.md section 3.5's own
+# "csf-ui should answer" column, verbatim. E_PEER is listed there as
+# "the web tier never sees this"; it is mapped here only as a backstop in
+# case that ever stops being true, and is treated the same as an internal
+# fault rather than given a status of its own, because section 3.5 does not
+# define one.
+###############################################################################
+my %HTTP_FOR_ERROR = (
+	E_PROTOCOL    => 500,
+	E_UNKNOWN_OP  => 500,
+	E_ARG         => 400,
+	E_PEER        => 500,
+	E_UNAVAILABLE => 503,
+	E_BUSY        => 503,
+	E_REFUSED     => 409,
+	E_BACKEND     => 502,
+	E_STALE       => 409,
+	E_INTERNAL    => 500,
+);
+
+sub _response_for_rpc {
+	my ($result) = @_;
+
+	if (ref($result) eq 'HASH' && _is_ok($result->{ok})) {
+		return _json_response(200, { ok => _true(), data => $result->{data} });
+	}
+
+	my $code    = (ref($result) eq 'HASH' && defined $result->{error}) ? $result->{error} : 'E_INTERNAL';
+	my $status  = $HTTP_FOR_ERROR{$code} || 500;
+	my $message = (ref($result) eq 'HASH' && defined $result->{message}) ? $result->{message} : '';
+
+	my $response = _json_response($status, { ok => _false(), error => $code, message => $message });
+	# section 3.5: "503 + Retry-After". The wire format carries no numeric
+	# hint for how long (error responses have no `data`, section 3.3), so
+	# this is a fixed, conservative value rather than an invented one dressed
+	# up as coming from the helper.
+	push @{ $response->{headers} }, ['Retry-After', 5] if $code eq 'E_BUSY';
+	return $response;
+}
+
+sub _json_response {
+	my ($status, $body) = @_;
+	my $json = eval { JSON::Tiny::encode_json($body) };
+	$json = '{"ok":false,"error":"WEB_INTERNAL","message":"could not encode response"}'
+		unless defined $json;
+	return {
+		status  => $status,
+		headers => [ ['Content-Type', 'application/json; charset=utf-8'] ],
+		body    => $json,
+	};
+}
+
+###############################################################################
+# Access log (docs/WEBUI-RPC.md S8): ts, id, user, role, source address,
+# method, path, status - one line per request this module routed, written
+# by csfui to a file the helper's own audit log never touches. G9: no
+# header, no cookie value, no session id, no CSRF token and no body ever
+# reaches this function's argument list, so there is nothing here that could
+# leak one even by accident - `path` is deliberately the path alone, never
+# the query string, and this function never reads $request->{headers} or
+# $request->{body} at all.
+###############################################################################
+sub _log_access {
+	my ($self, $request, $response, $user, $role, $id) = @_;
+
+	my $status = (ref($response) eq 'HASH' && defined $response->{status}) ? $response->{status} + 0 : 0;
+	my $entry = {
+		ts     => $self->{now}->() + 0,
+		id     => $id,
+		user   => $user,
+		role   => $role,
+		addr   => (ref($request) eq 'HASH' && defined $request->{peer})   ? "$request->{peer}"   : undef,
+		method => (ref($request) eq 'HASH' && defined $request->{method}) ? uc("$request->{method}") : undef,
+		path   => (ref($request) eq 'HASH' && defined $request->{path})  ? "$request->{path}"   : undef,
+		status => $status,
+	};
+	my $line = eval { JSON::Tiny::encode_json($entry) };
+	return unless defined $line;
+
+	sysopen(my $fh, $self->{access_log}, O_WRONLY | O_APPEND | O_CREAT, 0640) or return;
+	my $out = "$line\n";
+	my $written = 0;
+	while ($written < length $out) {
+		my $wrote = syswrite($fh, $out, length($out) - $written, $written);
+		unless (defined $wrote) {
+			last unless $!{EINTR};
+			next;
+		}
+		last if $wrote <= 0;
+		$written += $wrote;
+	}
+	close $fh;
+	return;
+}
+
+###############################################################################
+# This file has no listening socket of its own (see the header comment) and
+# is a library, not a daemon. Running it directly says so instead of doing
+# nothing silently.
+###############################################################################
+unless (caller) {
+	print STDERR "csf-ui is a library (ConfigServer::UI::App); it has no socket of its\n"
+		. "own and is loaded by Task 5's HTTP/TLS core (Server.pm in mode B, or the\n"
+		. "front web server's adapter in mode A), not executed directly.\n";
+	exit 0;
+}
+
+1;

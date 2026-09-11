@@ -311,6 +311,88 @@ line is added below the original notice; the original stays intact.
   on. (`ui-src/lib/ConfigServer/UI/Auth.pm`, `ui-src/bin/csf-ui-passwd`,
   `t/20-auth.t`, `t/11-helper-validate.t`)
 
+- **2026-09-11** — Added the unprivileged web tier's request handler: the
+  part of the replacement WebUI that terminates HTTP-level concerns and
+  talks to `csf-ui-helper` over the socket Task 2 built, running as `csfui`
+  with no shell and no capabilities. Four pieces.
+
+  `Client.pm` connects to the helper's socket, sends one request, reads one
+  response and enforces a 10-second wall-clock budget across the whole
+  exchange. It never retries — not once, for any operation, mutating or
+  not — which is the simplest way to guarantee a mutating call is never
+  retried by accident: a client with no retry logic anywhere in it cannot
+  retry selectively. A failure that never reached the wire (the socket is
+  missing, the helper never answers, it answers something unparseable or
+  with the wrong request id) is reported back shaped exactly like a real
+  wire response, reusing `E_UNAVAILABLE`/`E_BACKEND` from the closed
+  enumeration in `docs/WEBUI-RPC.md` §3.5 rather than inventing a second
+  vocabulary for "the same kind of failure, but local".
+
+  `Session.pm` implements the server-side sessions the brief calls for: a
+  32-byte `/dev/urandom` identifier, base64url, naming a file under
+  `/var/lib/csf-ui/sessions/` (mode 0600) that carries the username, role,
+  a CSRF nonce and both timestamps — never a self-contained token the
+  server cannot revoke. A tampered, expired or never-issued identifier is
+  refused identically in every case, which is what stops a bad guess from
+  learning anything about which case it hit. `csrf_ok()` compares the
+  submitted token against the session's in constant time, visiting every
+  byte regardless of where — or whether — a difference is found, the same
+  discipline `Auth.pm` already applies to password verification.
+
+  `RateLimit.pm` is the web tier's own login rate limiter — two rolling
+  15-minute windows, one keyed by source address (cap 5) and one by the
+  submitted username (cap 10), counting failed attempts only, state under
+  `/var/lib/csf-ui/rl/`. It is independent of, and no substitute for, the
+  helper's own per-username lockout (§5.14): that one holds even when this
+  web tier is the attacker; this one acts earlier, before a guess ever
+  reaches the socket. It has no dependency on `Client.pm` at all and cannot
+  reach `csf.deny` — letting unauthenticated traffic add a firewall entry
+  would let an attacker get a chosen address blocked, a victim's or a
+  shared office egress. Every counter here fails *closed*: a state file
+  that cannot be opened or rewritten is reported as "blocked", never as
+  "not blocked, so proceed unmetered" — the specific failure mode this
+  project's own helper was found to have during Task 2's review, silently,
+  while its test suite kept passing.
+
+  `csf-ui` is the request handler: given a normalised request (method,
+  path, headers, body, peer address — the structure is defined and
+  documented in this file's header comment, for Task 5 to produce), it
+  routes, resolves the session, enforces role (`support` reaches `grep` and
+  `list` only, admin reaches all fourteen — application-level, because the
+  helper authenticates the process, not the session, so this is the only
+  place it can happen), requires and constant-time-checks a CSRF token on
+  every one of the eight mutating operations, calls the helper through
+  `Client.pm`, and maps the closed error enumeration onto HTTP status per
+  §3.5. It never parses HTTP and never touches a listening socket itself.
+  Login calls the helper's `authenticate` and never opens the users file;
+  every request, whatever its outcome, is written to
+  `/var/log/csf-ui-access.log` (ts, request id, user, role, source address,
+  method, path, status) joined to the helper's own audit log by the same
+  request id — and never carries a header, a cookie value, a CSRF token or
+  a request body, so there is no field in it a password could leak into.
+
+  Several security-relevant behaviours were verified the hard way — the
+  guard was reverted, the specific test that should fail was confirmed to
+  fail, and the guard was restored — and two of those reverts found the
+  test suite itself did not yet prove what it looked like it proved. A
+  short-circuiting `eq` in place of `csrf_ok`'s XOR loop passed every
+  existing assertion, because every one of them checked the boolean
+  outcome and none checked that the comparison actually ran to completion;
+  a `$COMPARE_VISITS` counter (the same test-only introspection `Auth.pm`
+  already uses for password verification) was added so the loop's
+  completeness is asserted directly rather than inferred from a result
+  a short-circuit would also have produced. Separately, the id grammar
+  check in `Session.pm`'s path-building was found to be provably
+  unexercised by the existing "path-traversal-shaped id is refused"
+  assertion — it passed only because `/etc/passwd` does not happen to
+  parse as a five-field session record on the machine running the test,
+  not because the guard caught it; a decoy file placed one directory above
+  a session store, containing something that *would* parse as a valid
+  session, is what actually exercises the guard. (`ui-src/lib/ConfigServer/UI/Client.pm`,
+  `ui-src/lib/ConfigServer/UI/Session.pm`, `ui-src/lib/ConfigServer/UI/RateLimit.pm`,
+  `ui-src/bin/csf-ui`, `t/30-session.t`, `t/31-ratelimit.t`, `t/32-client.t`,
+  `t/33-app.t` — new files)
+
 #### The update mechanism — moved to GitHub, and made verifiable
 
 The original update path fetched a tarball and ran `sh install.sh` from it **as
