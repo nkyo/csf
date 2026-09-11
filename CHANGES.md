@@ -37,6 +37,90 @@ line is added below the original notice; the original stays intact.
 
 ### Unreleased
 
+#### Task 7 fix round 1 — a test bound to nothing, a role check by memory, a class fixed but not closed, focusable-while-invisible on the one screen that can't afford it
+
+**2026-09-11** — Two independent reviews came back PASS with no Critical and the role
+boundary confirmed by measurement (every `/ui/*` route swept with a fresh `support`
+session and a valid CSRF token: 200 on exactly `/ui/lists` and `/ui/lookup`, 403 on the
+other fourteen). Four findings, all in tests or one CSS rule, not in the security
+properties themselves.
+
+- **R55 — `t/60-screens.t`'s GHOST-exclusion test was bound to nothing.** The review-step
+  test submitted only the fixable id and asserted the GHOST finding did not appear on the
+  confirmation page - true, but for the wrong reason: GHOST was never selected, so nothing
+  about the `fixable` cross-check was exercised. The reviewer proved it by removing the
+  cross-check entirely and watching this exact test stay green; only the stale-count
+  assertion noticed. The fifth test-passing-for-the-wrong-reason in this project, and the
+  first one found *inside* the guard-removal table meant to catch exactly that - the table
+  had credited a guarantee the removal did not actually exercise. Fixed by submitting
+  **both** ids (`fix_id_0` the fixable ORPHAN, `fix_id_1` the unfixable GHOST, as a tampered
+  client would) and asserting GHOST is excluded *despite* being submitted, with a `stale`
+  count assertion pinning that exactly 1 of 2 was rejected. Re-verified against the real
+  code (all green) and against the code with the cross-check removed (three exactly-named
+  assertions red).
+- **R56 — the read-only role check rested on hand-written lists in two files.**
+  `t/60-screens.t` swept mutating `/ui/*` routes mechanically from `@ROUTES` but checked
+  the five GET routes against a hand-written three-element admin-only list and a
+  hand-written two-element allowed list - nothing forced either to stay in sync with new
+  screens. `t/33-app.t`'s own mechanical binding (the R27 table) only ever matches a route
+  that names an `op`; every `/ui/*` row is a `handler` row, so none of Task 7's routes were
+  bound by it at all. Both fixed: `t/60-screens.t` now enumerates every non-anonymous GET
+  `/ui/*` route from `@ROUTES` and checks each one's `support` flag against an independent
+  table keyed from `docs/WEBUI-RPC.md` S5 (not against the route's own flag - an earlier
+  draft of this exact fix did that, which is a tautology that can never go red no matter
+  which way a flag is wrong, caught before it shipped by re-running the removal proof and
+  watching nothing turn red). `t/33-app.t` gets a new `%HANDLER_SPEC` table binding all
+  22 handler rows (3 pre-existing `/api/*` + 19 from Task 7) by path, plus a converse check
+  that every table entry names a route that still exists. Guard-removal re-run against both
+  independently: a `support => 1` added to `/ui/health` turns red in both files.
+- **R57 — the `layout.html` comment bug was fixed as one instance; the class was still
+  open.** The prior fix round respelled `layout.html`'s own comment and added
+  `_strip_leading_comments()` - but that function ran *after* `render()`, stripping only
+  the rendered output's leading block. The reviewer showed this mitigates nothing: `render()`
+  substitutes a template's entire text in one pass, comments included, so by the time an
+  output-side strip runs, any comment that happened to spell a real var's name has already
+  been substituted, and for a RAW marker whose value contains a comment-closing sequence,
+  the strip regex itself truncates early at that *embedded* sequence rather than the
+  comment's real end - not "mitigates nothing" by accident, but demonstrably: reverting to
+  the old shape and feeding it a synthetic template reproduces a live `<script>` leaking
+  into rendered output. Fixed structurally: `_render_template()` (replacing
+  `_render_screen()`'s/`_render_nav()`'s/`_authed_page()`'s direct `render_file()` calls)
+  now reads a template's raw bytes off disk and strips every HTML comment - leading or
+  mid-file - with `_strip_comments()` *before* handing the result to
+  `ConfigServer::UI::Render::render()`. Nothing inside any comment, anywhere, in any
+  template, is a substitution candidate any more, regardless of what brace syntax it
+  contains - closing the class the first fix only closed one instance of. Three new direct
+  tests against `_strip_comments()`/`_render_template()`, including a synthetic on-disk
+  template reproducing the exact truncation shape (a raw marker substituted with content
+  containing `--><script>evil</script>`), plus an end-to-end assertion that no template's
+  GPL header or any HTML comment survives into a real dispatched response. Guard-removal:
+  reverting `_render_template()` to the old post-render-strip shape reproduces the live
+  `<script>` leak in the new tests, confirmed, then reverted back.
+- **R58 — `.visually-hidden` on a destructive form left it keyboard-focusable while
+  invisible.** `app.css`'s own `.visually-hidden` comment says plainly what it is for -
+  content that stays reachable by keyboard and screen reader (a control's label) - which
+  is the opposite of what "there is nothing here to reach" needs. Health's "Review selected
+  fixes" button (when nothing is fixable) and, worse, `health-review.html`'s "Yes, delete
+  these rules" form (when nothing survived a fresh re-check) were both hidden with it, so a
+  keyboard user tabbing through the page could land on - and activate - a destructive
+  control they never saw. Added `.fully-hidden { display: none; }` to `app.css` (removes
+  from layout, the accessibility tree, AND the tab order) and switched `findings_class`,
+  `review_form_class` and `apply_class`'s hidden values to it in `ui-src/bin/csf-ui`; left
+  `.visually-hidden` in place everywhere else it wraps non-interactive status text, which is
+  exactly what it is for. Four new tests pin the exact class on the exact form in both
+  states (hidden with nothing to apply, visible with a survivor); guard-removal (reverting
+  `apply_class` to `visually-hidden`) turns both red.
+- Two small corrections: `_route_ui_health_apply`'s own comment now states explicitly that
+  the function does not itself re-derive or re-validate submitted ids - the safety of an id
+  it did not check is entirely `reconcile_fix`'s own re-scan per S5.12, not anything in this
+  tier, and the comment said so imprecisely enough to read otherwise. And `t/50-render.t`'s
+  scanner failure message no longer cites a `task-7-report.md` heading that does not exist;
+  it points at `lists.html`'s own header comment, where the R51 worked example actually
+  lives.
+
+`t/33-app.t`: 140 → 207 assertions. `t/60-screens.t`: 120 → 143 assertions. Whole suite:
+**1837 tests** (was 1747), `prove -I. t/`.
+
 #### Task 7 — the five screens: Overview, Block/Unblock, Lists, IP lookup, Health
 
 **2026-09-11** — Added the server-rendered screens people actually use, built entirely on

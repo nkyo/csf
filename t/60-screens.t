@@ -41,7 +41,7 @@ use lib "$FindBin::Bin/..", "$FindBin::Bin/../ui-src/lib";
 
 use File::Temp qw(tempdir);
 use JSON::Tiny ();
-use Test::More tests => 120;
+use Test::More tests => 143;
 
 my $APP_PATH = "$FindBin::Bin/../ui-src/bin/csf-ui";
 ok(-f $APP_PATH, 'csf-ui is where the brief says it is');
@@ -278,6 +278,87 @@ sub _pct_decode {
 }
 
 ###############################################################################
+# R57 (fix round 1 review): comments are structurally inert to
+# _render_template() - stripped from a template's RAW text before it ever
+# reaches render(), not merely absent from rendered output by luck of
+# what today's comments happen to say. The first version of this fix
+# stripped render()'s OUTPUT instead, which the review showed mitigates
+# nothing: any comment whose text happened to spell a real var's name in
+# brace syntax (exactly what layout.html's own pre-existing comment did)
+# is already substituted by the time an output-side strip runs. Tested
+# directly against the real function - a synthetic on-disk template
+# reproducing that exact shape, including the RAW-marker form whose
+# substituted content could otherwise truncate a comment early.
+###############################################################################
+{
+	no warnings 'once'; # ConfigServer::UI::App::_strip_comments is touched exactly once in this file
+	is(ConfigServer::UI::App::_strip_comments('<!-- x --> keep <!-- y -->'), ' keep ',
+		'_strip_comments: removes every comment, leading or mid-file, keeps the text between them');
+	is(ConfigServer::UI::App::_strip_comments("a\n<!--\nmulti\nline\n-->\nb"), "a\n\nb",
+		'_strip_comments: a multi-line comment is removed as one block');
+	is(ConfigServer::UI::App::_strip_comments('no comments here at all'), 'no comments here at all',
+		'_strip_comments: text with no comment in it is unchanged');
+}
+
+{
+	# The duplication half: a comment that spells a real two-brace var
+	# name gets that value substituted into it, harmlessly escaped - not
+	# the dangerous half, but still worth pinning: the comment must not
+	# survive AT ALL, not merely survive with its embedded copy escaped.
+	my $dir = tempdir(CLEANUP => 1);
+	my $path = "$dir/duplicate.html";
+	open(my $fh, '>:raw', $path) or die "test setup: cannot write $path: $!\n";
+	print { $fh } "<!-- documentation mentioning the title as {{title}} -->\n<p>{{title}}</p>";
+	close $fh;
+
+	my $app = $A->new(web_root => $WEB_ROOT);
+	my $out = $app->_render_template($path, { title => 'REAL TITLE' });
+	unlike($out, qr/documentation mentioning/, 'R57 (duplication): the dangerous comment never reaches the output at all');
+	is(scalar(() = $out =~ /REAL TITLE/g), 1,
+		'R57 (duplication): the real title was substituted exactly once - not ALSO duplicated into the (removed) comment');
+	is($out, "\n<p>REAL TITLE</p>", 'R57 (duplication): byte-exact - only the real markup survives');
+}
+
+{
+	# The truncation half - the one that actually hit layout.html: a
+	# comment that spells a real RAW-marker name, substituted with
+	# content containing a literal comment-closing sequence. The OLD,
+	# output-side strip (`\A\s*<!--.*?-->` run AFTER render()) would match
+	# only up to the FIRST such sequence - the one INSIDE the substituted
+	# content, not the comment's own real close - leaving everything after
+	# it, including a live <script>, as ordinary un-stripped output. This
+	# is the exact reproduction the fix round's guard-removal proof used
+	# (see task-7-report.md): reverting _render_template() to the old
+	# shape turns this block red; the current shape never lets {{{leak}}}
+	# reach render() at all, because the whole comment is gone from the
+	# TEMPLATE before substitution runs.
+	my $dir = tempdir(CLEANUP => 1);
+	my $path = "$dir/truncating.html";
+	open(my $fh, '>:raw', $path) or die "test setup: cannot write $path: $!\n";
+	print { $fh } "<!-- doc: {{{leak}}} end of comment -->\n<p>{{title}}</p>";
+	close $fh;
+
+	my $app = $A->new(web_root => $WEB_ROOT);
+	my $out = $app->_render_template($path,
+		{ title => 'REAL TITLE', leak => 'INJECTED--><script>evil</script>' });
+	unlike($out, qr/<script>evil<\/script>/, 'R57 (truncation): the injected live <script> never reaches the output');
+	unlike($out, qr/INJECTED/, 'R57 (truncation): none of the injected content reaches the output either');
+	is($out, "\n<p>REAL TITLE</p>",
+		'R57 (truncation): byte-exact - the whole dangerous comment is gone, only the real markup survives');
+}
+
+# And end to end, through a real dispatched request: no template's GPL
+# header or design-rationale prose - the ORIGINAL instance this task
+# fixed by hand in layout.html - leaks into a real response body.
+{
+	my ($app, undef, $sessions) = _build(responses => { status => [ _status_ok() ], counts => [ _counts_ok() ], reconcile => [ _reconcile_empty() ] });
+	my $sess = $sessions->create(user => 'alice', role => 'admin');
+	my $r = $app->dispatch({ method => 'GET', path => '/ui/overview', headers => { cookie => "csfui_sid=$sess->{id}" }, peer => '1.2.3.4' });
+	unlike($r->{body}, qr/Copyright \(C\)/, 'R57 end to end: no template GPL header leaks into a real dispatched response');
+	unlike($r->{body}, qr/<!--/, 'R57 end to end: no HTML comment of any kind survives into a real dispatched response');
+}
+
+###############################################################################
 # Pagination bounds (task-7-brief.md's own words).
 ###############################################################################
 {
@@ -304,26 +385,54 @@ sub _pct_decode {
 # route with 403 - the page-level GET routes AND every mutating POST.
 # task-7-brief.md: "support sees only IP lookup and read-only Lists ... not
 # Overview, not Health; the server enforces this per request".
+#
+# R56 (fix round 1 review): this used to be a hand-written three-element
+# admin-only list and a hand-written two-element allowed list - exactly
+# the shape R27/R50 already learned not to trust ("a guarantee held by
+# memory rather than by a check"), since nothing forces either list to
+# stay in sync with @ROUTES as screens are added. Enumerated mechanically
+# instead, the same way @UI_MUTATING already is below: every non-
+# anonymous GET /ui/* route, admin-only or support, checked against
+# whatever its OWN `support` flag actually says, so a future GET route
+# that forgets (or wrongly sets) `support => 1` fails THIS test.
 ###############################################################################
+my @UI_GET_ROUTES;
 {
-	my @admin_only_get = (
-		['/ui/overview', 'Overview'],
-		['/ui/block',    'Block'],
-		['/ui/health',   'Health'],
-	);
-	for my $case (@admin_only_get) {
-		my ($path, $label) = @$case;
-		my ($app, undef, $sessions) = _build();
-		my $sess = $sessions->create(user => 'trent', role => 'support');
-		my $r = $app->dispatch({ method => 'GET', path => $path, headers => { cookie => "csfui_sid=$sess->{id}" }, peer => '1.2.3.4' });
-		is($r->{status}, 403, "support cannot reach $label ($path)");
-	}
+	no warnings 'once'; # @ConfigServer::UI::App::ROUTES is touched exactly once in this file
+	@UI_GET_ROUTES = sort { $a->{path} cmp $b->{path} }
+		grep { $_->{path} =~ m{^/ui/} && uc($_->{method}) eq 'GET' && !$_->{anonymous} } @ConfigServer::UI::App::ROUTES;
+}
+is(scalar(@UI_GET_ROUTES), 5,
+	'sanity: this checks all five GET /ui/* screen routes (overview, block, lists, lookup, health)');
 
-	my ($app_ok, undef, $sessions_ok) = _build(responses => { list => [ _list_one_row() ] });
-	my $sess_ok = $sessions_ok->create(user => 'trent', role => 'support');
-	for my $path (qw(/ui/lists /ui/lookup)) {
-		my $r = $app_ok->dispatch({ method => 'GET', path => $path, query => {}, headers => { cookie => "csfui_sid=$sess_ok->{id}" }, peer => '1.2.3.4' });
-		is($r->{status}, 200, "support CAN reach $path");
+# docs/WEBUI-RPC.md S5's role mapping, as an INDEPENDENT table - not read
+# off each route's own `support` flag. An earlier version of this block
+# did exactly that (`if ($route->{support}) { expect 200 } else { expect
+# 403 }`), which is a tautology: it can only ever confirm that _gate()
+# honours whatever a route currently declares, never that the DECLARATION
+# itself is the one the contract requires - flipping a flag the wrong way
+# would have made this block adapt silently rather than go red. This is
+# the exact "test passing for the wrong reason" shape the fix round that
+# added this table was itself responding to (R55), caught here before it
+# shipped by re-deriving the removal-restore proof rather than trusting
+# the first green run.
+my %GET_SUPPORT_OK = ( '/ui/lists' => 1, '/ui/lookup' => 1 );
+{
+	for my $route (@UI_GET_ROUTES) {
+		my $expect_support = $GET_SUPPORT_OK{ $route->{path} } ? 1 : 0;
+		is(!!$route->{support}, !!$expect_support,
+			"$route->{path}'s own support flag matches docs/WEBUI-RPC.md S5's role mapping");
+
+		my ($app, undef, $sessions) = _build(responses => {
+			list => [ _list_one_row() ],
+			'grep' => [ { ok => 1, data => { ip => '192.0.2.10', lines => [], count => 0, truncated => \0 } } ],
+		});
+		my $sess = $sessions->create(user => 'trent', role => 'support');
+		my $r = $app->dispatch({ method => 'GET', path => $route->{path}, query => {},
+			headers => { cookie => "csfui_sid=$sess->{id}" }, peer => '1.2.3.4' });
+		is($r->{status}, $expect_support ? 200 : 403,
+			$expect_support ? "support CAN reach $route->{path} (S5: lookup-only)"
+			                : "support cannot reach $route->{path} (S5: admin-only)");
 	}
 }
 
@@ -387,16 +496,30 @@ is(scalar(@UI_MUTATING), 11, 'sanity: this checks all eleven mutating /ui/* rout
 	my $sess = $sessions->create(user => 'alice', role => 'admin');
 	my $cookie = "csfui_sid=$sess->{id}";
 
-	# Step 1: the operator selects the fixable finding (fix_id_0) and
-	# leaves the unfixable one alone (it never had a checkbox to submit).
+	# Step 1: the operator's own checkboxes never offer the GHOST finding
+	# a name to submit (health-row-unfixable.html has no checkbox at all -
+	# see health.html's own header comment) - but the handler must not
+	# rely on that alone, since a hostile or merely stale client can submit
+	# any field name it likes. R55 (fix round 1 review): a prior version of
+	# this test submitted ONLY the fixable id, so "the review page does not
+	# show the GHOST finding" passed because GHOST was never selected, not
+	# because the fixable filter rejected it - proven by the reviewer
+	# removing the filter and watching this exact test stay green. Submit
+	# BOTH ids, as a tampered client would, so the assertion below can only
+	# pass if the cross-check against a FRESH reconcile's `fixable` field is
+	# actually running.
 	my $r1 = $app->dispatch({ method => 'POST', path => '/ui/health/review',
 		headers => { cookie => $cookie, 'x-csrf-token' => $sess->{csrf} },
-		body => "fix_id_0=$ID_ORPHAN", peer => '1.2.3.4' });
+		body => "fix_id_0=$ID_ORPHAN&fix_id_1=$ID_GHOST", peer => '1.2.3.4' });
 	is($r1->{status}, 200, 'POST /ui/health/review (fresh reconcile ok) renders a confirmation page');
 	like($r1->{body}, qr/rule\(s\) will be deleted/, 'the review page states what will be deleted');
 	like($r1->{body}, qr/198\.51\.100\.7/, 'the review page shows the surviving finding');
-	unlike($r1->{body}, qr/198\.51\.100\.8/, 'the review page does not show the GHOST finding, which was never selectable');
-	like($r1->{body}, qr/name="apply_id_0"\s+value="$ID_ORPHAN"/, 'the review page carries the id forward as a hidden field');
+	unlike($r1->{body}, qr/198\.51\.100\.8/,
+		'the review page does not show the GHOST finding, EVEN THOUGH it was submitted - the fixable filter rejected it');
+	like($r1->{body}, qr/1 of 2 selected finding\(s\) are no longer present or no longer fixable/,
+		'and says so: 1 of the 2 submitted ids did not survive the fresh fixable check');
+	like($r1->{body}, qr/name="apply_id_0"\s+value="$ID_ORPHAN"/, 'the review page carries the surviving id forward as a hidden field');
+	unlike($r1->{body}, qr/value="$ID_GHOST"/, 'and never carries the rejected GHOST id forward at all, hidden field or otherwise');
 	is(scalar(grep { $_->{op} eq 'reconcile' } @{ $client->{calls} }), 1,
 		'reviewing runs its own FRESH reconcile scan rather than trusting the page just shown');
 
@@ -440,6 +563,43 @@ is(scalar(@UI_MUTATING), 11, 'sanity: this checks all eleven mutating /ui/* rout
 	is($r->{status}, 200, 'reviewing a since-vanished id still renders (no crash)');
 	like($r->{body}, qr/no longer present or no longer fixable/, 'the page says the selection is stale');
 	like($r->{body}, qr/nothing to apply|None of the selected findings/, 'and offers no Yes-delete form when nothing survived');
+
+	# R58 (fix round 1 review): the wrapper hiding that Yes-delete form
+	# must be genuinely inert (display: none via .fully-hidden), not
+	# merely invisible-but-keyboard-focusable (.visually-hidden, which
+	# that class's own comment in app.css says is deliberately for labels
+	# that must stay reachable - the opposite of what a hidden destructive
+	# form needs). Matched directly against the literal wrapper/form pair
+	# health-review.html emits, not inferred indirectly.
+	like($r->{body}, qr{<div class="fully-hidden">\s*<p class="text-muted"></p>\s*<form method="POST" action="/ui/health/apply">},
+		'R58: the Yes-delete form, when nothing survived, is wrapped in .fully-hidden');
+	unlike($r->{body}, qr{<div class="visually-hidden">\s*<p class="text-muted"></p>\s*<form method="POST" action="/ui/health/apply">},
+		'R58: ...and specifically not the old, merely-visual, still-focusable spelling');
+}
+
+{
+	# The converse state (a survivor DOES exist): the Yes-delete form is
+	# VISIBLE (apply_class => ''), confirming the fix did not accidentally
+	# hide the form in the case it is actually needed.
+	my ($app, undef, $sessions) = _build(responses => { reconcile => [ _reconcile_with_findings(), _reconcile_with_findings() ] });
+	my $sess = $sessions->create(user => 'alice', role => 'admin');
+	my $r = $app->dispatch({ method => 'POST', path => '/ui/health/review',
+		headers => { cookie => "csfui_sid=$sess->{id}", 'x-csrf-token' => $sess->{csrf} },
+		body => "fix_id_0=$ID_ORPHAN", peer => '1.2.3.4' });
+	like($r->{body}, qr{<div class="">\s*<p class="text-muted">1 rule\(s\) will be deleted:</p>\s*<form method="POST" action="/ui/health/apply">},
+		'R58: ...and the same form is fully visible (no fully-hidden, no visually-hidden) when a survivor genuinely exists');
+
+	# app.css itself defines .fully-hidden as display:none - read directly
+	# off disk (not through the app, which only serves it as a static
+	# file - t/50-render.t and the /app.css route test already cover
+	# that path) so this assertion is anchored to the actual rule, not to
+	# a class name this test merely assumes exists.
+	open(my $fh, '<', "$WEB_ROOT/app.css") or die "test: cannot read $WEB_ROOT/app.css: $!\n";
+	local $/;
+	my $css = <$fh>;
+	close $fh;
+	like($css, qr/\.fully-hidden\s*\{\s*display:\s*none;?\s*\}/,
+		'R58: app.css defines .fully-hidden as display:none (removes from layout, a11y tree, AND tab order)');
 }
 
 ###############################################################################

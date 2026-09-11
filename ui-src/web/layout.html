@@ -82,11 +82,20 @@ IS the contract; there is no version of "forgot one" that ships quietly.
   version of this comment spelled out the real markers in brace syntax as
   documentation, and every page render silently duplicated the nav/content
   HTML into this comment and truncated it at the first place that HTML
-  closed a comment of its own. Fixed by respelling every mention in this
-  comment (functional markers below are unaffected); see CHANGES.md. (And
-  yes, this paragraph was itself rewritten once already for writing that
-  closing sequence out literally, for the exact same reason - the words
-  "ends a comment" appear here now for exactly that reason.)
+  closed a comment of its own. Fixed here by respelling every mention in
+  this comment (functional markers below are unaffected); see CHANGES.md.
+  (And yes, this paragraph was itself rewritten once already for writing
+  that closing sequence out literally, for the exact same reason - the
+  words "ends a comment" appear here now for exactly that reason.)
+
+  R57 (fix round 1 review): respelling this one comment fixed the
+  instance but left the CLASS open - any comment, in any template, could
+  make the identical mistake. Closed structurally instead:
+  ui-src/bin/csf-ui's _render_template() strips every HTML comment out of
+  a template's raw text before it ever reaches render(), so nothing in
+  ANY comment - this one included - is a substitution candidate any more,
+  regardless of wording. The respelling above stays as documentation of
+  what went wrong and why, but is no longer what keeps this file safe.
 
 Structural elements below are landmarks by native HTML semantics, not by
 added ARIA roles (a <header>/<footer> that is not nested inside sectioning

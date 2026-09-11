@@ -40,7 +40,7 @@ use lib "$FindBin::Bin/..", "$FindBin::Bin/../ui-src/lib";
 
 use File::Temp qw(tempdir);
 use JSON::Tiny ();
-use Test::More tests => 140;
+use Test::More tests => 207;
 
 my $APP_PATH = "$FindBin::Bin/../ui-src/bin/csf-ui";
 ok(-f $APP_PATH, 'csf-ui is where the brief says it is');
@@ -517,6 +517,78 @@ sub _last_access_line {
 			ok($ANONYMOUS_OK{ $route->{path} },
 				"anonymous route '$route->{path}' is one of the deliberate, closed set, not an accident");
 		}
+	}
+}
+
+###############################################################################
+# R56 (fix round 1 review of Task 7): %SPEC above binds every ROUTE THAT
+# NAMES AN `op` to section 5's Mutates/role columns - it says nothing at
+# all about a `handler` row, because a handler's mutates/support pair is
+# an application-level choice, not always a mirror of whichever operation
+# it happens to call internally (`/ui/health/review`, for instance, has
+# `mutates => 1` though it never calls a mutating operation itself - the
+# CSRF requirement is on the confirmation STEP, not on any one RPC call).
+# Every `/ui/*` route Task 7 added is a `handler` row, so none of them
+# were checked by %SPEC's mechanism at all - found by the reviewer, not
+# by this suite, which is exactly the gap this block closes: a table
+# binding every handler route's flags, checked the same mechanical way,
+# so a future handler row that forgets `mutates => 1` or drifts onto
+# `support => 1` fails THIS test rather than shipping unnoticed.
+###############################################################################
+{
+	my %HANDLER_SPEC = (
+		'/api/login'   => {},                        # anonymous is checked separately above
+		'/api/logout'  => { mutates => 1, any_role => 1 },
+		'/api/session' => { any_role => 1 },
+
+		'/app.css'  => {},                            # anonymous is checked separately above
+		'/ui/login' => {},                            # anonymous is checked separately above (both GET and POST rows)
+		'/ui/logout' => { mutates => 1, any_role => 1 },
+
+		'/ui/overview' => {},
+		'/ui/restart'  => { mutates => 1 },
+
+		'/ui/block'          => {},
+		'/ui/block/deny'     => { mutates => 1 },
+		'/ui/block/tempdeny' => { mutates => 1 },
+		'/ui/block/allow'    => { mutates => 1 },
+		'/ui/block/undeny'   => { mutates => 1 },
+
+		'/ui/lists'         => { support => 1 },
+		'/ui/lists/undeny'  => { mutates => 1 },
+		'/ui/lists/unallow' => { mutates => 1 },
+		'/ui/lists/temprm'  => { mutates => 1 },
+
+		'/ui/lookup' => { support => 1 },
+
+		'/ui/health'        => {},
+		'/ui/health/review' => { mutates => 1 },
+		'/ui/health/apply'  => { mutates => 1 },
+	);
+	is(scalar(keys %HANDLER_SPEC), 21, 'sanity: this checks all twenty-one handler-row paths (3 /api/* + /app.css + 17 /ui/*)');
+
+	my @handler_routes = grep { defined $_->{handler} } @ConfigServer::UI::App::ROUTES;
+	# 22, not 21: /ui/login is one path with two rows (GET the form, POST
+	# the submission), both bound to the same (empty, i.e. "anonymous only")
+	# expectation.
+	is(scalar(@handler_routes), 22, 'sanity: this checks all twenty-two handler rows');
+
+	for my $route (@handler_routes) {
+		my $expect = $HANDLER_SPEC{ $route->{path} };
+		ok($expect, "handler route '$route->{path}' is bound by \%HANDLER_SPEC, not left unchecked")
+			or next;
+		my %actual  = map { $_ => !!$route->{$_} }  qw(mutates support any_role);
+		my %wanted  = map { $_ => !!$expect->{$_} } qw(mutates support any_role);
+		is_deeply(\%actual, \%wanted,
+			"handler route '$route->{method} $route->{path}'s mutates/support/any_role flags match \%HANDLER_SPEC");
+	}
+
+	# Converse: every path %HANDLER_SPEC names is a real handler route,
+	# so a stale entry (one naming a path Task 7 later removed or renamed)
+	# fails loudly rather than silently checking nothing.
+	my %real_paths = map { $_->{path} => 1 } @handler_routes;
+	for my $path (sort keys %HANDLER_SPEC) {
+		ok($real_paths{$path}, "\%HANDLER_SPEC's '$path' entry names a route that actually exists");
 	}
 }
 

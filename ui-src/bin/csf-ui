@@ -711,36 +711,72 @@ sub _screen_path {
 	return "$self->{web_root}/screens/$name";
 }
 
-# Every template under ui-src/web (this file's own convention, and every
-# file Task 7 added) opens with a GPL header comment and a dated
-# "what this file is" comment - required to be IN THE SOURCE TREE, per
-# GPLv3 S5(a) (CHANGES.md's own words: "a modified work must carry
-# prominent notices ... Git history is convenient but is not a substitute
-# for this file" - the requirement is about the file on disk, never about
-# every rendered HTTP response repeating it). Stripped here, once, before
-# a rendered fragment is used: a screen that composes many small partials
-# (a Lists row rendered once per row, for instance - found exactly this
-# way, by actually rendering a page with several rows during Task 7's own
-# manual verification) would otherwise repeat 30+ lines of licence and
-# design-rationale text per row, which is not a security issue - it is all
-# inert, codebase-authored text inside an HTML comment - but is real,
-# needless bloat on every page this tier serves. The header stays exactly
-# where GPLv3 needs it: in the file. layout.html carried the same class of
-# problem in a more serious form - see its own header comment (added by
-# this task) for the truncation bug that specific case caused, fixed
-# separately by respelling that file's OWN comment rather than by this
-# helper (this helper cannot fix a marker that is INSIDE the comment being
-# stripped, only the comment's mere presence in the output).
-sub _strip_leading_comments {
+# R57 (fix round 1 review, closing a class rather than the one instance
+# found by hand): every template under ui-src/web opens with a GPL header
+# and a dated "what this file is" comment, some carry further explanatory
+# comments mid-file, and ALL of it is required to be IN THE SOURCE TREE
+# per GPLv3 S5(a) - never in a rendered HTTP response (CHANGES.md's own
+# words: "Git history is convenient but is not a substitute for this
+# file" - the requirement is about the file on disk).
+#
+# The first version of this fix ran AFTER render() and stripped only the
+# rendered OUTPUT's leading comment block. The review showed that
+# mitigates nothing against the actual danger: Render.pm's render()
+# processes a template's ENTIRE text as one substitution pass, comments
+# included, with no notion of "this is documentation, not a real
+# placeholder" (Render.pm's own header comment: "SINGLE PASS ... over the
+# template text"). By the time a post-render strip runs, any comment
+# whose text happened to spell a real var name in brace syntax has
+# ALREADY been substituted - silently duplicating real data into that
+# comment, or, for a RAW marker, potentially truncating the comment at
+# the first place the substituted HTML happened to close a comment of
+# its own (exactly what layout.html's own pre-existing comment did - see
+# CHANGES.md). Stripping the already-corrupted output afterward does not
+# undo that corruption in general; it only happened to look clean because
+# the ONE instance found was ALSO fixed by hand, separately, by
+# respelling that comment's text.
+#
+# So comments are now stripped from the RAW template text - read
+# straight off disk, before ConfigServer::UI::Render::render() ever sees
+# it - rather than from render()'s output. Nothing inside ANY comment,
+# anywhere in a template, leading or mid-file, is a candidate for
+# substitution at all any more, regardless of what brace-syntax text it
+# happens to contain, which closes the whole class: a future template
+# author can write documentation containing a real var's name in brace
+# syntax, by accident or on purpose, and it is structurally inert, not
+# merely "currently worded to avoid it". This also still serves the
+# original, separate purpose (GPLv3 S5(a) bloat: a Lists row rendered
+# once per row no longer repeats 30+ lines of licence text per row),
+# now as a side effect of the real fix rather than the whole of it.
+sub _read_raw_file {
+	my ($path) = @_;
+	open(my $fh, '<:raw', $path) or die "cannot open '$path': $!\n";
+	local $/;
+	my $text = <$fh>;
+	close $fh;
+	die "'$path' is empty or unreadable\n" unless defined $text;
+	return $text;
+}
+
+sub _strip_comments {
 	my ($html) = @_;
-	1 while $html =~ s/\A\s*<!--.*?-->//s;
+	$html =~ s/<!--.*?-->//gs;
 	return $html;
+}
+
+# The one place a template on disk reaches ConfigServer::UI::Render::render()
+# in this tier - render_file() is deliberately NOT used here, because it
+# would hand the raw (comment-and-all) text straight to render() with no
+# chance to strip first.
+sub _render_template {
+	my ($self, $path, $vars) = @_;
+	my $template = _strip_comments(_read_raw_file($path));
+	return ConfigServer::UI::Render::render($template, $vars);
 }
 
 sub _render_screen {
 	my ($self, $name, $vars) = @_;
-	return _strip_leading_comments(
-		ConfigServer::UI::Render::render_file($self->_screen_path($name), $vars));
+	return $self->_render_template($self->_screen_path($name), $vars);
 }
 
 # role => [nav template under web_root, ordered list of page keys it names
@@ -759,8 +795,7 @@ sub _render_nav {
 	my ($file, $pages) = @$spec;
 	my %vars = (csrf => $csrf);
 	$vars{"cur_$_"} = ($_ eq (defined $current ? $current : '')) ? 'page' : 'false' for @$pages;
-	return _strip_leading_comments(
-		ConfigServer::UI::Render::render_file("$self->{web_root}/$file", \%vars));
+	return $self->_render_template("$self->{web_root}/$file", \%vars);
 }
 
 # Wraps an already-rendered screen body in layout.html - the one place
@@ -769,14 +804,13 @@ sub _render_nav {
 sub _authed_page {
 	my ($self, $session, $current, $title, $body_html) = @_;
 	my $nav = $self->_render_nav($current, $session->{role}, $session->{csrf});
-	my $html = _strip_leading_comments(
-		ConfigServer::UI::Render::render_file("$self->{web_root}/layout.html", {
-			title   => $title,
-			user    => $session->{user},
-			role    => $session->{role},
-			nav     => $nav,
-			content => $body_html,
-		}));
+	my $html = $self->_render_template("$self->{web_root}/layout.html", {
+		title   => $title,
+		user    => $session->{user},
+		role    => $session->{role},
+		nav     => $nav,
+		content => $body_html,
+	});
 	return _html_response(200, $html);
 }
 
@@ -1356,10 +1390,16 @@ sub _route_ui_health {
 		# as a warning rather than an error for that reason.
 		$vars{unavailable_class} = ($code eq 'E_UNAVAILABLE') ? 'alert alert-warning' : 'alert alert-error';
 		$vars{unavailable_text}  = _rpc_error_text($result);
-		$vars{findings_class}    = 'visually-hidden';
+		# R58 (fix round 1 review): 'fully-hidden', not 'visually-hidden',
+		# for any region that wraps a FORM or BUTTON - see app.css's own
+		# comment on .fully-hidden. .visually-hidden deliberately stays
+		# keyboard-focusable (it exists for labels, not for hiding
+		# controls), which would leave a destructive "Review selected
+		# fixes" button tabbable while invisible.
+		$vars{findings_class}    = 'fully-hidden';
 		$vars{summary_text}      = '';
 		$vars{rows}              = '';
-		$vars{review_form_class} = 'visually-hidden';
+		$vars{review_form_class} = 'fully-hidden';
 	}
 	else {
 		my $data    = $result->{data} || {};
@@ -1371,10 +1411,10 @@ sub _route_ui_health {
 		$vars{unavailable_text}  = '';
 
 		if ($total == 0) {
-			$vars{findings_class}    = 'visually-hidden';
+			$vars{findings_class}    = 'fully-hidden'; # R58 - see above
 			$vars{summary_text}      = 'No reconciliation issues found.';
 			$vars{rows}              = '';
-			$vars{review_form_class} = 'visually-hidden';
+			$vars{review_form_class} = 'fully-hidden'; # R58 - see above
 		}
 		else {
 			$vars{findings_class} = '';
@@ -1409,7 +1449,7 @@ sub _route_ui_health {
 				$i++;
 			}
 			$vars{rows}              = join('', @row_html);
-			$vars{review_form_class} = $fixable_count > 0 ? '' : 'visually-hidden';
+			$vars{review_form_class} = $fixable_count > 0 ? '' : 'fully-hidden'; # R58 - see above
 		}
 	}
 
@@ -1472,7 +1512,15 @@ sub _route_ui_health_review {
 
 	if (!@survivors) {
 		$vars{empty_class} = '';
-		$vars{apply_class} = 'visually-hidden';
+		# R58 (fix round 1 review): 'fully-hidden', not 'visually-hidden' -
+		# this wraps the "Yes, delete these rules" FORM, the single most
+		# destructive control in the whole UI. .visually-hidden
+		# deliberately stays keyboard-focusable (it exists for labels, not
+		# for hiding controls - see app.css's own comment on
+		# .fully-hidden), which would leave that button tabbable and
+		# activatable while invisible - worse here than anywhere else this
+		# UI uses a hide-when-empty toggle.
+		$vars{apply_class} = 'fully-hidden';
 		$vars{count_text}  = '';
 		$vars{rows}        = '';
 	}
@@ -1503,9 +1551,19 @@ sub _route_ui_health_review {
 
 # Step 2 - the only route in this whole tier that ever calls
 # `reconcile_fix`. Its ids come only from apply_id_N fields this module's
-# own health-review-row.html just rendered a moment ago; §5.12 itself is
-# what makes a forged id harmless regardless ("It re-runs the full
-# reconcile scan ... and acts only on ids present in the fresh result").
+# own health-review-row.html just rendered a moment ago, but - stated
+# precisely, since it matters exactly here - THIS FUNCTION DOES NOT
+# ITSELF RE-DERIVE OR RE-VALIDATE THEM. It collects whatever apply_id_N
+# fields are in the submitted body and forwards them to `reconcile_fix`
+# as-is; there is no second reconcile() call and no %by_id cross-check
+# here (that already happened once, in _route_ui_health_review() above -
+# and even that copy is not what makes a forged id here harmless, because
+# a forged id could simply skip straight to this route without ever
+# visiting review). The safety of an id this function did not itself
+# check - forged, stale, or naming something no longer fixable - is
+# entirely §5.12's, on the HELPER side: "It re-runs the full reconcile
+# scan ... and acts only on ids present in the fresh result." Read that
+# guarantee there, not into this function.
 sub _route_ui_health_apply {
 	my ($self, $request, $session, $args) = @_;
 

@@ -772,6 +772,24 @@ table tbody tr:hover {
  * nothing above this point is changed.
  * ------------------------------------------------------------------- */
 
+/* R58 (fix round 1 review): NOT .visually-hidden. That class's own
+   comment above is explicit about what it is for - content that "stays
+   in the accessibility tree" so it remains reachable by keyboard and a
+   screen reader (a control's label, chiefly) - which is exactly wrong
+   for a region this file hides because it holds nothing meaningful to
+   reach right now: Health's "Review selected fixes" button when nothing
+   is fixable, and the confirm screen's own "Yes, delete these rules"
+   form when nothing survived a fresh re-check. .visually-hidden leaves
+   both keyboard-focusable while invisible, so a keyboard user tabbing
+   through the page can land on - and activate - a destructive control
+   they never saw, which is worse on that specific screen than anywhere
+   else in this UI. .fully-hidden removes the region from layout, from
+   the accessibility tree, AND from the tab order, which is what "there
+   is genuinely nothing here to reach" requires. */
+.fully-hidden {
+	display: none;
+}
+
 /* Login screen (ui-src/web/screens/login.html) - a standalone document,
    not wrapped by layout.html, so it needs its own top-level centering. */
 .login-shell {
