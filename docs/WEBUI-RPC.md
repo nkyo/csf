@@ -935,13 +935,14 @@ time.
 
 **One hash algorithm, and it is `$6$` SHA-512 crypt.** The record keeps its `algo`
 field so a future migration has somewhere to go, but the only value this contract
-implements is `crypt6`. `Crypt::Argon2` is neither a core module nor vendored in
+implements is **`6`** — the record format is `username:algo:hash:role:created_epoch`
+and Task 3 rejects any other `algo` on write. `Crypt::Argon2` is neither a core module nor vendored in
 this tree — `Crypt/` holds `Blowfish_PP.pm` and `CBC.pm` and nothing else — so
 under G1 it cannot be a dependency, and a branch that cannot run would advertise a
 strength the deployment does not have. The plan's "Argon2id when present"
 (`docs/WEBUI-PLAN.md:178`) is amended accordingly (§11.8).
 
-A record whose `algo` is anything other than `crypt6` — a store copied from a
+A record whose `algo` is anything other than `6` — a store copied from a
 machine that had something else, or a future format met by an older helper — is
 **unverifiable, not wrong**. `authenticate` answers `E_UNAVAILABLE` naming the
 username's algorithm and the remedy (`csf-ui-passwd passwd <user>`), and
@@ -1412,7 +1413,7 @@ dependency, and an optional branch nobody can exercise advertises a strength the
 deployment does not have.
 
 **Ruled: `$6$` SHA-512 `crypt()` is the only implemented algorithm.** The record
-keeps its `algo` field so a later migration has somewhere to go; `crypt6` is the
+keeps its `algo` field so a later migration has somewhere to go; `6` is the
 only value this contract accepts, `UI_CRYPT_ROUNDS` (§10) is its cost, and a record
 carrying any other `algo` is answered `E_UNAVAILABLE` **without** touching the
 failure counter (§5.14) — a store the helper cannot read must not lock out the
