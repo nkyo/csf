@@ -37,6 +37,132 @@ line is added below the original notice; the original stays intact.
 
 ### Unreleased
 
+#### Task 5 — the minimal HTTP/TLS core that faces the network (Mode B)
+
+- **2026-09-11** — Added `ui-src/lib/ConfigServer/UI/HTTP.pm`: the only HTTP
+  parser in this project that ever reads bytes a network peer chose. It is
+  deliberately small and deliberately strict, because the design's preferred
+  deployment (a front web server in Mode A) has no HTTP parser of ours facing
+  the network at all — this module exists for the other mode, standalone,
+  which reintroduces exactly the risk Mode A removes.
+
+  What it accepts: `GET` and `POST` only, origin-form targets, `HTTP/1.0` and
+  `HTTP/1.1`, a request line of at most 8192 bytes, at most 64 headers of at
+  most 8192 bytes each, and a body of at most 65536 bytes that is
+  `application/x-www-form-urlencoded` (or has no `Content-Type` at all — the
+  shape a plain `<form>` without `enctype=""` POSTs as) when one is sent.
+  Every other method is refused with a `405` before the request line's
+  target, version or headers are even parsed — not merely before the body is
+  read. There is no keep-alive: every response carries `Connection: close`
+  and this module answers exactly one request per filehandle it is given.
+  There is no chunked transfer encoding — `Transfer-Encoding`'s mere
+  presence, any value, is a `400` — no multipart, and no byte-range support.
+
+  Percent-decoding (`docs/WEBUI-RPC.md` §14.2, for the path and the query
+  string this module is the one that decodes) refuses rather than guesses: a
+  `%` not followed by two hex digits is a `400`, and so is any escape —
+  valid or not — that names a NUL byte, in a path or a query key/value. The
+  decoded query hash is raw bytes with no UTF-8 flag set, matching exactly
+  what `ui-src/bin/csf-ui`'s own `_url_decode()` produces for a form body, so
+  a value from either source reaches `Proto::as_chars` the same way. A
+  `..%2f..%2f` traversal path is deliberately *not* rejected here — §14.1 is
+  explicit that routing is exact-string match one layer up, so this decodes
+  it and lets the router's `404` be the `4xx` for that case.
+
+  Every read is bounded by a deadline (15s for the request line and headers
+  together, 15s more for the body) and every cap is enforced by bounding
+  what is read *before* it is trusted: a declared `Content-Length` is
+  checked against the 65536-byte cap and refused with `413` before a single
+  body byte is read, so a peer cannot make this process allocate a buffer
+  sized by a number it chose. A single header or request line that runs
+  past its own cap with no newline in it is refused at exactly that many
+  bytes, never more — fixed during this task's own verification pass after
+  a test proved a line arriving in one large chunk (its newline included)
+  could still slip a few hundred bytes past the 8192-byte cap, because the
+  per-read chunk size was a flat 8192 rather than bounded to the cap's
+  remaining headroom; reads are now sized to never let the buffer exceed the
+  cap in the first place. A `Content-Length` larger than what the peer
+  actually sends is refused immediately on a clean close, or after the body
+  deadline on an idle connection that never closes — the fault in the idle
+  case is marked `silent`, so the connection is dropped rather than
+  answered, the same "a slow client is dropped" reading `docs/WEBUI-RPC.md`
+  §7 already gives the helper side. Two lines are never accepted as framing:
+  a bare `\n` with no preceding `\r` (LF without CR), and any other `\r` not
+  immediately followed by `\n` (CR without LF, whether malformed or an
+  attempt to fold a second header into one line) — checked identically for
+  the request line and every header line. Duplicate `Content-Length` or
+  `Host` headers are refused outright rather than folded, because folding is
+  exactly the ambiguity a request-smuggling payload needs from those two
+  headers specifically; every other repeated header folds last-value-wins,
+  which §14.1 leaves to the producer's choice. `write_response()` puts
+  §14.3's response structure on the wire, computing `Content-Length` from
+  the body's own byte length rather than trusting anything csf-ui supplies,
+  and refuses to let a response header carry a literal CR/LF or override
+  `Connection`/`Content-Length` — csf-ui's own responses never try to, but
+  this tier does not take that on faith either.
+  (`ui-src/lib/ConfigServer/UI/HTTP.pm` — new file; `t/40-http-parse.t`,
+  `t/41-http-hostile.t` — new files)
+
+- **2026-09-11** — Added `ui-src/lib/ConfigServer/UI/Server.pm`: TLS
+  termination, the `ui.conf` startup gate, the IP allowlist, and the
+  accept/fork loop for Mode B. Three refusals, fail closed, each named
+  rather than silent:
+
+  **No `IO::Socket::SSL`, no start.** Checked for real at `preflight()` time
+  (`require IO::Socket::SSL`) and never assumed — this module never falls
+  back to plain HTTP, because a firewall admin interface served unencrypted
+  is worse than one that will not start. `IO::Socket::SSL` is not installed
+  in this workspace by design (G1), which is what lets this refusal be
+  tested for real rather than only through a mock.
+
+  **An empty or missing `UI_ALLOW`, no start.** `read_ui_conf()` is the
+  strict gate for all six `ui.conf` keys (`docs/WEBUI-RPC.md` §10), not only
+  the four (`UI_MODE`, `UI_LISTEN`, `UI_PORT`, `UI_ALLOW`) this task's own
+  checklist row names — `ui-src/bin/csf-ui`'s own `ConfigServer::UI::App`
+  already documents that its own lenient two-key reading of `ui.conf` is not
+  a substitute for "the long-running process" owning the full contract, and
+  this is that process. An unknown key, a duplicate key, or a line that
+  matches none of comment/blank/`KEY="VALUE"` refuses the whole file, naming
+  the key or line rather than silently ignoring it — the same reasoning §10
+  itself gives for why a typo'd `UI_ALOW` must not be able to hide as "no
+  allowlist". `UI_ALLOW` itself is validated per §4.1 with neither the
+  removal carve-out nor the mutating prefix floor (`Proto::ip_info($entry)`
+  with no options is exactly that), 1–64 entries, `/0` still rejected.
+
+  **`UI_MODE` other than `"b"`, no start** — Server.pm's own addition, not
+  named in §10 (which only requires the value be `"a"` or `"b"`): this
+  binary is specifically the Mode-B listener, and a syntactically valid
+  `"a"` still means it has nothing to bind and should not be running.
+
+  The allowlist itself (`peer_allowed()`) is checked on the connecting
+  address *before* TLS ever begins — the cheapest possible rejection for a
+  peer with no business here, spending neither a handshake nor a parse on an
+  address the administrator never listed — using the same packed-address
+  CIDR-containment arithmetic `ConfigServer::UI::Proto::ip_info()` already
+  computes, not a second implementation of it. `handle_connection()` is the
+  full per-request pipeline (parse via `ConfigServer::UI::HTTP`, add `peer`,
+  dispatch to `ConfigServer::UI::App`, write the response) and never lets a
+  die — a parse fault, or a bug in whatever `App` turns out to be — escape
+  to its caller, which in production is a forked child of the accept loop:
+  every failure becomes a well-formed HTTP response, or, for a fault marked
+  silent, a closed connection with nothing written at all.
+
+  The accept/fork loop (`run()`) mirrors `csf-ui-helper`'s own accept loop —
+  a per-connection fork, a concurrency cap, `SO_REUSEADDR`, signals reset in
+  the child — and, like that loop, is not itself exercised by this task's
+  tests: it needs a real listening socket, a real fork, and, in production,
+  a real TLS library this workspace does not have installed. Everything up
+  to and including one connection's handling is a plain function or takes
+  its socket as an argument instead, so `t/40` and `t/41` exercise all of it
+  directly over `socketpair()`s and a fake `App`. The TLS certificate/key
+  path (`/etc/csf-ui/ssl/{cert,key}.pem`) is this module's own placement
+  inside the already-frozen `/etc/csf-ui/` tree — `docs/WEBUI-RPC.md` names
+  no path for Mode B's TLS material, and this task adds no new `ui.conf`
+  key to name one, so this is not yet confirmed against whichever task
+  provisions the certificate.
+  (`ui-src/lib/ConfigServer/UI/Server.pm` — new file; `t/40-http-parse.t` —
+  new file)
+
 #### Task 4 fix round 1 — a rate limiter that stopped enforcing for the third time, connect() outside its own timeout, and a route table with no floor
 
 - **2026-09-11** — Fixed `RateLimit.pm` failing OPEN under exactly the
