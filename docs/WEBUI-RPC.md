@@ -94,9 +94,12 @@ Stated exactly, because the design is worth only what is on this list:
 3. **No argument ever names a file, a command, a flag or a chain.** Those are
    fixed tables in the helper (§9), so path traversal, argument injection and
    command injection have no argument to travel in.
-   The same discipline is why every `csf` invocation carries a note (§5.7): an
-   argument list that looks harmless can still reach a branch that does something
-   we excluded — in that case root resolving an attacker-chosen hostname.
+   The same discipline is why **the three operations that pass a comment to `csf`
+   — `deny`, `allow` and `tempdeny` — never pass an empty one** (§5.3, §5.5,
+   §5.7): an argument list that looks harmless can still reach a branch that does
+   something we excluded, in that case root resolving an attacker-chosen hostname.
+   The other eleven operations send no comment and cannot reach that branch at
+   all.
 4. The helper's audit log (§8) is written by root and is not writable by the web
    tier. An attacker who owns `csf-ui` can forge *who asked*; they cannot forge
    or erase *what was executed*.
@@ -328,7 +331,7 @@ Closed enumeration. New codes are an amendment to this document.
 | `E_UNKNOWN_OP` | `op` is not one of the 14 | closed | 500 (a client bug) |
 | `E_ARG` | an argument is missing, the wrong JSON type, unknown, or fails its grammar in §4 | closed | 400, with the field name |
 | `E_PEER` | `SO_PEERCRED` check failed | closed | — (the web tier never sees this; it means something else connected) |
-| `E_UNAVAILABLE` | a structural precondition is unmet and no request can succeed until someone fixes it: the `csfui` group does not exist (§2.1), `LF_IPSET` is on and `reconcile` cannot be computed (§5.11), or the password store is missing, unusable or empty so `authenticate` cannot answer (§5.14). **Not** used for `csf` being disabled — that is a state the operator chose, and it is `E_REFUSED` | closed | 503 + the remedy |
+| `E_UNAVAILABLE` | a structural precondition is unmet and no request can succeed until someone fixes it: the `csfui` group does not exist (§2.1), `LF_IPSET` is on and `reconcile` cannot be computed (§5.11), the password store is missing, unusable or empty so `authenticate` cannot answer, or the user's record carries an `algo` this helper cannot verify (both §5.14 — and that last one leaves the failure counter untouched). **Not** used for `csf` being disabled — that is a state the operator chose, and it is `E_REFUSED` | closed | 503 + the remedy |
 | `E_BUSY` | transient: concurrency cap, `csf` lock held, mutation-rate cap, restart interval (§7) | closed | 503 + `Retry-After` |
 | `E_REFUSED` | the request was well-formed and the system refused it: the address is one of this server's own, is in `csf.allow`/`csf.ignore`, is marked "do not delete", or `csf` has an unresolved start error | closed | 409, showing `message` |
 | `E_BACKEND` | `csf` or `iptables` failed, timed out, was killed, or left the state inconclusive | closed | 502 |
