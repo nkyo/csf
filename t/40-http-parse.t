@@ -41,7 +41,7 @@ use File::Temp qw(tempdir);
 use Fcntl ();
 use Socket ();
 use Time::HiRes ();
-use Test::More tests => 322;
+use Test::More tests => 324;
 
 require_ok('ConfigServer::UI::HTTP');
 require_ok('ConfigServer::UI::Server');
@@ -1101,11 +1101,39 @@ sub _connect_unix {
 	like($error, qr/systemctl status csf-ui/, 'F14: and the refusal names how to find the process that holds it');
 	ok(-S $path, 'F14: the socket is still there');
 
-	my $client = _connect_unix($path);
-	my $paddr = accept(my $connection, $live);
+	# BOUND, AND NON-FATAL ON FAILURE (fix round 2, R107's sweep). With
+	# the liveness check removed, the path no longer names the socket
+	# $live is behind by the time this runs - so _connect_unix()'s own
+	# `or die` ABORTED THE WHOLE FILE after test 171 (measured: exit 111,
+	# "Connection refused at t/40-http-parse.t line 992"), and the
+	# hundred-and-fifty-odd assertions below it never ran. The commit
+	# that added this block recorded "red: 169, 170" and could not have
+	# seen that. And had the rebind gone the other way - the path still
+	# naming a socket nothing is queued on - accept() here would have
+	# blocked forever instead. Both outcomes are now a named red
+	# assertion: the alarm never fires while the guard is present.
+	my $client;
+	my $paddr;
+	my $blocked = 0;
+	{
+		local $SIG{ALRM} = sub { die "ALARM: accept() on the first listener never returned\n" };
+		alarm(10);
+		my $completed = eval {
+			socket($client, Socket::PF_UNIX(), Socket::SOCK_STREAM(), 0) or die "socket: $!";
+			connect($client, Socket::pack_sockaddr_un($path)) or die "connect $path: $!";
+			$paddr = accept(my $connection, $live);
+			close $connection if defined $paddr;
+			1;
+		};
+		alarm(0);
+		$blocked = 1 if !$completed && $@ =~ /^ALARM:/;
+	}
+	is($blocked, 0,
+		'R107: and reaching it does not block - a path that has been rebound out from under the first listener leaves accept() with nothing to return');
 	ok(defined $paddr,
 		'F14: and still reaches the FIRST listener - the running daemon was not orphaned behind a path that no longer names it');
-	close $connection; close $client; close $live;
+	close $client if defined $client;
+	close $live;
 	unlink $path;
 }
 {
@@ -1154,9 +1182,36 @@ sub _connect_unix {
 		connect($client, Socket::pack_sockaddr_un($path));
 		push @pending, $client;
 	}
-	is($S->can('_socket_is_live')->($path), 1,
+	# BOUND BY AN ALARM (fix round 2, R107), for exactly the reason the
+	# run() case at the end of this file already gives for its own: the
+	# ALTERNATIVE to the guard under test here is not an error, it is a
+	# connect() that never returns, and a hung file produces zero "not
+	# ok" lines - the same outcome as a dead run, reached by a different
+	# route. MEASURED: with the two fcntl lines in _socket_is_live()
+	# removed, this file stopped dead after test 178 and was still
+	# running when it was killed at 60s (the round-2 reviewer's own run
+	# reached 662s), with not one failing assertion in it. The alarm
+	# never fires while the guard is present; with the guard gone the
+	# three assertions below redden by name in under a second. SIGALRM
+	# breaks the blocking connect() with EINTR and Perl's deferred
+	# delivery then runs the handler at the next opcode boundary, so the
+	# die is reached rather than swallowed by the syscall.
+	my ($live, $error, $blocked);
+	{
+		local $SIG{ALRM} = sub { die "ALARM: the liveness probe did not return\n" };
+		alarm(10);
+		my $completed = eval {
+			$live  = $S->can('_socket_is_live')->($path);
+			$error = _dies(sub { $S->can('_open_unix_listener')->($path) });
+			1;
+		};
+		alarm(0);
+		$blocked = (!$completed && $@ =~ /^ALARM:/) ? 1 : 0;
+	}
+	is($blocked, 0,
+		'R107: the liveness probe RETURNS against a live socket whose backlog is full - it does not block startup on the very daemon whose fate it is deciding');
+	is($live, 1,
 		'F14: a live socket whose backlog is full is still live - EAGAIN is not ECONNREFUSED');
-	my $error = _dies(sub { $S->can('_open_unix_listener')->($path) });
 	like($error, qr/something is already listening/,
 		'F14: and a busy daemon is refused over rather than unlinked out from under');
 	close $_ for grep { defined } @pending;

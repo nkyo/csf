@@ -43,7 +43,8 @@ use FindBin ();
 use lib "$FindBin::Bin/..", "$FindBin::Bin/../ui-src/lib";
 
 use File::Temp qw(tempdir tempfile);
-use Test::More tests => 208;
+use POSIX ();
+use Test::More tests => 209;
 
 my $DIST = "$FindBin::Bin/../ui-src/dist";
 my $RENDERER = "$DIST/render-template.sh";
@@ -369,9 +370,44 @@ SKIP: {
 	my $app_path = "$FindBin::Bin/../ui-src/bin/csf-ui";
 	my $lib1 = "$FindBin::Bin/..";
 	my $lib2 = "$FindBin::Bin/../ui-src/lib";
-	my $out = `"$^X" -I"$lib1" -I"$lib2" "$app_path" 2>&1`;
-	my $rc = $? >> 8;
+	# BOUNDED, AND THE CHILD IS REAPED RATHER THAN ORPHANED (fix round 2,
+	# R107's sweep). The whole point of this block is that csf-ui now
+	# reaches Server.pm's run(), and run()'s alternative to refusing is
+	# entering accept() and blocking forever - so the day this
+	# environment acquires a usable ui.conf (or preflight() stops
+	# refusing for an unrelated reason) a plain backtick here would hang
+	# this file with zero "not ok" lines. Run through a pipe rather than
+	# backticks so the deadline has a pid to SIGKILL: an alarm over a
+	# backtick would leave a wedged csf-ui running after this file has
+	# finished with it.
+	my $out = '';
+	my $rc;
+	my $blocked = 0;
+	my $pid = open(my $fh, '-|');
+	die "fork: $!" unless defined $pid;
+	if (!$pid) {
+		open(STDERR, '>&', \*STDOUT) or POSIX::_exit(126);
+		exec($^X, "-I$lib1", "-I$lib2", $app_path) or POSIX::_exit(127);
+	}
+	{
+		local $SIG{ALRM} = sub { die "ALARM\n" };
+		alarm(60);
+		my $completed = eval { local $/; my $text = <$fh>; $out = defined $text ? $text : ''; 1 };
+		alarm(0);
+		if ($completed) {
+			close $fh;
+			$rc = $? >> 8;
+		}
+		else {
+			$blocked = 1;
+			kill 'KILL', $pid;
+			waitpid($pid, 0);
+			close $fh;
+		}
+	}
 
+	is($blocked, 0,
+		'R107: running ui-src/bin/csf-ui directly RETURNS - it refuses, rather than entering the accept loop and hanging this file');
 	isnt($rc, 0, 'running ui-src/bin/csf-ui directly exits non-zero (no ui.conf/SSL in this environment)');
 	unlike($out, qr/is a library/, 'and no longer claims to be a library that cannot be executed directly');
 	like($out, qr/ui\.conf|IO::Socket::SSL/,

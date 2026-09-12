@@ -77,7 +77,7 @@ use File::Temp qw(tempdir);
 use POSIX ();
 use Socket ();
 use Time::HiRes ();
-use Test::More tests => 29;
+use Test::More tests => 30;
 
 require_ok('ConfigServer::UI::Server');
 my $S = 'ConfigServer::UI::Server';
@@ -155,10 +155,50 @@ sub _start_daemon {
 	POSIX::_exit(defined $rc ? $rc : 71);
 }
 
+###############################################################################
+# EVERY WAIT ON THE DAEMON IS BOUNDED (fix round 2, R107's sweep).
+#
+# Three calls in this file can block indefinitely against a daemon that is
+# present but wedged, and a hung test file produces ZERO "not ok" lines -
+# indistinguishable from a dead run, which is precisely the failure R107
+# was raised for over in t/40. They are:
+#
+#   * connect() to a live socket whose backlog is full;
+#   * sysread() on a connection the daemon accepted and then neither wrote
+#     to nor closed - and the wall-clock `while` in _request() below
+#     cannot interrupt its OWN sysread(), so that deadline bounds the loop
+#     and not the syscall inside it;
+#   * the blocking waitpid() after SIGKILL in _stop_daemon().
+#
+# On the deadline each helper returns exactly what it already returns for
+# the failure it is bounding, so the CALLER's own named assertion reddens
+# instead of the file stopping. $BLOCKED records that a deadline was hit at
+# all, and is asserted once at the end of this file - because "the request
+# got nothing back" is a true statement about a wedged daemon too, and the
+# two are different defects.
+###############################################################################
+our $BLOCKED = 0;
+
+sub _bounded {
+	my ($seconds, $code) = @_;
+	local $SIG{ALRM} = sub { die "ALARM\n" };
+	alarm($seconds);
+	my @out = eval { $code->() };
+	my $error = $@;
+	alarm(0);
+	if ($error ne '') {
+		$BLOCKED++ if $error eq "ALARM\n";
+		return ();
+	}
+	return @out;
+}
+
 sub _connect {
 	my ($path) = @_;
 	socket(my $socket, Socket::PF_UNIX(), Socket::SOCK_STREAM(), 0) or die "socket: $!";
-	return undef unless connect($socket, Socket::pack_sockaddr_un($path));
+	my ($connected) = _bounded(10,
+		sub { return connect($socket, Socket::pack_sockaddr_un($path)) ? 1 : 0 });
+	return undef unless $connected;
 	return $socket;
 }
 
@@ -173,13 +213,16 @@ sub _request {
 	syswrite($socket, "GET $target HTTP/1.1\r\nHost: x\r\nX-Real-IP: 10.0.0.7\r\n\r\n");
 	my $out = '';
 	my $deadline = Time::HiRes::time() + 5;
-	while (Time::HiRes::time() < $deadline) {
-		my $chunk;
-		my $read = sysread($socket, $chunk, 8192);
-		last unless defined $read && $read > 0;
-		$out .= $chunk;
-		last if $out =~ /\r\n\r\n/;
-	}
+	_bounded(10, sub {
+		while (Time::HiRes::time() < $deadline) {
+			my $chunk;
+			my $read = sysread($socket, $chunk, 8192);
+			last unless defined $read && $read > 0;
+			$out .= $chunk;
+			last if $out =~ /\r\n\r\n/;
+		}
+		return 1;
+	});
 	close $socket;
 	return $out;
 }
@@ -197,7 +240,7 @@ sub _stop_daemon {
 		Time::HiRes::sleep(0.02);
 	}
 	kill 'KILL', $daemon->{pid};
-	waitpid($daemon->{pid}, 0);
+	_bounded(10, sub { waitpid($daemon->{pid}, 0); return 1 });
 	return undef; # "it did not exit on TERM" - the caller asserts on this
 }
 
@@ -374,3 +417,14 @@ sub _log {
 
 	_stop_daemon($daemon);
 }
+
+###############################################################################
+# R107's own assertion for this file: not one of the waits above hit its
+# deadline. Every assertion in this file reads a daemon's answer, and "the
+# daemon answered nothing" and "the daemon never answered" are different
+# defects that look identical from a response string. Without this line a
+# wedged daemon would make the assertions above fail for a reason none of
+# them names - or, before the bounds were added, make them not run at all.
+###############################################################################
+is($BLOCKED, 0,
+	'R107: no wait on a daemon in this file hit its deadline - every connect(), read and reap returned on its own');
