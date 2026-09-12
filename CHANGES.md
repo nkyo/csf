@@ -37,6 +37,85 @@ line is added below the original notice; the original stays intact.
 
 ### Unreleased
 
+#### Task 9 — packaging: the mode-B entry point, TLS material, systemd units, front-end templates, and an installer that verifies what it installed
+
+**2026-09-12** — Makes the replacement WebUI installable: `ui-src/dist/{nginx,apache,litespeed}.conf.tpl`,
+`ui-src/dist/render-template.sh`, `ui-src/dist/csf-ui-cert.sh`, `ui-src/dist/csf-ui.service`,
+`ui-src/dist/csf-ui-helper.service`, `ui-src/dist/install-webui.sh` (new); a small addition
+to `ui-src/bin/csf-ui`'s own `unless (caller)` block; one comment in
+`ConfigServer::UI::Firewall`; the same nine lines appended to each of the seven
+`install.*.sh`; `t/80-templates.t` (new, 75 tests). 2624 tests (was 2549).
+
+- **The mode-B daemon entry point (Ruling R30).** Nothing previously wired
+  `ConfigServer::UI::App` into `ConfigServer::UI::Server->new(app => ...)->run()`.
+  `docs/WEBUI-RPC.md` §2.3 names exactly one binary for systemd to exec —
+  `/usr/local/csf-ui/bin/csf-ui` — and `t/71-rollback.t` already enforces that
+  `ui-src/bin/` may never hold a fifth file, so the wiring could not be a new binary; it
+  had to be `ui-src/bin/csf-ui`'s own `unless (caller)` stub, left in place for exactly
+  this by Task 5. It now `require`s `ConfigServer::UI::Server`, constructs both, and
+  calls `run()`, deferring every startup decision (mode, TLS availability, `ui.conf`
+  validity) to `Server::preflight()` rather than re-deciding any of it here. Verified by
+  running the file directly: it no longer prints "csf-ui is a library... not executed
+  directly" and exits 0; it now reaches `Server.pm`'s own refusal and exits non-zero.
+
+- **TLS material at `/etc/csf-ui/ssl/{cert,key}.pem` (Ruling R29).** `csf-ui-cert.sh` is
+  a sibling of the existing `ui-cert.sh`, not an edit to it — `ui-cert.sh` stays exactly
+  as it is, still serving the *old* built-in UI's `/etc/csf/ui/server.{key,crt}`, until
+  Task 11 retires that UI. The two paths were kept from ever colliding by construction.
+  Self-signed, host-only, SAN-based, regenerated on expiry or a key/cert mismatch — the
+  same generation logic as `ui-cert.sh`, because the reasoning for it doesn't change
+  with the path.
+
+- **Everything installed lives outside `/etc/csf`, `/var/lib/csf` and `/usr/local/csf`**
+  (Ruling R11; §13's measurement of why: those three trees are reset to `0600` on every
+  pass of `lfd`'s main loop, and a `0600` directory is impassable even to its own owner).
+  `install-webui.sh` creates its own tree — `/usr/local/csf-ui/{bin,lib,web}`,
+  `/etc/csf-ui{,/ssl}`, `/var/lib/csf-ui/{helper,sessions,rl}`, `/var/run/csf-ui` — and
+  the `csfui` system account (no login shell, no home), copying `ui-src/{bin,lib,web}` as
+  whole directories rather than an enumerated file list, so Task 11 deleting assets later
+  cannot silently break the copy.
+
+- **The installer verifies what it installed (item C).** `verify_install()` checks all
+  four binaries by the exact names §2.3 freezes, every directory in the tree above, that
+  the `csfui` account actually exists, that `csfui` can read a written `ui.conf` (§13.2's
+  demonstration, run for real rather than only argued about), and that installing the UI
+  did not widen `/etc/csf`, `/var/lib/csf` or `/usr/local/csf` off `0600` (§13.5's second
+  assertion). §13.5's first assertion — re-checking after a full minute of `lfd` running —
+  is not repeated on a timer: by construction none of this task's paths sit under the
+  three swept trees, so `lfd` cannot reach them and a 60-second-later re-check would
+  reconfirm the same answer on a correct install, never a different one.
+
+- **Non-interactive installs enable neither mode.** Account, directories, binaries, TLS
+  material and (on a systemd host) the unit files are always installed — that is
+  packaging, not turning anything on. Writing `/etc/csf-ui/ui.conf` and enabling a unit
+  happens only when stdin and stdout are both a real terminal; every other case (a
+  curl-pipe install, cron, CI) gets the UI installed but dormant, and prints how to finish
+  it later with `csf-ui-setup`. A failure anywhere in this script is printed and the
+  script still exits 0 — the caller does not check its exit status, deliberately, because
+  the firewall matters more than its optional UI.
+
+- **A real gap in the frozen contract, found rather than papered over.** `docs/WEBUI-
+  RPC.md` and `docs/WEBUI-PLAN.md` both say Mode A's `csf-ui` "listens on a unix socket"
+  that a front web server proxies to, but no path for that socket exists anywhere in
+  §2.3, and nothing in this codebase — `Server.pm` is, by its own header, "The Mode B
+  listener" and refuses outright for `UI_MODE=a` — implements one. Building an
+  unreviewed accept loop inside this task to paper over that would repeat exactly what
+  `Server.pm`'s own five fix rounds (Rulings R31–R37) exist to warn against: a
+  network-facing HTTP-parsing component shipped without the guard-removal review that
+  class of code has gotten everywhere else in this project. Templates, `ui.conf`
+  writing and front-end detection for Mode A are implemented and tested; `install-webui.sh`
+  renders the vhost and writes `ui.conf` for Mode A but deliberately does **not** enable
+  `csf-ui.service` for it, printing why, rather than start a process that would
+  immediately exit into a restart loop. `csf-ui-helper.service` and Mode B are both fully
+  functional. See this task's report for the full reasoning and the socket path chosen
+  (`/var/run/csf-ui/csf-ui.sock`, inside the already-frozen `/var/run/csf-ui/` directory)
+  for whoever implements the listener next.
+
+- **`_run_argv`'s six-name signal reset is hand-maintained, now said where the next
+  person changing it will see it** (item E): a comment at the list itself
+  (`ConfigServer::UI::Firewall`) names what it does and does not track, since nothing
+  enforces that a seventh signal disposition added elsewhere gets added here too.
+
 #### Task 8 fix round 4 — a zombie that read as a living wizard, and an ignored signal that outlived the process that ignored it
 
 **2026-09-11** — Three findings and two message-quality items.

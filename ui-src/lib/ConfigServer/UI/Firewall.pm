@@ -221,6 +221,16 @@ sub _run_argv {
 		# from the default; a child that cannot be killed by SIGTERM, or
 		# that never notices a broken pipe, is a child debugged by somebody
 		# who has no idea this program touched it.
+		#
+		# Added 2026-09-12 in https://github.com/nkyo/csf - see CHANGES.md.
+		# NAMED, not derived: this list is every disposition THIS process is
+		# known to change today, not "whatever %SIG currently holds" - the
+		# latter would also reset a handler this process's own caller relies
+		# on. A seventh signal changed anywhere in this codebase's callers
+		# (ConfigServer::UI::Server::run() sets PIPE/TERM/INT already
+		# covered here; csf-ui's own daemon entry point at the foot of
+		# ui-src/bin/csf-ui sets none) needs adding to this list BY HAND -
+		# nothing enforces that the two stay in sync.
 		$SIG{$_} = 'DEFAULT' for qw(CHLD PIPE HUP INT TERM ALRM);
 
 		{

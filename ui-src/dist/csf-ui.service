@@ -1,0 +1,75 @@
+# Added 2026-09-12 in https://github.com/nkyo/csf - see CHANGES.md.
+#
+# ConfigServer Security & Firewall - WebUI web tier (docs/WEBUI-RPC.md S2.3,
+# S13; task-9-brief.md). Runs as the unprivileged csfui account in both
+# deployment modes: mode B serves TLS directly (ConfigServer::UI::Server),
+# mode A listens on a unix socket that a front nginx/Apache/LiteSpeed
+# (ui-src/dist/*.conf.tpl) proxies to instead. ui-src/bin/csf-ui's own
+# `unless (caller)` block is what ExecStart below actually runs; it is the
+# same file S2.3 installs as a library for both modes to load.
+#
+# ConditionPathExists means an install that has never configured the UI
+# (no /etc/csf-ui/ui.conf - the common case; a non-interactive install
+# writes none, task-9-brief.md) shows this unit as inactive rather than
+# failed, and this unit is never `enable`d by such an install in the first
+# place.
+[Unit]
+Description=ConfigServer Security & Firewall - WebUI (web tier)
+Documentation=https://github.com/nkyo/csf
+After=network.target csf-ui-helper.service
+Wants=csf-ui-helper.service
+ConditionPathExists=/etc/csf-ui/ui.conf
+
+[Service]
+Type=simple
+User=csfui
+Group=csfui
+ExecStart=/usr/local/csf-ui/bin/csf-ui
+Restart=on-failure
+RestartSec=5
+UMask=0077
+
+# The mandatory set (task-9-brief.md). This process is the half of the
+# split that parses bytes a network peer - or, in mode A, a peer only one
+# step removed - chose (docs/WEBUI-RPC.md S1.2); it never needs a second
+# privilege, a home directory, a foreign namespace or a network family
+# beyond the three it can legitimately use.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+
+# /var/lib/csf-ui is where its own sessions/ and rl/ state lives (S2.3).
+# /var/log/csf-ui-access.log is ConfigServer::UI::App's own access log
+# (S2.3: "written by csf-ui - who asked for it") - listed explicitly
+# alongside the brief's own ReadWritePaths=/var/lib/csf-ui rather than
+# left to fail silently under ProtectSystem=strict, which would otherwise
+# turn every access-log write into a quiet no-op (_log_access() never
+# dies on a failed open, so nothing would ever say so).
+ReadWritePaths=/var/lib/csf-ui /var/log/csf-ui-access.log
+
+# Narrowing beyond the mandatory set - each one only removes something
+# this process has no legitimate use for; none of them touch a path or
+# family the mandatory set above already grants.
+AmbientCapabilities=
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectProc=invisible
+RemoveIPC=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+
+[Install]
+WantedBy=multi-user.target

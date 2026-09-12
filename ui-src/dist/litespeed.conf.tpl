@@ -1,0 +1,83 @@
+##############################################################################
+# Copyright (C) 2006-2025 Jonathan Michaelson
+#
+# https://github.com/waytotheweb/scripts
+#
+# This program is free software; you can redistribute it and/or modify it under
+# the terms of the GNU General Public License as published by the Free Software
+# Foundation; either version 3 of the License, or (at your option) any later
+# version.
+#
+# This program is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+# FOR A PARTICULAR PURPOSE. See the GNU General Public License for more
+# details.
+#
+# You should have received a copy of the GNU General Public License along with
+# this program; if not, see <https://www.gnu.org/licenses>.
+##############################################################################
+# Added 2026-09-12 in https://github.com/nkyo/csf - see CHANGES.md.
+#
+# csf WebUI - Mode A front end (LiteSpeed / OpenLiteSpeed, native config
+# syntax - this is NOT an Apache-compatible vhost include). Same role as
+# nginx.conf.tpl and apache.conf.tpl in this directory: LiteSpeed
+# terminates TLS and parses HTTP so csf-ui never has to. Rendered by
+# ui-src/dist/render-template.sh at install time; every placeholder token is
+# resolved then or the render is refused.
+#
+# Meant to be dropped where the detected LiteSpeed/OpenLiteSpeed install
+# reads extra vhost config from (commonly
+# /usr/local/lsws/conf/vhosts/csf-ui/vhconf.conf, referenced by a `vhost`
+# stanza in the main httpd_config.conf) - install-webui.sh writes it there
+# and prints the one line of main-config wiring LiteSpeed's own admin
+# console would otherwise ask for, rather than editing httpd_config.conf
+# itself sight-unseen.
+#
+# Placeholders: @@UI_PORT@@ @@UI_SOCK@@ @@UI_ALLOW_INCLUDE@@
+##############################################################################
+
+docRoot                   /usr/local/lsws/Example/html
+vhDomain                  *
+adminEmails               root@localhost
+enableGzip                0
+
+extprocessor csfui {
+	type                    proxy
+	address                 UDS://@@UI_SOCK@@
+	maxConns                35
+	pcKeepAliveTimeout      15
+	initTimeout             30
+	retryTimeout            0
+	respBuffer              0
+}
+
+context / {
+	type                    proxy
+	handler                 csfui
+	addDefaultCharset       off
+
+	# The address ConfigServer::UI::RateLimit keys on and csf-ui's own
+	# access log records (docs/WEBUI-RPC.md S14.1: "must be per-connecting-
+	# client, never a constant"). LiteSpeed sets this from its own view of
+	# the connecting peer - a client-supplied X-Real-IP is overwritten,
+	# never trusted through, for the same reason S10 gives for UI_ALLOW
+	# and X-Forwarded-For.
+	extraHeaders            X-Real-IP %{REMOTE_ADDR}
+}
+
+# docs/WEBUI-RPC.md S10: UI_ALLOW is enforced HERE in mode A, never by
+# csf-ui itself, and the generated file this includes is never empty - the
+# installer refuses to render this vhost at all while UI_ALLOW is empty.
+include @@UI_ALLOW_INCLUDE@@
+
+vhssl {
+	keyFile                 /etc/csf-ui/ssl/key.pem
+	certFile                /etc/csf-ui/ssl/cert.pem
+	sslProtocol             24
+}
+
+# docs/WEBUI-RPC.md S3.1/S14.1: matches the 65536-byte wire/body cap on the
+# csf-ui side of the socket. LiteSpeed's own per-context body limit,
+# maxReqBodySize, is set at the listener/vhost-map level in
+# httpd_config.conf; install-webui.sh's printed wiring note includes it as
+# 65536 for the map this vhost is bound to.

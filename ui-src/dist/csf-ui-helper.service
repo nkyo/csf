@@ -1,0 +1,66 @@
+# Added 2026-09-12 in https://github.com/nkyo/csf - see CHANGES.md.
+#
+# ConfigServer Security & Firewall - WebUI privileged backend
+# (docs/WEBUI-RPC.md; task-9-brief.md: "csf-ui-helper as root with the
+# narrowest set that still works"). This is the ONLY half of the WebUI
+# split that runs as root, by design (docs/WEBUI-RPC.md S1.2) - it is what
+# lets csf-ui itself run with none of the capabilities below at all. It
+# answers exactly the 14 operations in docs/WEBUI-RPC.md S5 over
+# /var/run/csf-ui/helper.sock and does not parse or route HTTP.
+#
+# "Narrowest set that still works", worked out from what the helper
+# actually does (ui-src/bin/csf-ui-helper, ConfigServer::UI::Firewall's
+# _run_argv): it reads files it does not own (root already owns
+# /etc/csf/*, so no DAC_OVERRIDE is needed to read them), execs
+# /usr/sbin/csf as its own child (a plain exec, not a privilege gain), and
+# creates its own state under paths it owns outright. The one exception
+# is /var/run/csf-ui/helper.sock, which docs/WEBUI-RPC.md S2 requires at
+# group csfui - SupplementaryGroups= grants that group membership so the
+# chgrp succeeds as an ordinary (non-CAP_CHOWN) operation on a file this
+# process already owns, rather than granting CAP_CHOWN to change ANY
+# file's owner. Measured against that, the capability bounding set this
+# process actually needs is empty.
+[Unit]
+Description=ConfigServer Security & Firewall - WebUI (privileged helper)
+Documentation=https://github.com/nkyo/csf
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/csf-ui/bin/csf-ui-helper
+Restart=on-failure
+RestartSec=5
+UMask=0077
+SupplementaryGroups=csfui
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+RestrictAddressFamilies=AF_UNIX
+CapabilityBoundingSet=
+ReadWritePaths=/var/lib/csf-ui/helper /var/run/csf-ui /var/log/csf-ui-audit.log
+
+# Narrowing beyond the mandatory csf-ui set this unit mirrors - none of
+# these touch a path, family or child-process ability this service
+# actually uses (a plain fork+exec of /usr/sbin/csf needs no more than
+# @system-service already allows).
+AmbientCapabilities=
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+RemoveIPC=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+
+[Install]
+WantedBy=multi-user.target

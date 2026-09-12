@@ -583,6 +583,19 @@ chown -f root:root /usr/sbin/csf /usr/sbin/lfd /etc/logrotate.d/lfd /etc/cron.d/
 cd webmin ; tar -czf /usr/local/csf/csfwebmin.tgz ./*
 ln -svf /usr/local/csf/csfwebmin.tgz /etc/csf/
 
+
+# Added 2026-09-12 in https://github.com/nkyo/csf - see CHANGES.md.
+#
+# The replacement WebUI (docs/WEBUI-PLAN.md) - packaging only.
+# task-9-brief.md: "A failure to set up the UI must not fail the install"
+# (the firewall matters more than its optional UI) and "A non-interactive
+# install enables neither mode" (an unattended run installs it disabled).
+# Exit status is deliberately not checked here - see
+# ui-src/dist/install-webui.sh's own header comment for why.
+if [ -f ui-src/dist/install-webui.sh ]; then
+	sh ui-src/dist/install-webui.sh
+fi
+
 echo
 echo "Installation Completed"
 echo

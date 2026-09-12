@@ -1774,15 +1774,54 @@ sub _log_access {
 }
 
 ###############################################################################
-# This file has no listening socket of its own (see the header comment) and
-# is a library, not a daemon. Running it directly says so instead of doing
-# nothing silently.
+# Added 2026-09-12 in https://github.com/nkyo/csf - see CHANGES.md.
+#
+# Running this file directly execs the web tier's own long-running process.
+# docs/WEBUI-RPC.md S2.3 is explicit that systemd's csf-ui.service execs
+# this exact installed path (/usr/local/csf-ui/bin/csf-ui) as csfui - there
+# is no separate fifth binary for it (t/71-rollback.t enforces that the
+# four names S2.3 lists are the only files ui-src/bin/ may ever contain),
+# so the wiring has to live here rather than in a new file.
+#
+# ConfigServer::UI::Server::new()'s own header comment says outright what
+# this block is: "Server.pm does not know how to load a package that lives
+# in a bin/ script rather than under lib/, and does not guess a path for
+# it; whatever process starts the mode-B daemon owns requiring that file
+# and constructing the App it passes in here." That process is this one.
+# Ruling R30 (.superpowers/sdd/webui-implementation/progress.md) assigned
+# the wiring to Task 9 rather than Task 5 because it is packaging, and
+# packaging is the part that can see the systemd units it ships with.
+#
+# `require`, not a top-of-file `use` - reached only when this file is
+# executed directly, never when some other consumer (t/33-app.t, t/60-
+# screens.t, a possible future mode-A adapter) loads it purely for
+# dispatch(). None of those want Server.pm's TLS/accept-loop dependencies
+# pulled in as a cost of using this module as a library.
+#
+# Mode selection is NOT decided here, deliberately. Server->run() reads
+# /etc/csf-ui/ui.conf itself (preflight(), read_ui_conf()) and refuses
+# loudly, naming the reason, for a missing or invalid ui.conf, a mode-A
+# UI_MODE (mode A has no listener of csf-ui's own for this process to
+# start - a front web server proxies to one instead; see this task's own
+# report for the gap that leaves open), or a missing IO::Socket::SSL -
+# all before anything binds. Re-deciding any of that here would just be a
+# second place for the two to disagree.
 ###############################################################################
 unless (caller) {
-	print STDERR "csf-ui is a library (ConfigServer::UI::App); it has no socket of its\n"
-		. "own and is loaded by Task 5's HTTP/TLS core (Server.pm in mode B, or the\n"
-		. "front web server's adapter in mode A), not executed directly.\n";
-	exit 0;
+	require ConfigServer::UI::Server;
+	my $app    = __PACKAGE__->new();
+	my $server = ConfigServer::UI::Server->new(app => $app);
+	my $rc     = eval { $server->run() };
+	if (my $err = $@) {
+		# run() itself never dies for a reason this block would handle any
+		# differently - a startup refusal is a printed problem list and a
+		# return of 1 (see Server.pm's own run()), not a die. This catches
+		# only what neither file anticipated, so it reaches the log as a
+		# one-line message rather than a bare Perl "died at ..." trace.
+		print STDERR "csf-ui: $err";
+		exit 1;
+	}
+	exit(defined $rc ? $rc : 1);
 }
 
 1;
