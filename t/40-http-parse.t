@@ -40,7 +40,7 @@ use lib "$FindBin::Bin/..", "$FindBin::Bin/../ui-src/lib";
 use File::Temp qw(tempdir);
 use Socket ();
 use Time::HiRes ();
-use Test::More tests => 239;
+use Test::More tests => 240;
 
 require_ok('ConfigServer::UI::HTTP');
 require_ok('ConfigServer::UI::Server');
@@ -496,7 +496,7 @@ sub _conf {
 	my $path = _conf(qq(UI_MODE="a"\nUI_LISTEN="127.0.0.1"\nUI_ALLOW="10.0.0.0/8"\n));
 	my ($conf, $problems) = $S->can('read_ui_conf')->($path);
 	is($conf, undef, 'UI_LISTEN set to exactly its own default still counts as present in mode A');
-	ok((grep { /UI_LISTEN/ } @$problems), 'and is refused by name');
+	ok((grep { /UI_LISTEN/ && /contradicts/ } @$problems), 'and is refused for the contradiction, by name');
 }
 {
 	# Same rule, the other way an "empty means absent" reading would break
@@ -504,7 +504,11 @@ sub _conf {
 	my $path = _conf(qq(UI_MODE="a"\nUI_LISTEN=""\nUI_ALLOW="10.0.0.0/8"\n));
 	my ($conf, $problems) = $S->can('read_ui_conf')->($path);
 	is($conf, undef, 'mode A with an EMPTY UI_LISTEN refuses too - an empty string is a value, not an absence');
-	ok((grep { /UI_LISTEN/ } @$problems), 'naming UI_LISTEN');
+	# /contradicts/, not merely /UI_LISTEN/: an empty value ALSO fails the
+	# "must be a literal address" check, whose message names UI_LISTEN as
+	# well - so a laxer assertion here would stay green with the mode-A
+	# rule bypassed entirely, which is the whole thing being tested.
+	ok((grep { /contradicts/ } @$problems), 'for the contradiction, not because "" is not an address');
 }
 {
 	my $path = _conf(qq(UI_MODE="a"\nUI_LISTEN="not-an-address"\nUI_ALLOW="10.0.0.0/8"\n));
@@ -1116,12 +1120,18 @@ sub _connect_unix {
 # input; the real, uninjected path is exercised immediately afterwards.
 ###############################################################################
 {
+	my $unwanted_scan = 0;
 	my $set = $S->can('unix_peer_uids')->(4242,
 		self_uid     => 1000,
 		group_lookup => sub { return ('csf-ui-sock', '', 4242, 'www-data nginx') },
 		name_lookup  => sub { return ($_[0], '', { 'www-data' => 33, nginx => 104 }->{$_[0]}, 4242) },
-		passwd_scan  => sub { die "the passwd scan must not run when the member list already found somebody\n" },
+		# Counted, never die(): a die here would abort this file and
+		# produce no "not ok" line at all, which is the one way a guard
+		# can look verified without being verified.
+		passwd_scan  => sub { $unwanted_scan++; return (999) },
 	);
+	is($unwanted_scan, 0,
+		'the passwd scan does NOT run when the member list already found somebody - it is the failure path only');
 	is_deeply([sort { $a <=> $b } keys %$set], [33, 104, 1000],
 		'the accepted set is the socket group\'s members plus this process itself');
 }
@@ -1498,13 +1508,32 @@ sub _connect_unix {
 	my $conf_path = _conf(qq(UI_MODE="a"\nUI_ALLOW="10.0.0.0/8"\n));
 	my $server = $S->new(
 		app          => FakeApp->new,
+		mode         => 'b', # deliberately wrong: run() reads the mode from the file
 		ui_conf_path => $conf_path,
 		socket_path  => $path,
 		self_uid     => $> + 0,
 		peer_uids    => { $> + 0 => 1 }, # deliberately: nobody but us
 	);
+	# Two devices, both so that REMOVING a guard below reddens a named
+	# assertion instead of doing something a passing suite cannot tell
+	# apart from success:
+	#
+	#   eval, so a guard removal that turns this refusal into a die leaves
+	#   $rc undef and reddens, rather than aborting the file and producing
+	#   no "not ok" line at all;
+	#
+	#   alarm, because the ALTERNATIVE to this refusal is not an error -
+	#   it is run() proceeding into accept() and blocking forever. Without
+	#   a deadline, removing the refusal would hang this file rather than
+	#   fail it, which is the same "zero not ok lines" outcome by a
+	#   different route. The alarm never fires when the guard is present.
 	my $rc;
-	my $stderr = _capture_stderr(sub { $rc = $server->run() });
+	my $stderr = _capture_stderr(sub {
+		local $SIG{ALRM} = sub { die "run() never returned - it entered the accept loop\n" };
+		alarm(5);
+		$rc = eval { $server->run() };
+		alarm(0);
+	});
 
 	is($rc, 1, 'run() refuses to start when no account but this one can reach the mode-A socket');
 	like($stderr, qr/no account other than this one/,

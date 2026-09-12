@@ -629,6 +629,18 @@ sub _netmask {
 # the option comes back too short to unpack - the same "fewer than 3
 # values means close immediately" row section 2.2's own table carries.
 # Callers must treat the empty list as a refusal, not as "unknown".
+#
+# MEASURED, so the next reader knows which of these four early returns
+# are load-bearing and which are not. Only ONE is reachable on this
+# platform: a filehandle that is not a socket, where getsockopt returns
+# undef. The other three are defensive and no test can enter them here -
+# `defined $socket` is redundant because getsockopt on undef returns undef
+# too and the next line catches it; and the length and count checks
+# cannot fire at all where SO_PEERCRED genuinely returns the twelve bytes
+# section 2.2 states as verified fact. They are kept because the cost of
+# a wrong answer here is the entire mode-A identity check, and because
+# unpack() on a short string does not fail - it pads with undef, which is
+# exactly the "partial answer" a caller would then read as a uid.
 ###############################################################################
 sub peercred {
 	my ($socket) = @_;
@@ -826,12 +838,23 @@ sub peer_from_front {
 	my $value = $request->{headers}{$FRONT_PEER_HEADER};
 	return undef unless defined $value && !ref($value) && length $value;
 
-	# Before ip_info(), and cheaper than it: this rejects the shapes a
-	# proxy chain produces (a comma-joined list), a bracketed IPv6
-	# literal, an address with a port, and an IPv6 zone index - none of
-	# which section 14.1 permits ("no port, no brackets") and each of
-	# which would otherwise reach a validator as a puzzle rather than as a
-	# refusal.
+	# A character-class pre-filter for the shapes a proxy chain, a
+	# bracketed IPv6 literal, an address with a port, an IPv6 zone index
+	# and a CIDR all take - none of which section 14.1 permits ("no port,
+	# no brackets", and a prefix is not one client).
+	#
+	# MEASURED, so this comment neither overstates nor understates its own
+	# guard. Four of those five are ALSO refused by ip_info() below on its
+	# own: inet_pton is strict, and ip_info's own \x21-\x7E rule catches
+	# the space in a comma-joined chain. The fifth is not. A prefix -
+	# "203.0.113.0/24" - is something ip_info() with removal => 1
+	# deliberately ACCEPTS, so the only things standing between a front
+	# server's header and a whole subnet arriving as one client's identity
+	# are this line and the plen check further down. They are load-bearing
+	# AS A PAIR: remove either alone and the CIDR is still refused by the
+	# other; remove both and it is accepted. So the pair is verified by
+	# removing both together - each alone reddens nothing, and that is a
+	# fact about their overlap, not about their necessity.
 	return undef if $value =~ /[^0-9A-Fa-f:.]/;
 
 	# removal => 1 for the same reason peer_allowed() uses it on a peer:
@@ -846,7 +869,10 @@ sub peer_from_front {
 	# A prefix is not one client. removal => 1 accepts /0, and a front
 	# server has no business sending any prefix at all, so the whole
 	# question is settled by refusing every one of them rather than by
-	# reasoning about which are harmless.
+	# reasoning about which are harmless. The other half of the pair the
+	# character-class filter above describes: either one of the two
+	# refuses a CIDR, and both are kept because either could reasonably be
+	# the one a later edit relaxes.
 	return undef if defined $info->{plen};
 
 	# The canonical form, not the bytes as sent: two spellings of one IPv6
