@@ -43,7 +43,7 @@ use FindBin ();
 use lib "$FindBin::Bin/..", "$FindBin::Bin/../ui-src/lib";
 
 use File::Temp qw(tempdir tempfile);
-use Test::More tests => 126;
+use Test::More tests => 153;
 
 my $DIST = "$FindBin::Bin/../ui-src/dist";
 my $RENDERER = "$DIST/render-template.sh";
@@ -160,7 +160,8 @@ my $csf_ui_helper = slurp($UNIT{'csf-ui-helper.service'});
 # RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6, CapabilityBoundingSet=
 # (empty), ReadWritePaths=/var/lib/csf-ui."
 like($csf_ui, qr/^User=csfui$/m,        'csf-ui.service runs as csfui');
-like($csf_ui, qr/^Group=csfui$/m,       'csf-ui.service runs as group csfui');
+# Group=csf-ui-sock (not csfui) as of fix round 2 (R90) - checked in the
+# dedicated block below, alongside SupplementaryGroups=csfui.
 like($csf_ui, qr/^NoNewPrivileges=yes$/m, 'csf-ui.service: NoNewPrivileges=yes');
 like($csf_ui, qr/^ProtectSystem=strict$/m, 'csf-ui.service: ProtectSystem=strict');
 like($csf_ui, qr/^ProtectHome=yes$/m,   'csf-ui.service: ProtectHome=yes');
@@ -204,7 +205,9 @@ like($csf_ui_helper, qr/^CapabilityBoundingSet=.*\bCAP_NET_RAW\b/m,
 	'csf-ui-helper.service: CapabilityBoundingSet grants CAP_NET_RAW (iptables-legacy raw socket creation)');
 like($csf_ui_helper, qr/^CapabilityBoundingSet=.*\bCAP_DAC_READ_SEARCH\b/m,
 	'csf-ui-helper.service: CapabilityBoundingSet grants CAP_DAC_READ_SEARCH (/etc/csf is a 0600 directory - S13.2)');
-for my $tree (qw(/etc/csf /var/lib/csf /usr/local/csf /run)) {
+# /usr/local/csf REMOVED as of fix round 2 (R89) - checked explicitly,
+# below, alongside CAP_SYS_MODULE and the two Protect* removals.
+for my $tree (qw(/etc/csf /var/lib/csf /run)) {
 	like($csf_ui_helper, qr{^ReadWritePaths=.*\Q$tree\E}m,
 		"csf-ui-helper.service: ReadWritePaths includes $tree (csf.pl's own tree or /run/xtables.lock, not this task's)");
 }
@@ -443,4 +446,132 @@ for my $installer (@SH_FILES) {
 		'install-webui.sh: verify_install() uses a mode/owner-checking helper, not just -e/-x');
 	like($install_webui, qr/is not one of the four docs\/WEBUI-RPC\.md S2\.3 names/,
 		'install-webui.sh: verify_install() checks the installed bin/ holds only the four S2.3 names');
+}
+
+###############################################################################
+# Fix round 2 (task-9-review.md R87-R90 and the lower-priority findings):
+# structural checks for what root/systemd/a-real-front-server would be
+# needed to exercise end to end (done manually against real, freshly
+# installed apache2/nginx on this host - see the task report for the
+# full reproduction, including the negative cases), plus a real,
+# no-root invocation of the one new function that is pure string logic.
+###############################################################################
+{
+	my $install_webui = slurp("$DIST/install-webui.sh");
+
+	# R87: UI_ALLOW must be validated - shape-checked and explicitly
+	# refused at /0 - before either csf-ui or a front server ever sees it.
+	like($install_webui, qr/^validate_ui_allow\s*\(\)/m,
+		'install-webui.sh: a validate_ui_allow() function exists');
+	# Both checked as "if ! validate_ui_allow ...; then return" - not
+	# merely "the string appears somewhere in the function" - because a
+	# call whose result is never checked is indistinguishable from no
+	# call at all to a presence-only regex (checked directly: the
+	# apache_missing_modules assertion below used to be presence-only,
+	# and a guard rewritten to `if false` left it green - see the task
+	# report's guard-removal table).
+	like($install_webui, qr{setup_mode_a\(\) \{[\s\S]*?if ! validate_ui_allow "\$allow"; then},
+		'install-webui.sh: setup_mode_a() actually GATES on validate_ui_allow, not just calls it');
+	like($install_webui, qr{setup_mode_b\(\) \{[\s\S]*?if ! validate_ui_allow "\$allow"; then},
+		'install-webui.sh: setup_mode_b() actually GATES on validate_ui_allow too');
+
+	# R87/R88: the front server's OWN validator gates success, and a
+	# missing validator is treated as a refusal (exit 2), never a pass.
+	like($install_webui, qr/^front_configtest\s*\(\)/m,
+		'install-webui.sh: a front_configtest() function exists');
+	like($install_webui, qr/return 2/,
+		'install-webui.sh: front_configtest() has a distinct "no validator found" return, not silent success');
+	like($install_webui, qr{test_rc=\$\?\n\tif \[ "\$test_rc" -ne 0 \]; then},
+		'install-webui.sh: setup_mode_a() actually GATES on front_configtest()\'s exit status, not just calls it');
+	like($install_webui, qr/front_disable_vhost/,
+		'install-webui.sh: a rollback path (front_disable_vhost) exists for a failed validation');
+
+	# R88: a missing Apache module must be caught directly - configtest
+	# alone cannot see it, because <IfModule> is what stops it being a
+	# fatal error in the first place.
+	like($install_webui, qr/^apache_missing_modules\s*\(\)/m,
+		'install-webui.sh: an apache_missing_modules() function exists');
+	like($install_webui, qr/a2enmod ssl proxy proxy_http headers/,
+		'install-webui.sh: apache_missing_modules() attempts to enable the needed modules first');
+	# Deliberately not just "the string apache_missing_modules appears
+	# after setup_mode_a() {" - that regex still matches a call sitting
+	# behind a guard that can never be true (checked directly: replacing
+	# the condition below with `if false; then` left this assertion
+	# green while the real behaviour was gone). The exact guard shape is
+	# what has to survive.
+	like($install_webui,
+		qr{if \[ "\$front" = "apache" \]; then\n\t\tstill_missing=\$\(apache_missing_modules\)},
+		'install-webui.sh: setup_mode_a() checks for still-missing modules specifically when $front is apache');
+
+	# R87: a certificate csf-ui-cert.sh failed to create must not be
+	# referenced by a rendered vhost.
+	like($install_webui, qr{\[ ! -s /etc/csf-ui/ssl/cert\.pem \]},
+		'install-webui.sh: setup_mode_a() checks the certificate exists before rendering a vhost that references it');
+
+	# R89: /usr/local/csf must not be a helper ReadWritePaths entry -
+	# nothing in S5 writes there, and it is where csfpre.sh/csfpost.sh
+	# (executed by `csf -r`) live.
+	my $csf_ui_helper = slurp("$DIST/csf-ui-helper.service");
+	unlike($csf_ui_helper, qr{^ReadWritePaths=.*/usr/local/csf\b}m,
+		'csf-ui-helper.service: ReadWritePaths no longer includes /usr/local/csf (R89)');
+	like($csf_ui_helper, qr/^CapabilityBoundingSet=.*\bCAP_SYS_MODULE\b/m,
+		'csf-ui-helper.service: CapabilityBoundingSet grants CAP_SYS_MODULE (csf -r calls modprobe)');
+	unlike($csf_ui_helper, qr/^ProtectKernelModules=yes$/m,
+		'csf-ui-helper.service: ProtectKernelModules removed (would strip CAP_SYS_MODULE regardless of the grant above)');
+	unlike($csf_ui_helper, qr/^ProtectKernelTunables=yes$/m,
+		'csf-ui-helper.service: ProtectKernelTunables removed (csf -r writes /proc/sys/net/ipv4/ip_forward)');
+
+	# R90: the RuntimeDirectory must be traversable by a front-server
+	# worker WITHOUT reusing csfui (that reuse is exactly R(I5)/fix round
+	# 1's own removed mistake) - a second, dedicated group does this.
+	my $csf_ui = slurp("$DIST/csf-ui.service");
+	like($csf_ui, qr/^Group=csf-ui-sock$/m,
+		'csf-ui.service: primary Group is csf-ui-sock, not csfui (R90 - so RuntimeDirectory is owned by it)');
+	like($csf_ui, qr/^SupplementaryGroups=csfui$/m,
+		'csf-ui.service: csfui kept as a SUPPLEMENTARY group (still needed to read ui.conf/the mode-B key)');
+	like($install_webui, qr/^grant_socket_group\s*\(\)/m,
+		'install-webui.sh: a grant_socket_group() function exists');
+	like($install_webui, qr/usermod -aG csf-ui-sock/,
+		'install-webui.sh: grant_socket_group() grants csf-ui-sock, never csfui');
+	like($install_webui, qr/getent group csf-ui-sock/,
+		'install-webui.sh: create_account() creates the csf-ui-sock group');
+
+	# Lower-priority findings: detect_frontend() must not treat a
+	# leftover config directory as proof a server is installed.
+	unlike($install_webui, qr{detect_frontend\(\) \{[\s\S]*?-d /etc/nginx[\s\S]*?\n\}},
+		'install-webui.sh: detect_frontend() no longer trusts a bare -d /etc/nginx');
+}
+
+###############################################################################
+# validate_ui_allow(), run for real as a subprocess (no root needed - it
+# is pure string logic) - the same "exercise the real script, do not
+# reimplement its logic in Perl and test that instead" approach this file
+# already uses for render-template.sh.
+###############################################################################
+{
+	my $src = slurp("$DIST/install-webui.sh");
+	$src =~ /(\nvalidate_ui_allow\(\) \{.*?\n\})/s
+		or die "could not extract validate_ui_allow() from install-webui.sh";
+	my $fn = $1;
+
+	my ($fh, $harness) = tempfile(SUFFIX => '.sh');
+	print $fh "#!/bin/sh\n$fn\nvalidate_ui_allow \"\$1\"\nexit \$?\n";
+	close $fh;
+
+	my %case = (
+		'203.0.113.5'                    => 0,
+		'203.0.113.0/24'                 => 0,
+		'2001:db8::1'                    => 0,
+		'203.0.113.5,198.51.100.0/24'    => 0,
+		'not-an-ip'                      => 1,
+		'0.0.0.0/0'                      => 1,
+		'::/0'                           => 1,
+		''                               => 1,
+	);
+	for my $input (sort keys %case) {
+		my $rc = system('sh', $harness, $input);
+		$rc = $rc == -1 ? -1 : ($rc >> 8);
+		my $label = length($input) ? $input : '(empty)';
+		is($rc == 0 ? 0 : 1, $case{$input}, "validate_ui_allow('$label') " . ($case{$input} ? 'rejects' : 'accepts') . " as expected");
+	}
 }

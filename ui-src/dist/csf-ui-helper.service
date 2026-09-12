@@ -37,24 +37,28 @@ SupplementaryGroups=csfui
 
 NoNewPrivileges=yes
 
-# csf owns /etc/csf, /var/lib/csf and /usr/local/csf outright - every
-# other document in this project (docs/WEBUI-RPC.md S13, Ruling R11) says
-# so precisely because lfd enforces 0600 on exactly these three trees
-# forever. Granting them here is not a guess: it is the same three paths,
-# taken from the same source of truth, rather than an attempt to
-# enumerate which of csf.pl's ~30 flags touches which file - that
-# enumeration is what produced the empty set this fix round exists to
-# correct, and getting it precisely-but-still-wrong a second time is a
-# worse outcome than granting the whole tree csf.pl already assumes it
-# owns. /run is added for the same reason, on review's own finding: even
-# a READ-ONLY `iptables -S`/`-L` takes out /run/xtables.lock first, to
-# serialise against a concurrent writer - so reconcile (S5.11), the
-# operation this fix round's own review used to prove the sandbox was
-# broken, needs a writable /run just as much as deny/allow/temp* do.
+# csf owns /etc/csf and /var/lib/csf outright, and every mutating S5
+# operation (deny/allow/temp*) writes into one of the two - every other
+# document in this project (docs/WEBUI-RPC.md S13, Ruling R11) names them
+# for the same reason: lfd enforces 0600 on them forever. /run is granted
+# for the same "trust the whole tree, do not enumerate" reason, on
+# review's own finding: even a READ-ONLY `iptables -S`/`-L` takes out
+# /run/xtables.lock first, to serialise against a concurrent writer - so
+# reconcile (S5.11), the operation this fix round's own review used to
+# prove the sandbox was broken, needs a writable /run just as much as
+# deny/allow/temp* do.
+#
+# Fix round 2 (task-9-review.md R89): /usr/local/csf REMOVED. No S5
+# operation writes there - csf's own scripts under it
+# (csfpre.sh/csfpost.sh, run by `csf -r`) are read and exec'd, never
+# written, and granting write access to a tree containing scripts a root
+# process then executes is a hole with no corresponding need, not a
+# narrow grant. CAP_DAC_READ_SEARCH still covers reading anything under
+# it that lfd's own hardening would otherwise block traversal into.
 # ProtectSystem=strict still confines everything else (/usr, /boot,
 # arbitrary other paths this process has no business in).
 ProtectSystem=strict
-ReadWritePaths=/etc/csf /var/lib/csf /usr/local/csf /run /var/lib/csf-ui/helper /var/log/csf-ui-audit.log
+ReadWritePaths=/etc/csf /var/lib/csf /run /var/lib/csf-ui/helper /var/log/csf-ui-audit.log
 
 ProtectHome=yes
 PrivateTmp=yes
@@ -78,15 +82,22 @@ RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6
 # iptables-legacy's getsockopt/setsockopt approach uses in the first
 # place - without it, socket() itself fails before csf's child ever
 # reaches the operation this whole unit exists to allow. CAP_DAC_READ_SEARCH:
-# the one this fix round's first pass missed entirely - /etc/csf is reset
+# the one fix round 1's own first pass missed entirely - /etc/csf is reset
 # to 0600 by lfd on every main-loop pass (lfd.pl:1187-1201, S13.3), and a
 # 0600 DIRECTORY has no execute/search bit for ANYONE, INCLUDING its own
 # root owner (S13.2's own demonstration) - reaching csf.conf/csf.deny at
 # all, not merely reading or writing them once reached, needs this
 # capability to bypass that missing search bit, on every single pass
 # through /etc/csf regardless of which of the three write paths above the
-# ReadWritePaths grant already covers.
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_DAC_READ_SEARCH
+# ReadWritePaths grant already covers. CAP_SYS_MODULE: fix round 2
+# (task-9-review.md, lower-priority findings) - `csf -r` calls modprobe
+# (csf.pl:5801) to load netfilter kernel modules that may not already be
+# built in or loaded, and modprobe is exec'd as this unit's own
+# descendant, inheriting its capability bounding set exactly the way
+# iptables/nft do (fix round 1's own C2 reasoning, one syscall class
+# over). Without it modprobe runs but cannot actually insert a module,
+# failing silently in exactly the shape this whole task exists to close.
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_DAC_READ_SEARCH CAP_SYS_MODULE
 
 # Narrowing beyond the mandatory csf-ui set this unit mirrors - each
 # still believed to touch nothing this service or its csf/iptables/nft
@@ -96,15 +107,29 @@ CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_DAC_READ_SEARCH
 # tightening or loosening any one of them knows it rests on documented
 # behaviour, not a measurement.
 #
-# SystemCallFilter's own `~@privileged` narrowing line, present in the
-# previous round, is REMOVED here rather than kept: review could not
-# rule out that one of its excluded syscalls (bpf, capset, mount, setns,
+# SystemCallFilter's own `~@privileged` narrowing line, present in an
+# earlier round, is REMOVED here rather than kept: review could not rule
+# out that one of its excluded syscalls (bpf, capset, mount, setns,
 # sysfs and the rest of that group) is reached somewhere in csf.pl's
 # ~250KB or in iptables/nft/ipset's own startup path, and "narrowest set
 # that still works" means WORKS wins the tie. @system-service alone is
 # still a real restriction (it excludes debugging, raw io port access,
-# kernel module and namespace syscalls entirely) - it is just not
-# narrowed a second time on a guess.
+# and namespace syscalls entirely) - it is just not narrowed a second
+# time on a guess.
+#
+# ProtectKernelModules and ProtectKernelTunables are REMOVED for the same
+# reason, fix round 2 (task-9-review.md, lower-priority findings):
+# ProtectKernelModules revokes CAP_SYS_MODULE from the effective set
+# regardless of CapabilityBoundingSet, defeating the grant just added
+# above and modprobe with it; ProtectKernelTunables mounts /proc/sys
+# (among other paths) read-only, and `csf -r` writes
+# /proc/sys/net/ipv4/ip_forward (csf.pl:3247, among others this task did
+# not exhaustively enumerate) - the same "grant the tree, do not guess
+# which of csf.pl's many sysctl writes matter" reasoning as /etc/csf and
+# /var/lib/csf above, except /proc/sys has no single well-known subtree
+# to grant back via ReadWritePaths the way those two do, so the
+# protection itself is removed rather than punched with holes of
+# uncertain completeness.
 AmbientCapabilities=
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
@@ -112,8 +137,6 @@ ProtectClock=yes
 ProtectControlGroups=yes
 ProtectHostname=yes
 ProtectKernelLogs=yes
-ProtectKernelModules=yes
-ProtectKernelTunables=yes
 RemoveIPC=yes
 RestrictNamespaces=yes
 RestrictRealtime=yes

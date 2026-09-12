@@ -23,7 +23,24 @@ ConditionPathExists=/etc/csf-ui/ui.conf
 [Service]
 Type=simple
 User=csfui
-Group=csfui
+
+# Fix round 2 (task-9-review.md R90): PRIMARY group is csf-ui-sock, not
+# csfui - RuntimeDirectory= (below) is owned by this unit's User/Group,
+# and reusing csfui for that ownership is what R90 found: a directory
+# 0750 csfui:csfui is untraversable by any front-server worker account,
+# and the ONLY thing that would have fixed that (fix round 1's own
+# grant_frontend_group()) was correctly removed for an unrelated reason
+# (R(I5): it targeted the wrong file for a premise that was false) -
+# taking away the one mechanism that also happened to cover this. csfui
+# stays available as a SUPPLEMENTARY group so this process can still read
+# what it owns via group bits (ui.conf, the TLS key in mode B) - a
+# process's own UID always satisfies an owner check regardless of its
+# group, but ui.conf and the mode-B key are owned by ROOT, not csfui, so
+# reaching them at all is a GROUP check this supplementary membership is
+# what satisfies.
+Group=csf-ui-sock
+SupplementaryGroups=csfui
+
 ExecStart=/usr/local/csf-ui/bin/csf-ui
 Restart=on-failure
 RestartSec=5
@@ -36,13 +53,20 @@ UMask=0077
 # socket, and a non-root user cannot create a file in a directory it does
 # not own or have write access to. RuntimeDirectory is systemd's own
 # mechanism for exactly this: it creates /run/csf-ui-web fresh before
-# every start, owned by this unit's User/Group, and it is compatible with
+# every start, owned by this unit's User/Group - csfui:csf-ui-sock, per
+# the fix round 2 change above - and it is compatible with
 # ProtectSystem=strict without needing a matching ReadWritePaths entry.
-# The socket's own mode (once something binds one there) is still that
-# code's responsibility to set explicitly, the same way ui-src/bin/
-# csf-ui-helper's own preflight() chmod()s its socket rather than trusting
-# UMask= - this directory being writable is necessary but not sufficient
-# for the front server to reach a socket inside it.
+#
+# Fix round 2 (R90): the directory's GROUP is now csf-ui-sock specifically
+# so a front-server worker can be added to that one group (setup_mode_a()
+# in install-webui.sh) to traverse it, without that grant also reaching
+# csfui's OTHER uses - ui.conf, the mode-B TLS key, or (via S2.3)
+# /var/run/csf-ui/helper.sock, none of which csf-ui-sock has anything to
+# do with. The socket's own mode (once something binds one there) is
+# still that code's responsibility to set explicitly, the same way
+# ui-src/bin/csf-ui-helper's own preflight() chmod()s its socket rather
+# than trusting UMask= - this directory being traversable is necessary
+# but not sufficient for the front server to reach a socket inside it.
 RuntimeDirectory=csf-ui-web
 RuntimeDirectoryMode=0750
 
