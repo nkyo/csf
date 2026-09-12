@@ -40,7 +40,7 @@ use lib "$FindBin::Bin/..", "$FindBin::Bin/../ui-src/lib";
 use File::Temp qw(tempdir);
 use Socket ();
 use Time::HiRes ();
-use Test::More tests => 254;
+use Test::More tests => 264;
 
 require_ok('ConfigServer::UI::HTTP');
 require_ok('ConfigServer::UI::Server');
@@ -593,6 +593,68 @@ sub _conf {
 	my $path = _conf(qq(UI_MODE="b"\nUI_ALOW="typo"\n));
 	my @problems = $S->can('preflight')->(ui_conf_path => $path);
 	ok((grep { /not a recognised key/ } @problems), 'and a malformed ui.conf\'s own problems are included');
+}
+{
+	# MODE A'S ONLY ENFORCED STARTUP GATE, REACHED THROUGH preflight()
+	# RATHER THAN CALLED DIRECTLY. Every other mode_a_preflight() test in
+	# this file calls that function itself, and the one preflight() mode-A
+	# case above hands it a GOOD directory - so replacing preflight()'s
+	# `push @problem, mode_a_preflight(...)` with `1;` left all 2866 tests
+	# green, and Mode A's startup gate could have been deleted invisibly.
+	# This is the case that notices: a mode-A ui.conf that is otherwise
+	# perfect, pointed at a directory that cannot work.
+	my $path = _conf(qq(UI_MODE="a"\nUI_ALLOW="10.0.0.0/8"\n));
+	my @problems = $S->can('preflight')->(
+		ui_conf_path => $path,
+		socket_path  => '/nonexistent-csf-ui-dir/csf-ui.sock',
+	);
+	ok((grep { /mode-A socket directory/ } @problems),
+		"preflight() actually runs mode_a_preflight() in mode A - Mode A's only enforced startup gate is wired in, not merely present");
+}
+{
+	# FIX ROUND 1, F10: A FILE CAN BE WRONG AND STILL SAY WHICH MODE IT IS.
+	# read_ui_conf() returns (undef, \@problems) on any failure, so
+	# preflight() read the mode as "b" whenever ANY key was wrong - and a
+	# mode-A host with one unrelated typo was then told to install
+	# IO::Socket::SSL (which mode A must never demand) and never told
+	# about its socket directory, which is the two-round diagnosis
+	# preflight()'s own comment claims to avoid.
+	#
+	# The typo is in a key that has nothing to do with either mode, so the
+	# only thing that can produce the right answer here is carrying
+	# UI_MODE out of the failed read.
+	my $path = _conf(qq(UI_MODE="a"\nUI_ALLOW="10.0.0.0/8"\nUI_CRYPT_ROUNDS="notanumber"\n));
+	my @problems = $S->can('preflight')->(
+		ui_conf_path => $path,
+		socket_path  => '/nonexistent-csf-ui-dir/csf-ui.sock',
+	);
+	ok((grep { /UI_CRYPT_ROUNDS/ } @problems), "F10: the file's own problem is reported");
+	ok((grep { /mode-A socket directory/ } @problems),
+		"F10: and so is the socket directory - a mode-A host with an unrelated typo still learns about its environment in the same round");
+	ok(!(grep { /IO::Socket::SSL/ } @problems),
+		'F10: and it is NOT told to install a TLS library, which is what a mode-A listener must never demand');
+}
+{
+	# The fallback is still mode B, and still for a reason: a file with no
+	# usable UI_MODE has no answer to give, and mode B's preconditions are
+	# no less right than mode A's for a host that has not said which it is.
+	my $path = _conf(qq(UI_MODE="x"\nUI_ALLOW="10.0.0.0/8"\n));
+	my @problems = $S->can('preflight')->(ui_conf_path => $path);
+	ok((grep { /IO::Socket::SSL/ } @problems),
+		'F10: a ui.conf whose UI_MODE is not a mode at all still falls back to mode B rather than to nothing');
+	my ($conf, $cproblems, $mode) = $S->can('read_ui_conf')->($path);
+	is($mode, undef, "F10: read_ui_conf() hands back no mode when the file did not write a valid one");
+}
+{
+	# The third return value itself, both ways round.
+	my $good = _conf(qq(UI_MODE="a"\nUI_ALLOW="10.0.0.0/8"\n));
+	my (undef, undef, $mode_good) = $S->can('read_ui_conf')->($good);
+	is($mode_good, 'a', 'F10: read_ui_conf() reports the mode a valid file wrote');
+	my $bad = _conf(qq(UI_MODE="a"\nUI_ALLOW="10.0.0.0/8"\nUI_SESSION_IDLE="0"\n));
+	my ($conf_bad, $problems_bad, $mode_bad) = $S->can('read_ui_conf')->($bad);
+	is($conf_bad, undef, 'F10: a file with a bad key still returns no config');
+	ok(scalar(@$problems_bad), 'F10: and still reports the problem');
+	is($mode_bad, 'a', 'F10: but the mode it wrote survives the refusal, which is the whole point');
 }
 
 ###############################################################################

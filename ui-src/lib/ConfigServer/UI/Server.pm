@@ -290,14 +290,28 @@ our $MAX_PASSWD_SCAN = 20000;
 ###############################################################################
 # ui.conf (docs/WEBUI-RPC.md section 10)
 #
-# read_ui_conf($path) -> (\%conf, \@problems)
+# read_ui_conf($path) -> (\%conf, \@problems, $mode_as_written)
 #
-# On success: (\%conf, []) with every one of the six keys present (defaults
-# already applied) and already validated - UI_ALLOW as a parsed arrayref of
-# ConfigServer::UI::Proto::ip_info() structures, ready for peer_allowed()
-# below, not as the raw string.
+# On success: (\%conf, [], $mode) with every one of the six keys present
+# (defaults already applied) and already validated - UI_ALLOW as a parsed
+# arrayref of ConfigServer::UI::Proto::ip_info() structures, ready for
+# peer_allowed() below, not as the raw string.
 #
-# On any problem at all: (undef, \@problems), one entry per problem found.
+# On any problem at all: (undef, \@problems, $mode_as_written), one entry
+# per problem found.
+#
+# THE THIRD RETURN VALUE EXISTS BECAUSE A FILE CAN BE WRONG AND STILL SAY
+# WHICH MODE IT IS (fix round 1, F10). It is UI_MODE exactly as the file
+# wrote it when the file wrote it validly ("a" or "b"), and undef
+# otherwise - including when UI_MODE is absent, misspelled, or set twice.
+# It is NOT a fourth copy of the mode: %conf's UI_MODE remains the only
+# value anything acts on when the file is sound, and this one exists only
+# so preflight() can pick the right set of PRECONDITIONS to report
+# alongside the problems, rather than defaulting to mode B's and telling a
+# mode-A host to install a TLS library it has no use for. Read from %raw,
+# before defaults, for the same reason UI_LISTEN's "present in mode A"
+# rule is: once anything has been substituted in, "what the file said" is
+# no longer recoverable.
 # Every rule in section 10 is enforced here, not only the four keys
 # (UI_MODE, UI_LISTEN, UI_PORT, UI_ALLOW) this task's row in section 12's
 # checklist names - this function is the one place ui.conf's file-level
@@ -346,7 +360,16 @@ sub read_ui_conf {
 		$raw{$key} = $value;
 	}
 	close $fh;
-	return (undef, \@problem) if @problem;
+
+	# What the file said about its own mode, usable even when the file is
+	# otherwise unusable. Duplicated UI_MODE lines never get here (the
+	# duplicate is a problem and $raw{UI_MODE} holds only the first), and
+	# a value that is not exactly "a" or "b" is no answer at all.
+	my $mode_as_written =
+		(defined $raw{UI_MODE} && ($raw{UI_MODE} eq 'a' || $raw{UI_MODE} eq 'b'))
+			? $raw{UI_MODE} : undef;
+
+	return (undef, \@problem, $mode_as_written) if @problem;
 
 	my %conf;
 
@@ -477,8 +500,8 @@ sub read_ui_conf {
 		push @problem, 'ui.conf: UI_SESSION_IDLE must not be greater than UI_SESSION_MAX';
 	}
 
-	return (undef, \@problem) if @problem;
-	return (\%conf, []);
+	return (undef, \@problem, $mode_as_written) if @problem;
+	return (\%conf, [], $mode_as_written);
 }
 
 ###############################################################################
@@ -529,15 +552,31 @@ sub preflight {
 	push @problem, 'this process must not run as root; it is the unprivileged half of the WebUI split and must run as the unprivileged web-tier user'
 		if $> == 0;
 
-	my ($conf, $problems) = read_ui_conf($ui_conf_path);
+	my ($conf, $problems, $mode_as_written) = read_ui_conf($ui_conf_path);
 	push @problem, @$problems if @$problems;
 
-	# An unreadable or invalid ui.conf has no mode, and the refusals above
-	# already say so. It is treated as mode B here only so that the
-	# IO::Socket::SSL problem is still reported alongside the config ones
-	# rather than withheld until the config is fixed and the process is
-	# started a second time.
-	my $mode = (!@$problems && $conf) ? $conf->{UI_MODE} : 'b';
+	# WHICH MODE'S PRECONDITIONS TO REPORT ALONGSIDE THE CONFIG PROBLEMS.
+	# The point of reporting any is that a file with problems should not
+	# have to be fixed and the process started a second time before the
+	# environment's own problems are even mentioned - the comment here
+	# used to say exactly that, and then got the mode wrong (fix round 1,
+	# F10): read_ui_conf() returns (undef, \@problems) on ANY failure, so
+	# a file whose UI_MODE parsed perfectly was treated as mode B the
+	# moment any OTHER key was wrong. Measured: a mode-A host with one
+	# unrelated typo was told to install IO::Socket::SSL - which this
+	# listener must never demand in mode A - and was never told about its
+	# socket directory at all, producing precisely the two-round diagnosis
+	# this paragraph claims to avoid.
+	#
+	# So the mode comes from what the FILE said, which read_ui_conf() now
+	# hands back even when it refuses. Mode B remains the fallback for the
+	# case where there genuinely is no answer - an unreadable file, a
+	# missing or misspelled UI_MODE - because that is the mode this file
+	# had when it was the only one, and because in that case neither set
+	# of preconditions is more right than the other.
+	my $mode = defined $mode_as_written ? $mode_as_written
+		: (!@$problems && $conf)        ? $conf->{UI_MODE}
+		:                                 'b';
 
 	if ($mode eq 'b') {
 		# The one dependency this task adds, and the one mode B refuses to
