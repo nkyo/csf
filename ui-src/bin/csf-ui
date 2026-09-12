@@ -1793,19 +1793,26 @@ sub _log_access {
 # packaging is the part that can see the systemd units it ships with.
 #
 # `require`, not a top-of-file `use` - reached only when this file is
-# executed directly, never when some other consumer (t/33-app.t, t/60-
-# screens.t, a possible future mode-A adapter) loads it purely for
-# dispatch(). None of those want Server.pm's TLS/accept-loop dependencies
-# pulled in as a cost of using this module as a library.
+# executed directly, never when some other consumer (t/33-app.t,
+# t/60-screens.t) loads it purely for dispatch(). None of those want
+# Server.pm's accept-loop dependencies pulled in as a cost of using this
+# module as a library.
 #
-# Mode selection is NOT decided here, deliberately. Server->run() reads
-# /etc/csf-ui/ui.conf itself (preflight(), read_ui_conf()) and refuses
-# loudly, naming the reason, for a missing or invalid ui.conf, a mode-A
-# UI_MODE (mode A has no listener of csf-ui's own for this process to
-# start - a front web server proxies to one instead; see this task's own
-# report for the gap that leaves open), or a missing IO::Socket::SSL -
-# all before anything binds. Re-deciding any of that here would just be a
-# second place for the two to disagree.
+# Mode selection is NOT decided here, deliberately, and this is the same
+# ExecStart in BOTH deployment modes. Server->run() reads
+# /etc/csf-ui/ui.conf itself (preflight(), read_ui_conf()) and picks its
+# own transport from UI_MODE: a TLS listener on UI_LISTEN:UI_PORT in mode
+# B, or the unix socket a front web server proxies to in mode A. It
+# refuses loudly, naming the reason, for a missing or invalid ui.conf, a
+# mode-A file that also sets UI_LISTEN (docs/WEBUI-RPC.md S10), a mode-B
+# start with no IO::Socket::SSL, or a mode-A start with no SO_PEERCRED or
+# no usable socket directory - all before anything binds.
+#
+# Re-deciding any of that here would just be a second place for the two
+# to disagree. (Until the mode-A listener landed, run() refused mode A
+# outright and this comment said so; that refusal WAS the statement that
+# mode A had no listener, and it is now a mode selection instead - see
+# ConfigServer::UI::Server's own header comment.)
 ###############################################################################
 unless (caller) {
 	require ConfigServer::UI::Server;

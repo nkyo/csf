@@ -68,8 +68,13 @@ UI_SRC="$DIST_DIR/.."
 # might join is exactly the R(I5) mistake fix round 1 already found and
 # removed once. csf-ui-sock exists for exactly one purpose: letting a
 # front server's worker traverse csf-ui.service's own RuntimeDirectory
-# (see csf-ui.service and setup_mode_a(), below) to reach the future
-# Mode A socket, and nothing else is ever gated by it.
+# (see csf-ui.service and setup_mode_a(), below) to reach the Mode A
+# socket ConfigServer::UI::Server binds inside it, and nothing else is
+# ever gated by it. That group is ALSO what the listener derives its
+# accepted-peer set from (Server.pm's unix_peer_uids(), which reads the
+# membership of whichever group owns the socket): a worker account this
+# function does not add is one the listener will refuse, so the grant
+# below and that check are two halves of one decision.
 ###############################################################################
 create_account() {
 	if ! getent group csfui >/dev/null 2>&1; then
@@ -299,7 +304,7 @@ grant_socket_group() {
 	for u in $candidates; do
 		if getent passwd "$u" >/dev/null 2>&1; then
 			usermod -aG csf-ui-sock "$u" 2>/dev/null \
-				&& echo "csf-ui: added '$u' to group csf-ui-sock (so $front can reach the future Mode A socket - this group gates nothing else)"
+				&& echo "csf-ui: added '$u' to group csf-ui-sock (so $front can reach the Mode A socket ConfigServer::UI::Server binds there - this group gates nothing else)"
 		fi
 	done
 }
