@@ -89,15 +89,8 @@ RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6
 # all, not merely reading or writing them once reached, needs this
 # capability to bypass that missing search bit, on every single pass
 # through /etc/csf regardless of which of the three write paths above the
-# ReadWritePaths grant already covers. CAP_SYS_MODULE: fix round 2
-# (task-9-review.md, lower-priority findings) - `csf -r` calls modprobe
-# (csf.pl:5801) to load netfilter kernel modules that may not already be
-# built in or loaded, and modprobe is exec'd as this unit's own
-# descendant, inheriting its capability bounding set exactly the way
-# iptables/nft do (fix round 1's own C2 reasoning, one syscall class
-# over). Without it modprobe runs but cannot actually insert a module,
-# failing silently in exactly the shape this whole task exists to close.
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_DAC_READ_SEARCH CAP_SYS_MODULE
+# ReadWritePaths grant already covers.
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_DAC_READ_SEARCH
 
 # Narrowing beyond the mandatory csf-ui set this unit mirrors - each
 # still believed to touch nothing this service or its csf/iptables/nft
@@ -117,19 +110,37 @@ CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_DAC_READ_SEARCH CAP_SYS_MODU
 # and namespace syscalls entirely) - it is just not narrowed a second
 # time on a guess.
 #
-# ProtectKernelModules and ProtectKernelTunables are REMOVED for the same
-# reason, fix round 2 (task-9-review.md, lower-priority findings):
-# ProtectKernelModules revokes CAP_SYS_MODULE from the effective set
-# regardless of CapabilityBoundingSet, defeating the grant just added
-# above and modprobe with it; ProtectKernelTunables mounts /proc/sys
-# (among other paths) read-only, and `csf -r` writes
-# /proc/sys/net/ipv4/ip_forward (csf.pl:3247, among others this task did
-# not exhaustively enumerate) - the same "grant the tree, do not guess
-# which of csf.pl's many sysctl writes matter" reasoning as /etc/csf and
-# /var/lib/csf above, except /proc/sys has no single well-known subtree
-# to grant back via ReadWritePaths the way those two do, so the
-# protection itself is removed rather than punched with holes of
-# uncertain completeness.
+# Fix round 3 (task-9-review.md R91): fix round 2 added CAP_SYS_MODULE
+# and removed ProtectKernelModules/ProtectKernelTunables for `csf -r`'s
+# modprobe call and its ip_forward sysctl write. REVERTED IN FULL,
+# because the trade was net negative once actually checked rather than
+# reasoned about:
+#   - the grant was inert. SystemCallFilter=@system-service is an
+#     ALLOW-list that does not include the @module syscall group, so
+#     finit_module/init_module are SIGSYS-killed regardless of any
+#     capability or of ProtectKernelModules - CAP_SYS_MODULE never did
+#     anything.
+#   - the helper never execs modprobe in the first place. Its only
+#     child, by grep, is /usr/sbin/csf (ui-src/bin/csf-ui-helper:1693);
+#     csf.pl itself discards modprobe's exit status by design
+#     (csf.pl:5627-5646), and half the legacy module names csf.pl calls
+#     modprobe for do not exist on modern kernels anyway. What actually
+#     loads netfilter modules is the kernel's own request_module()
+#     usermode helper, which runs outside this sandbox entirely.
+#   - the cost was real and worse than the benefit: ProtectSystem=strict
+#     EXEMPTS /proc and /sys (it only confines /usr, /boot and similar) -
+#     ProtectKernelTunables was the ONLY thing keeping them read-only
+#     here. Removing it opened /proc/sys/kernel/modprobe and
+#     /sys/kernel/uevent_helper - kernel-context execution paths that
+#     need no capability at all to abuse - to buy one conditional
+#     ip_forward write (csf.pl:3247) that was never confirmed to need
+#     the hole in the first place.
+# If csf.pl:3247's write is later shown to matter in practice, the fix
+# is a narrow ReadWritePaths=/proc/sys/net/ipv4/ip_forward addition,
+# MEASURED to work, not a second removal of either protection - neither
+# is touched again here absent that measurement.
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
 AmbientCapabilities=
 LockPersonality=yes
 MemoryDenyWriteExecute=yes

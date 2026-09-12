@@ -361,7 +361,16 @@ write_allow_include() {
 # the ones already frozen there.
 ###############################################################################
 write_ui_conf() {
-	mode=$1
+	# Fix round 3 (task-9-review.md, sibling check on the write_allow_include
+	# `out` collision fix round 2 found by actually running the code):
+	# ui_mode, not `mode` - interactive_setup() (the only caller, alongside
+	# setup_mode_a()/setup_mode_b() which pass a literal "a"/"b") has its
+	# own global named `mode` for the a/b choice it read from the operator.
+	# Both currently only ever get reassigned to a value already equal to
+	# what they held, so this was inert, not a live bug like out=$3 was -
+	# renamed anyway, on the same "every shared name is a latent version of
+	# that bug" reasoning fix round 2 recorded.
+	ui_mode=$1
 	port=$2
 	allow=$3
 
@@ -369,7 +378,7 @@ write_ui_conf() {
 	{
 		printf '# /etc/csf-ui/ui.conf - written by the csf installer, %s\n' "$(date '+%Y-%m-%d')"
 		printf '# docs/WEBUI-RPC.md S10 is the frozen grammar and key list.\n'
-		printf 'UI_MODE="%s"\n' "$mode"
+		printf 'UI_MODE="%s"\n' "$ui_mode"
 		printf 'UI_PORT="%s"\n' "$port"
 		printf 'UI_ALLOW="%s"\n' "$allow"
 	} > "$tmp"
@@ -447,7 +456,7 @@ validate_ui_allow() {
 }
 
 ###############################################################################
-# apache_missing_modules - fix round 2 (task-9-review.md R87/R88): "Stock
+# apache_check_modules - fix round 2 (task-9-review.md R87/R88): "Stock
 # Debian and Ubuntu ship mod_ssl, mod_proxy_http and mod_headers
 # DISABLED... your <IfModule>-wrapped vhost is wholly inert" and "your
 # <IfModule> fix turned a fatal error into a silent no-op". configtest
@@ -456,22 +465,21 @@ validate_ui_allow() {
 # loaded have to be checked directly, not inferred from configtest's exit
 # code.
 #
-# Attempts to enable them where a mechanism exists (a2enmod, Debian/
-# Ubuntu) before checking - re-running the installer after `apt install
-# apache2` should not require a second manual step for the common case.
-# RHEL-family hosts ship these modules enabled by default via
-# conf.modules.d and have no equivalent single command; this function
-# only checks for those, it does not try to fix them.
+# Fix round 3 (task-9-review.md R93): this used to also RUN `a2enmod`
+# itself, silently, before checking - "unannounced, and never reverted".
+# Enabling mod_ssl activates `Listen 443` through Debian's own
+# ports.conf regardless of anything this vhost does - a firewall
+# installer changing the operator's server exposure without asking is
+# exactly backwards. This function is now a PURE CHECK with no side
+# effects; enabling modules is a separate, explicit, asked-first step
+# (apache_enable_modules(), below), called only from setup_mode_a()
+# after the operator agrees.
 #
-# Prints the space-separated list of still-missing module names (empty
-# string if none) on stdout. Callers must not declare Mode A configured
-# while this is non-empty (R88).
+# Prints the space-separated list of missing module names (empty string
+# if none) on stdout. Callers must not declare Mode A configured while
+# this is non-empty (R88).
 ###############################################################################
-apache_missing_modules() {
-	if command -v a2enmod >/dev/null 2>&1; then
-		a2enmod ssl proxy proxy_http headers >/dev/null 2>&1
-	fi
-
+apache_check_modules() {
 	loaded=$( (apache2ctl -M 2>/dev/null || httpd -M 2>/dev/null || apachectl -M 2>/dev/null) )
 	missing=""
 	for mod in ssl_module proxy_http_module headers_module; do
@@ -484,13 +492,41 @@ apache_missing_modules() {
 }
 
 ###############################################################################
+# apache_enable_modules NAMES - the one place a2enmod is ever invoked
+# (fix round 3, R93). NAMES is a space-separated list of *_module names
+# with the _module suffix already stripped (a2enmod's own naming) - the
+# caller builds this from apache_check_modules()'s output and asks the
+# operator before this function is ever reached.
+###############################################################################
+apache_enable_modules() {
+	names=$1
+	command -v a2enmod >/dev/null 2>&1 || return 1
+	a2enmod $names >/dev/null 2>&1
+}
+
+###############################################################################
 # front_configtest FRONT - runs FRONT's own configuration validator
 # against the ACTIVE config (ours included, once written) and returns its
 # exit status, with combined stdout+stderr already printed by the caller
 # via command substitution. Returns 2, not 0 or 1, when no validator
-# binary can be found at all - fix round 2 (task-9-review.md R87): "when
-# it is unavailable, say that rather than assuming success" - a caller
-# must treat 2 as a refusal, the same as a real failure, never as a pass.
+# binary can be found for a platform EXPECTED to ship one - fix round 2
+# (task-9-review.md R87): "when it is unavailable, say that rather than
+# assuming success" - a caller must treat 2 as a refusal, the same as a
+# real failure, never as a pass.
+#
+# Fix round 3 (task-9-review.md R92): that rule, applied uniformly,
+# silently made Mode A impossible for LiteSpeed - it ships no
+# configuration-test command at all, ever, on any host, so the generic
+# "no validator found" fallthrough refused it every single time. R92:
+# "a rule that is correct in general still needs a path for the
+# platform that ships no validator... silently refusing a supported
+# platform is not [fine]." LiteSpeed gets its own explicit arm: it says
+# plainly that nothing here can verify the config, and returns 0 - not
+# because anything was checked, but because "unavailable" is LiteSpeed's
+# permanent, expected state rather than nginx/Apache's anomalous one,
+# and refusing over a permanent condition is not a refusal a re-run can
+# ever get past. setup_mode_a() prints the manual verification step this
+# implies.
 ###############################################################################
 front_configtest() {
 	front=$1
@@ -512,6 +548,10 @@ front_configtest() {
 				apachectl configtest 2>&1
 				return $?
 			fi
+			;;
+		litespeed)
+			echo "csf-ui: LiteSpeed ships no configuration-test command - proceeding without automated verification"
+			return 0
 			;;
 	esac
 	echo "csf-ui: no configuration validator found for $front"
@@ -662,6 +702,31 @@ setup_mode_a() {
 			;;
 	esac
 
+	# Fix round 3 (task-9-review.md R94): a BASELINE test, before this
+	# script writes anything at all. Without it, a pre-existing, wholly
+	# unrelated problem elsewhere in $front's config makes the POST-write
+	# test fail, this script deletes the vhost it just wrote (which was
+	# fine), and reports the failure as its own - a false diagnosis in
+	# exactly the direction that wastes the most time. LiteSpeed has no
+	# validator to baseline (R92, below) - there is nothing to compare
+	# against, so this is skipped there, not attempted and ignored.
+	if [ "$front" != "litespeed" ]; then
+		baseline_output=$(front_configtest "$front")
+		baseline_rc=$?
+		if [ "$baseline_rc" -eq 2 ]; then
+			echo "csf-ui: leaving the WebUI unconfigured."
+			return 1
+		fi
+		if [ "$baseline_rc" -ne 0 ]; then
+			echo "csf-ui: $front's EXISTING configuration already fails its own test - before"
+			echo "csf-ui: this installer changed anything:"
+			echo "$baseline_output" | sed 's/^/csf-ui:   /'
+			echo "csf-ui: fix that first. Refusing to add a vhost on top of a config that was"
+			echo "csf-ui: already broken, and refusing to blame this installer for it."
+			return 1
+		fi
+	fi
+
 	if [ ! -s /etc/csf-ui/ssl/cert.pem ] || [ ! -s /etc/csf-ui/ssl/key.pem ]; then
 		echo "csf-ui: /etc/csf-ui/ssl/cert.pem or key.pem is missing or empty"
 		echo "csf-ui: (csf-ui-cert.sh could not create one - see its own output above)"
@@ -687,45 +752,96 @@ setup_mode_a() {
 	# that guard is precisely what stops it being a config-breaking
 	# error, and precisely why it cannot also be asked whether the vhost
 	# actually does anything. Checked directly instead.
+	#
+	# Fix round 3 (R93): enabling a module is no longer silent or
+	# automatic. apache_check_modules() (renamed from
+	# apache_missing_modules(), now a pure check) used to run `a2enmod`
+	# itself, unannounced - enabling mod_ssl activates `Listen 443`
+	# through Debian's own ports.conf regardless of anything this vhost
+	# does, which changes the operator's server exposure without telling
+	# them. This asks first; a "no" or an unavailable a2enmod (RHEL-
+	# family) prints the exact command and refuses, rather than guessing
+	# what the operator would have wanted.
 	if [ "$front" = "apache" ]; then
-		still_missing=$(apache_missing_modules)
+		still_missing=$(apache_check_modules)
 		if [ -n "$still_missing" ]; then
 			enable_names=$(printf '%s' "$still_missing" | sed 's/_module//g')
 			echo "csf-ui: Apache module(s) not enabled: $still_missing"
-			echo "csf-ui: the vhost would be syntactically valid but INERT (docs/WEBUI-RPC.md"
-			echo "csf-ui: - a <IfModule> guard skips it rather than breaking your whole Apache"
-			echo "csf-ui: config, per task-9-review.md I6). Enable them"
-			echo "csf-ui:   a2enmod $enable_names && systemctl reload apache2"
-			echo "csf-ui: and re-run this installer, or run csf-ui-setup once they are enabled."
-			front_disable_vhost "$front" "$out"
-			return 1
+			echo "csf-ui: the vhost would be syntactically valid but INERT without them"
+			echo "csf-ui: (docs/WEBUI-RPC.md - a <IfModule> guard skips it rather than breaking"
+			echo "csf-ui: your whole Apache config, per task-9-review.md I6)."
+			echo "csf-ui: NOTE: enabling mod_ssl activates 'Listen 443' via Debian/Ubuntu's own"
+			echo "csf-ui: ports.conf - a change to this host's network exposure, independent of"
+			echo "csf-ui: anything this WebUI vhost does."
+			enabled_now=0
+			if command -v a2enmod >/dev/null 2>&1; then
+				printf 'csf-ui: enable them now (a2enmod %s)? [y/N] ' "$enable_names"
+				read -r reply
+				case "$reply" in
+					[Yy]*)
+						apache_enable_modules "$enable_names"
+						still_missing=$(apache_check_modules)
+						[ -z "$still_missing" ] && enabled_now=1
+						;;
+				esac
+			fi
+			if [ "$enabled_now" -ne 1 ]; then
+				echo "csf-ui: not enabling Apache modules without confirmation. Run this yourself"
+				echo "csf-ui: when ready, then re-run this installer or run csf-ui-setup:"
+				echo "csf-ui:   a2enmod $enable_names && systemctl reload apache2"
+				front_disable_vhost "$front" "$out"
+				return 1
+			fi
 		fi
 	fi
 
-	# Fix round 2 (R87): the front server's OWN validator, run against
-	# the file just written IN PLACE (and, for Apache, enabled) - not a
-	# private copy - because only the active tree tells the truth about
-	# whether the whole config (ours plus whatever else the host already
-	# has) is actually valid.
+	# Fix round 2 (R87), fix round 3 (R92): the front server's OWN
+	# validator, run against the file just written IN PLACE (and, for
+	# Apache, enabled) - not a private copy - because only the active
+	# tree tells the truth about whether the whole config (ours plus
+	# whatever else the host already has) is actually valid. The baseline
+	# above already confirmed $front's config was clean before this run
+	# (nginx/Apache only - see the baseline comment above for why
+	# LiteSpeed has none), so a failure here is attributable to this
+	# vhost, not blamed on it by assumption.
+	#
+	# front_configtest() itself now has an explicit litespeed arm (R92)
+	# that always returns 0 - not because anything was checked, but
+	# because "no validator" is LiteSpeed's permanent, expected state
+	# rather than nginx/Apache's anomalous one, so this call never
+	# refuses Mode A for it; the manual-verification steps below are how
+	# that gap actually gets closed, per platform, rather than by
+	# guessing at a test that does not exist.
 	test_output=$(front_configtest "$front")
 	test_rc=$?
 	if [ "$test_rc" -ne 0 ]; then
-		echo "csf-ui: $front's own configuration test failed - the WebUI vhost is NOT active:"
+		echo "csf-ui: $front's own configuration test failed after adding this vhost"
+		echo "csf-ui: (it passed before - see above) - the WebUI vhost is NOT active:"
 		echo "$test_output" | sed 's/^/csf-ui:   /'
 		front_disable_vhost "$front" "$out"
 		echo "csf-ui: removed the vhost and left the WebUI unconfigured. Fix the problem above and re-run."
 		return 1
 	fi
+	if [ "$front" = "litespeed" ]; then
+		verified_note="NOT automatically verified - see the manual step below"
+	else
+		verified_note="verified with its own configuration test"
+	fi
 
 	write_ui_conf a "$port" "$allow"
 	grant_socket_group "$front"
 
-	echo "csf-ui: $front vhost written to $out and verified with its own configuration test."
+	echo "csf-ui: $front vhost written to $out and $verified_note."
 	if [ "$front" = "litespeed" ]; then
-		echo "csf-ui: add a matching 'listener'/vhost-map entry in LiteSpeed's own"
-		echo "csf-ui: httpd_config.conf pointing at $out (its admin console can do this),"
-		echo "csf-ui: and set maxReqBodySize to 65536 on that same listener/map - it is"
-		echo "csf-ui: NOT set by $out itself (docs/WEBUI-RPC.md S3.1/S14.1's 65536-byte cap)."
+		echo "csf-ui: LiteSpeed ships no configuration-test command this installer can call -"
+		echo "csf-ui: MANUAL VERIFICATION IS REQUIRED before relying on this:"
+		echo "csf-ui:   1. add a matching 'listener'/vhost-map entry in LiteSpeed's own"
+		echo "csf-ui:      httpd_config.conf pointing at $out (its admin console can do this),"
+		echo "csf-ui:      and set maxReqBodySize to 65536 on that same listener/map - it is"
+		echo "csf-ui:      NOT set by $out itself (docs/WEBUI-RPC.md S3.1/S14.1's 65536-byte cap);"
+		echo "csf-ui:   2. use the WebAdmin console's own 'Graceful Restart' (or"
+		echo "csf-ui:      lswsctrl restart) and check its error log before trusting this -"
+		echo "csf-ui:      nothing here has confirmed $out actually parses."
 	fi
 
 	# Fix round 1 (task-9-review.md Important): say what actually happens

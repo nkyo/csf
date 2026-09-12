@@ -43,7 +43,7 @@ use FindBin ();
 use lib "$FindBin::Bin/..", "$FindBin::Bin/../ui-src/lib";
 
 use File::Temp qw(tempdir tempfile);
-use Test::More tests => 153;
+use Test::More tests => 164;
 
 my $DIST = "$FindBin::Bin/../ui-src/dist";
 my $RENDERER = "$DIST/render-template.sh";
@@ -205,8 +205,9 @@ like($csf_ui_helper, qr/^CapabilityBoundingSet=.*\bCAP_NET_RAW\b/m,
 	'csf-ui-helper.service: CapabilityBoundingSet grants CAP_NET_RAW (iptables-legacy raw socket creation)');
 like($csf_ui_helper, qr/^CapabilityBoundingSet=.*\bCAP_DAC_READ_SEARCH\b/m,
 	'csf-ui-helper.service: CapabilityBoundingSet grants CAP_DAC_READ_SEARCH (/etc/csf is a 0600 directory - S13.2)');
-# /usr/local/csf REMOVED as of fix round 2 (R89) - checked explicitly,
-# below, alongside CAP_SYS_MODULE and the two Protect* removals.
+# /usr/local/csf REMOVED as of fix round 2 (R89) and never restored -
+# checked explicitly below, alongside the R91 CapabilityBoundingSet/
+# Protect* assertions (fix round 3 inverted those, not this one).
 for my $tree (qw(/etc/csf /var/lib/csf /run)) {
 	like($csf_ui_helper, qr{^ReadWritePaths=.*\Q$tree\E}m,
 		"csf-ui-helper.service: ReadWritePaths includes $tree (csf.pl's own tree or /run/xtables.lock, not this task's)");
@@ -489,24 +490,93 @@ for my $installer (@SH_FILES) {
 	# R88: a missing Apache module must be caught directly - configtest
 	# alone cannot see it, because <IfModule> is what stops it being a
 	# fatal error in the first place.
-	like($install_webui, qr/^apache_missing_modules\s*\(\)/m,
-		'install-webui.sh: an apache_missing_modules() function exists');
-	like($install_webui, qr/a2enmod ssl proxy proxy_http headers/,
-		'install-webui.sh: apache_missing_modules() attempts to enable the needed modules first');
-	# Deliberately not just "the string apache_missing_modules appears
+	like($install_webui, qr/^apache_check_modules\s*\(\)/m,
+		'install-webui.sh: an apache_check_modules() function exists');
+	# Deliberately not just "the string apache_check_modules appears
 	# after setup_mode_a() {" - that regex still matches a call sitting
-	# behind a guard that can never be true (checked directly: replacing
-	# the condition below with `if false; then` left this assertion
-	# green while the real behaviour was gone). The exact guard shape is
-	# what has to survive.
+	# behind a guard that can never be true (checked directly, fix round
+	# 2: replacing the condition below with `if false; then` left this
+	# assertion green while the real behaviour was gone). The exact
+	# guard shape is what has to survive.
 	like($install_webui,
-		qr{if \[ "\$front" = "apache" \]; then\n\t\tstill_missing=\$\(apache_missing_modules\)},
+		qr{if \[ "\$front" = "apache" \]; then\n\t\tstill_missing=\$\(apache_check_modules\)},
 		'install-webui.sh: setup_mode_a() checks for still-missing modules specifically when $front is apache');
+
+	# R93: apache_check_modules() must be a PURE check - fix round 2's
+	# apache_missing_modules() silently ran a2enmod itself, unannounced,
+	# which activates 'Listen 443' via Debian's ports.conf regardless of
+	# anything this vhost does. Enabling a module is now a separate,
+	# named function, called only after an explicit y/N prompt.
+	{
+		# Anchored to apache_check_modules()'s OWN closing brace (its body
+		# never has a nested `{`), not a generic "the string a2enmod does
+		# not appear somewhere after this point" - the earlier, unanchored
+		# version matched past the closing brace into apache_enable_modules()
+		# (which legitimately does call a2enmod) and reported this function
+		# as still-silent when it was not.
+		$install_webui =~ /apache_check_modules\(\) \{([\s\S]*?)\n\}/
+			or die "could not extract apache_check_modules() body";
+		unlike($1, qr/a2enmod/,
+			'install-webui.sh: apache_check_modules() does NOT itself run a2enmod (R93 - no more silent module enabling)');
+	}
+	like($install_webui, qr/^apache_enable_modules\s*\(\)/m,
+		'install-webui.sh: a separate apache_enable_modules() function exists');
+	like($install_webui, qr/read -r reply/,
+		'install-webui.sh: setup_mode_a() asks before enabling any Apache module (R93)');
+	like($install_webui, qr/apache_enable_modules "\$enable_names"/,
+		'install-webui.sh: apache_enable_modules() is only called after the y/N prompt, inside its [Yy]* case arm');
+	like($install_webui, qr/activates 'Listen 443'/,
+		'install-webui.sh: the prompt names the actual exposure change (R93 - "ask first, or refuse and print the command")');
 
 	# R87: a certificate csf-ui-cert.sh failed to create must not be
 	# referenced by a rendered vhost.
 	like($install_webui, qr{\[ ! -s /etc/csf-ui/ssl/cert\.pem \]},
 		'install-webui.sh: setup_mode_a() checks the certificate exists before rendering a vhost that references it');
+
+	# Fix round 2 found write_allow_include()'s own `out=$3` colliding
+	# with setup_mode_a()'s own `$out` once a reorder moved the call
+	# after $out was set. Fix round 3's own sibling audit found one more
+	# inert instance: write_ui_conf()'s `mode` against interactive_setup()'s
+	# own `mode`. Both renamed; checked here so neither regresses back to
+	# a name shared with its caller.
+	like($install_webui, qr/^\tdest=\$3$/m,
+		"install-webui.sh: write_allow_include()'s third parameter is named dest, not out");
+	like($install_webui, qr/^\tui_mode=\$1$/m,
+		"install-webui.sh: write_ui_conf()'s first parameter is named ui_mode, not mode");
+
+	# R92: LiteSpeed ships no configuration-test command, ever - treating
+	# that identically to nginx/Apache's ANOMALOUS "no validator found"
+	# made Mode A permanently impossible for a supported platform.
+	# front_configtest() needs its own litespeed arm rather than falling
+	# through to the generic refusal.
+	{
+		# Anchored to front_configtest()'s OWN closing brace - the
+		# earlier, unanchored version of this assertion kept matching
+		# after the litespeed arm was deliberately deleted (to prove the
+		# guard-removal works), because "litespeed)" and "return 0" both
+		# also appear later in the file, inside setup_mode_a()'s own
+		# case statement. Extract the function body precisely instead.
+		$install_webui =~ /front_configtest\(\) \{([\s\S]*?)\n\}/
+			or die "could not extract front_configtest() body";
+		my $fn_body = $1;
+		like($fn_body, qr/litespeed\)[\s\S]*?return 0/,
+			'install-webui.sh: front_configtest() has an explicit litespeed arm that returns 0, not the generic "no validator" refusal (R92)');
+	}
+	like($install_webui, qr/MANUAL VERIFICATION IS REQUIRED/,
+		'install-webui.sh: setup_mode_a() prints an explicit manual-verification step for LiteSpeed (R92 - "a documented manual step is fine")');
+
+	# R94: a BASELINE test before this script writes anything, so a
+	# pre-existing, unrelated failure in $front's config is diagnosed as
+	# pre-existing rather than blamed on the vhost this run adds.
+	like($install_webui, qr/baseline_rc=\$\?/,
+		'install-webui.sh: setup_mode_a() captures a baseline configtest result before writing anything (R94)');
+	like($install_webui, qr/EXISTING configuration already fails its own test/,
+		'install-webui.sh: a pre-existing failure is reported as pre-existing, not as this vhost\'s fault (R94)');
+	# The baseline capture must come BEFORE the certificate check and
+	# the render - not merely exist somewhere in the function.
+	like($install_webui,
+		qr{baseline_output=\$\(front_configtest "\$front"\)[\s\S]*?\[ ! -s /etc/csf-ui/ssl/cert\.pem \][\s\S]*?render-template\.sh}s,
+		'install-webui.sh: the baseline test runs before the certificate check and before rendering, not after (R94)');
 
 	# R89: /usr/local/csf must not be a helper ReadWritePaths entry -
 	# nothing in S5 writes there, and it is where csfpre.sh/csfpost.sh
@@ -514,12 +584,23 @@ for my $installer (@SH_FILES) {
 	my $csf_ui_helper = slurp("$DIST/csf-ui-helper.service");
 	unlike($csf_ui_helper, qr{^ReadWritePaths=.*/usr/local/csf\b}m,
 		'csf-ui-helper.service: ReadWritePaths no longer includes /usr/local/csf (R89)');
-	like($csf_ui_helper, qr/^CapabilityBoundingSet=.*\bCAP_SYS_MODULE\b/m,
-		'csf-ui-helper.service: CapabilityBoundingSet grants CAP_SYS_MODULE (csf -r calls modprobe)');
-	unlike($csf_ui_helper, qr/^ProtectKernelModules=yes$/m,
-		'csf-ui-helper.service: ProtectKernelModules removed (would strip CAP_SYS_MODULE regardless of the grant above)');
-	unlike($csf_ui_helper, qr/^ProtectKernelTunables=yes$/m,
-		'csf-ui-helper.service: ProtectKernelTunables removed (csf -r writes /proc/sys/net/ipv4/ip_forward)');
+	# Fix round 3 (task-9-review.md R91): fix round 2's CAP_SYS_MODULE +
+	# ProtectKernelModules/ProtectKernelTunables removal was reverted in
+	# full - the grant was inert (SystemCallFilter=@system-service is an
+	# allow-list that excludes @module regardless of any capability), the
+	# helper never execs modprobe at all (only /usr/sbin/csf), and
+	# ProtectSystem=strict does not confine /proc or /sys on its own, so
+	# ProtectKernelTunables was the only thing keeping them read-only -
+	# removing it opened kernel-context execution paths
+	# (/proc/sys/kernel/modprobe, /sys/kernel/uevent_helper) that need no
+	# capability at all, to buy a write that was never confirmed to need
+	# the hole. These assertions are inverted from fix round 2's own.
+	unlike($csf_ui_helper, qr/^CapabilityBoundingSet=.*\bCAP_SYS_MODULE\b/m,
+		'csf-ui-helper.service: CapabilityBoundingSet does NOT grant CAP_SYS_MODULE (R91 - inert, reverted)');
+	like($csf_ui_helper, qr/^ProtectKernelModules=yes$/m,
+		'csf-ui-helper.service: ProtectKernelModules restored (R91)');
+	like($csf_ui_helper, qr/^ProtectKernelTunables=yes$/m,
+		'csf-ui-helper.service: ProtectKernelTunables restored (R91 - ProtectSystem=strict does not cover /proc or /sys on its own)');
 
 	# R90: the RuntimeDirectory must be traversable by a front-server
 	# worker WITHOUT reusing csfui (that reuse is exactly R(I5)/fix round
