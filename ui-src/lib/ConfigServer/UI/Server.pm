@@ -520,7 +520,18 @@ sub mode_a_preflight {
 	my $socket_path = $opt{socket_path} || $DEFAULT_UNIX_SOCKET_PATH;
 	my @problem;
 
-	unless (defined &Socket::SO_PEERCRED && defined &Socket::SOL_SOCKET) {
+	# have_peercred is injectable for one reason: on every platform this
+	# project supports the constants DO resolve (docs/WEBUI-RPC.md section
+	# 2.1 states it as verified fact, and section 11.7 raised the Perl
+	# floor to guarantee it), so the refusal below cannot be reached here
+	# by any real configuration - and an unreachable refusal is an
+	# unproven one. The detection itself is the two `defined &` checks;
+	# what the injection makes provable is that the refusal fires and says
+	# the right thing when the detection says no.
+	my $have_peercred = defined $opt{have_peercred}
+		? $opt{have_peercred}
+		: (defined &Socket::SO_PEERCRED && defined &Socket::SOL_SOCKET) ? 1 : 0;
+	unless ($have_peercred) {
 		push @problem, 'this Socket module does not provide SO_PEERCRED; mode A cannot identify the process at the other end of its unix socket and will not start without it (Perl 5.14 or later with Socket 1.94 or later is required - docs/WEBUI-RPC.md section 11.7)';
 	}
 
@@ -1177,7 +1188,7 @@ sub _open_unix_listener {
 	die "Server.pm: the mode-A socket path ($path) is too long for a unix socket address\n"
 		if length($path) > 100;
 
-	_unlink_stale_socket($path);
+	_unlink_stale_socket($path, self_uid => $opt{self_uid});
 
 	socket(my $listener, Socket::PF_UNIX(), Socket::SOCK_STREAM(), 0)
 		or die "Server.pm: socket(AF_UNIX): $!\n";
@@ -1221,15 +1232,24 @@ sub _open_unix_listener {
 # "owned by uid 0" becomes "owned by us". lstat, not stat, and -S on the
 # lstat buffer: a symlink at this path is refused rather than followed,
 # because following one would unlink whatever it pointed at.
+#
+# self_uid is injectable for the same reason mode_a_preflight()'s
+# have_peercred is: creating a file owned by a second account needs root,
+# which this project's test suite deliberately does not have, so the
+# ownership comparison would otherwise be a branch no test could ever
+# enter. The comparison is the guard; the injection only supplies the
+# other side of it.
 sub _unlink_stale_socket {
-	my ($path) = @_;
+	my ($path, %opt) = @_;
+	my $self_uid = defined $opt{self_uid} ? $opt{self_uid} + 0 : $> + 0;
+
 	my @st = lstat($path);
 	return 0 unless @st;
 
 	die "Server.pm: $path already exists and is not a socket; refusing to unlink it\n"
 		unless -S _;
-	die "Server.pm: the socket at $path is owned by uid $st[4], not by this process (uid $>); refusing to unlink it\n"
-		unless $st[4] == $>;
+	die "Server.pm: the socket at $path is owned by uid $st[4], not by this process (uid $self_uid); refusing to unlink it\n"
+		unless $st[4] == $self_uid;
 
 	unlink($path) or die "Server.pm: could not remove the stale socket at $path: $!\n";
 	return 1;

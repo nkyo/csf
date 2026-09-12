@@ -40,7 +40,7 @@ use lib "$FindBin::Bin/..", "$FindBin::Bin/../ui-src/lib";
 use File::Temp qw(tempdir);
 use Socket ();
 use Time::HiRes ();
-use Test::More tests => 229;
+use Test::More tests => 239;
 
 require_ok('ConfigServer::UI::HTTP');
 require_ok('ConfigServer::UI::Server');
@@ -1022,6 +1022,20 @@ sub _connect_unix {
 	my $error = _dies(sub { $S->can('_open_unix_listener')->($long) });
 	like($error, qr/too long/, 'a socket path too long for a sockaddr_un is refused rather than silently truncated');
 }
+{
+	# The ownership half of "never unlink an arbitrary path". Creating a
+	# file owned by a second account needs root, which this suite does not
+	# have, so the OTHER side of the comparison is supplied instead - the
+	# comparison itself is what is under test.
+	my $path = _sock_path();
+	my ($listener) = $S->can('_open_unix_listener')->($path);
+	close $listener;
+	my $error = _dies(sub { $S->can('_open_unix_listener')->($path, self_uid => $> + 1) });
+	like($error, qr/owned by uid \Q$>\E, not by this process/,
+		'a socket at the path owned by somebody else is refused, not unlinked');
+	ok(-S $path, 'and it is still there');
+	unlink $path;
+}
 
 ###############################################################################
 # mode_a_preflight() - the startup preconditions that are mode A's alone.
@@ -1032,6 +1046,19 @@ sub _connect_unix {
 {
 	my @problems = $S->can('mode_a_preflight')->(socket_path => "$SOCK_DIR/ok.sock");
 	is_deeply(\@problems, [], 'a directory this process owns, not writable by other, is accepted');
+}
+{
+	# SO_PEERCRED resolves on every platform this project supports
+	# (docs/WEBUI-RPC.md S2.1 states it as verified fact, S11.7 raised the
+	# Perl floor to guarantee it), so the refusal cannot be reached by any
+	# real configuration here - and an unreachable refusal is an unproven
+	# one. The detection is two `defined &` checks; what this proves is
+	# that the refusal fires, and says what to do, when the answer is no.
+	my @problems = $S->can('mode_a_preflight')->(
+		socket_path => "$SOCK_DIR/ok.sock", have_peercred => 0);
+	ok((grep { /SO_PEERCRED/ } @problems),
+		'requirement 5: without SO_PEERCRED mode A refuses to start - it is the only identity a unix socket carries');
+	ok((grep { /Socket 1\.94/ } @problems), 'and names the floor that provides it');
 }
 {
 	my @problems = $S->can('mode_a_preflight')->(socket_path => '/nonexistent-csf-ui-dir/csf-ui.sock');
@@ -1444,6 +1471,49 @@ sub _connect_unix {
 	cmp_ok($elapsed, '<', 5,
 		'and it fires on its OWN budget, not after a ten-second hang - nothing waits for dispatch() to finish');
 	close $far;
+}
+
+###############################################################################
+# run() ITSELF, for the first time in this suite.
+#
+# Its own header comment has said since Task 5 that run() is untested by
+# design, "because it needs a real listening socket, a real fork, and, in
+# production, a real TLS library this workspace does not have installed,
+# and it sits behind preflight(), which always refuses here for exactly
+# that last reason". Mode A removes the last of those: there is no TLS in
+# this process in mode A, preflight() therefore does not demand
+# IO::Socket::SSL, and run() can genuinely reach its own mode-A startup
+# path here.
+#
+# What is driven is the refusal, not the loop - a run() that got past this
+# point would block in accept() forever, which is why the accepted set is
+# injected rather than read off the host's real group database (where the
+# answer would depend on which accounts happen to share this test user's
+# primary group, and the test would hang on some hosts and pass on
+# others).
+###############################################################################
+{
+	my $directory = tempdir(CLEANUP => 1);
+	my $path = "$directory/csf-ui.sock";
+	my $conf_path = _conf(qq(UI_MODE="a"\nUI_ALLOW="10.0.0.0/8"\n));
+	my $server = $S->new(
+		app          => FakeApp->new,
+		ui_conf_path => $conf_path,
+		socket_path  => $path,
+		self_uid     => $> + 0,
+		peer_uids    => { $> + 0 => 1 }, # deliberately: nobody but us
+	);
+	my $rc;
+	my $stderr = _capture_stderr(sub { $rc = $server->run() });
+
+	is($rc, 1, 'run() refuses to start when no account but this one can reach the mode-A socket');
+	like($stderr, qr/no account other than this one/,
+		'the install whose front server was never granted the socket group is refused loudly, not left to 502 silently');
+	like($stderr, qr/grant_socket_group/, 'and the remedy is named');
+	ok(!-e $path, 'and the socket it bound to find out is removed again rather than left behind as a stale one');
+	is($server->{mode}, 'a', 'run() read the mode from ui.conf rather than from whatever the constructor was told');
+	is($server->{allow}, undef,
+		'requirement 4: and left UI_ALLOW unloaded in mode A - the front server enforces it, from the same value');
 }
 
 print "# KEEP: " . scalar(@KEEP) . " temp files held open for the duration of this run\n";
