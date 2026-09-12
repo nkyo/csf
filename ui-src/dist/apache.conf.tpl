@@ -90,9 +90,25 @@ Listen @@UI_PORT@@ https
 	# Fix round 1 (task-9-review.md Important): mod_headers is common but
 	# NOT guaranteed enabled, and RequestHeader is exactly the kind of
 	# unknown directive that is fatal to Apache's whole config, not just
-	# this vhost - guarded so a host without it gets this one header
-	# silently absent (RateLimit.pm then sees no X-Real-IP for this
-	# request) rather than Apache refusing to start at all.
+	# this vhost - guarded so a host without it loses this one header
+	# rather than having Apache refuse to start at all.
+	#
+	# WHAT LOSING IT COSTS, corrected once the mode-A listener existed to
+	# have an opinion: NOT "RateLimit.pm sees no X-Real-IP", which is what
+	# this comment used to say. ConfigServer::UI::Server refuses a mode-A
+	# request that carries no usable X-Real-IP with a 400 naming this
+	# header, because docs/WEBUI-RPC.md S14.1 makes `peer` mandatory and
+	# forbids a constant standing in for it - so on such a host the UI
+	# answers 400 to everything rather than rate-limiting every visitor as
+	# one bucket. That is the louder of the two failures and the right one,
+	# but it IS a hard failure, so it must not be reached by accident:
+	# install-webui.sh's own setup_mode_a() refuses to write this vhost at
+	# all while headers_module is missing and the operator declines to
+	# enable it. The one path that still reaches here without the module is
+	# a host whose Apache config does not parse for an unrelated reason
+	# (apache_check_modules()'s "could not ask", R97), where the installer
+	# deliberately proceeds and lets the real validator decide - and where
+	# the 400's own message is then the thing that says what to fix.
 	<IfModule mod_headers.c>
 		RequestHeader set X-Real-IP "%{REMOTE_ADDR}s"
 	</IfModule>
