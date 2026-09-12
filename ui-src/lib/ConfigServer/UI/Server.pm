@@ -850,12 +850,42 @@ sub peercred {
 # an account whose primary group is the socket's group. It is bounded
 # ($MAX_PASSWD_SCAN) because getpwent() over a directory-backed NSS is
 # not guaranteed to be either fast or finite, and a startup that hangs in
-# NSS is worse than one that refuses; the bound is only ever reached on a
-# host where the answer was already "no local account", and the refusal it
-# leads to names the remedy.
+# NSS is worse than one that refuses.
+#
+# THE BOUND IS REACHABLE WITH THE ANSWER STILL INSIDE IT, and this comment
+# used to claim the opposite - "the bound is only ever reached on a host
+# where the answer was already 'no local account'" (fix round 1, F9).
+# Demonstrated false: with the bound at 3 and the target account 26th of
+# 27, the function returned nothing, run() refused with "has no other
+# member", and the account WAS in the group. getpwent() returns NSS order,
+# which no caller chooses, and csf's market is shared hosting with account
+# counts well past any bound worth setting. So the bound stays - a hang in
+# NSS is still worse than a refusal - but truncation is now REPORTED
+# (the `report` out-parameter below), and run()'s refusal says outright
+# that the search stopped early rather than asserting a membership fact it
+# did not establish.
+#
+# THE `report` OUT-PARAMETER. %opt may carry report => \%hash, which is
+# filled in with what was actually consulted: the gid, whether a group
+# with it exists, its name, how many members its list named, whether the
+# passwd scan ran, and whether it was truncated. It exists because run()'s
+# startup refusal has to describe a set that has several distinct ways of
+# coming back empty, and a message that picks one of them and states it as
+# fact is worse than no message (F8). Nothing branches on it; it is
+# diagnosis only.
 ###############################################################################
 sub unix_peer_uids {
 	my ($gid, %opt) = @_;
+
+	my $report = ref($opt{report}) eq 'HASH' ? $opt{report} : {};
+	%$report = (
+		gid            => $gid,
+		group_found    => 0,
+		group_name     => undef,
+		members_named  => 0,
+		scan_ran       => 0,
+		scan_truncated => 0,
+	);
 
 	my $self_uid = defined $opt{self_uid} ? $opt{self_uid} : $> + 0;
 	my %uid = ($self_uid => 1);
@@ -866,9 +896,12 @@ sub unix_peer_uids {
 
 	my @group = $group_lookup->($gid);
 	if (@group) {
+		$report->{group_found} = 1;
+		$report->{group_name}  = $group[0];
 		my $members = defined $group[3] ? $group[3] : '';
 		for my $name (split(/\s+/, $members)) {
 			next unless length $name;
+			$report->{members_named}++;
 			my @passwd = $name_lookup->($name);
 			next unless @passwd && defined $passwd[2];
 			$uid{ $passwd[2] + 0 } = 1;
@@ -880,22 +913,41 @@ sub unix_peer_uids {
 	return \%uid if grep { $_ != $self_uid } keys %uid;
 
 	my $passwd_scan = $opt{passwd_scan} || \&_primary_group_members;
-	for my $found ($passwd_scan->($gid)) {
+	$report->{scan_ran} = 1;
+	for my $found ($passwd_scan->($gid, report => $report)) {
 		$uid{ $found + 0 } = 1;
 	}
 	return \%uid;
 }
 
+# EXACTLY $MAX_PASSWD_SCAN ENTRIES ARE CONSIDERED, and this used to be
+# $MAX_PASSWD_SCAN + 1 fetched with the last one thrown away (F9: `last if
+# ++$seen > $MAX_PASSWD_SCAN` tests the bound after the read that already
+# happened). The read is now inside the bound and the bound is the loop
+# condition, so the count in the log and the count actually examined are
+# the same number.
+#
+# ONE probe past the bound, whose only purpose is to say so. Truncation
+# cannot be detected without knowing whether there was more, and the
+# alternative - reporting truncation whenever the bound was merely
+# reached - would put "the search stopped early" in run()'s refusal on
+# every host whose passwd database happens to be exactly $MAX_PASSWD_SCAN
+# long. That probe's result is used for nothing else.
 sub _primary_group_members {
-	my ($gid) = @_;
+	my ($gid, %opt) = @_;
+	my $report = ref($opt{report}) eq 'HASH' ? $opt{report} : {};
 	my @uid;
 	my $seen = 0;
 	setpwent();
-	while (my @passwd = getpwent()) {
-		last if ++$seen > $MAX_PASSWD_SCAN;
+	while ($seen < $MAX_PASSWD_SCAN) {
+		my @passwd = getpwent();
+		last unless @passwd;
+		$seen++;
 		next unless defined $passwd[3] && $passwd[3] == $gid;
 		push @uid, $passwd[2];
 	}
+	$report->{scanned} = $seen;
+	$report->{scan_truncated} = ($seen >= $MAX_PASSWD_SCAN && scalar(getpwent())) ? 1 : 0;
 	endpwent();
 	return @uid;
 }
@@ -1498,6 +1550,88 @@ sub _refuse_peer {
 }
 
 ###############################################################################
+# _no_local_peer_message($self, $report) -> $text - fix round 1, F8.
+#
+# run() refuses to start when nothing but this process can reach the mode-A
+# socket, and the refusal used to be one sentence for a condition that has
+# several distinct causes:
+#
+#   "no account other than this one can reach the mode-A socket: group
+#    1000, which owns it, has no other member."
+#
+# Three things wrong with it, all of them the same kind of wrong - it
+# asserted what the code had not established:
+#
+#   * it printed a numeric GID where it told the operator to add an account
+#     to a GROUP. unix_peer_uids() had already called getgrgid() and had
+#     the name in its hand; `usermod -aG 1000` is not the command anybody
+#     runs, and on a host where the gid and the name disagree with the
+#     operator's expectation the number is the least useful half.
+#   * it said "has no other member" from a set that can come back empty in
+#     at least four distinct ways: the group has genuinely no other member;
+#     no group with that gid exists at all; the passwd scan stopped at its
+#     bound before reaching an account that IS in the group (F9); or the
+#     set was handed to this process directly and no group was ever
+#     consulted.
+#   * measured on that last path: with peer_uids injected it printed "has
+#     no other member" although getgrgid() was never called, and
+#     socket_gid is undef there, so it read "group (unknown), which owns
+#     it".
+#
+# So the message is now assembled from what was actually consulted, and
+# each cause names its own remedy. The report comes from
+# unix_peer_uids()'s `report` out-parameter; an absent one means
+# unix_peer_uids() never ran, which is exactly the injected-set case.
+###############################################################################
+sub _no_local_peer_message {
+	my ($self, $report) = @_;
+	my $lead = 'no account other than this one can reach the mode-A socket: ';
+	my $remedy = " Add the front web server's worker account to that group"
+		. " (the installer's own grant_socket_group() does this) and start again.";
+
+	unless (ref($report) eq 'HASH' && exists $report->{gid}) {
+		return $lead
+			. 'the accepted set this process was given names only its own account.'
+			. ' That set was supplied directly rather than derived from the group that owns'
+			. " the socket, so no group on this host was consulted and there is nothing"
+			. ' this process can name as the thing to change.';
+	}
+
+	unless (defined $report->{gid}) {
+		return $lead
+			. 'the group that owns the socket could not be determined, so no account could be'
+			. ' derived from it. This normally means the socket was not created by this process'
+			. " (csf-ui.service's Group= is what decides that group).";
+	}
+
+	my $gid = $report->{gid};
+	unless ($report->{group_found}) {
+		return $lead
+			. "gid $gid owns the socket, but no group with that gid exists on this host, so its"
+			. ' membership could not be read at all. Create that group, or correct'
+			. " csf-ui.service's Group=, and add the front web server's worker account to it.";
+	}
+
+	my $name = defined $report->{group_name} ? $report->{group_name} : '(unnamed)';
+	my $text = $lead . "$name (gid $gid), the group that owns it, names no member other than"
+		. ' this account';
+	if ($report->{scan_truncated}) {
+		# The one case where the refusal must NOT be stated as a fact about
+		# the group: the search that would have found a primary-gid member
+		# stopped before the end of the account database (F9).
+		$text .= ", and the search for an account with $name as its PRIMARY group stopped after"
+			. " the first $MAX_PASSWD_SCAN entries of the local account database without"
+			. ' reaching the end - so such an account may exist and simply was not found.'
+			. " Check with `getent passwd | awk -F: '\$4 == $gid'` before changing anything.";
+		return $text;
+	}
+	if ($report->{scan_ran}) {
+		$text .= ", and no local account has $name as its primary group either";
+	}
+	return $text . '.' . $remedy;
+}
+
+###############################################################################
 # _log_drop($self, $kind, $why) - fix round 1, F2.
 #
 # THE TWO SILENT PATHS IN THE ACCEPT LOOP, AND WHY THEY WERE THE WRONG TWO
@@ -1817,7 +1951,13 @@ sub run {
 		# watchdog_exit and listener already follow in this file, and
 		# reachable from the same one place (a test; ui-src/bin/csf-ui
 		# passes nothing but `app`).
-		$self->{peer_uids} = unix_peer_uids($self->{socket_gid}, self_uid => $self->{self_uid})
+		# %peer_report records what was actually consulted to build the
+		# set, so the refusal below can describe the cause rather than
+		# assert one (F8). An injected set leaves it empty, which is
+		# itself the honest answer: nothing was consulted.
+		my %peer_report;
+		$self->{peer_uids} = unix_peer_uids($self->{socket_gid},
+				self_uid => $self->{self_uid}, report => \%peer_report)
 			unless ref($self->{peer_uids}) eq 'HASH';
 
 		# A socket nothing but this process can reach is a mode-A install
@@ -1827,11 +1967,8 @@ sub run {
 		# instead, naming the remedy, rather than accept connections that
 		# can only ever be refused one at a time.
 		unless (grep { $_ != $self->{self_uid} } keys %{ $self->{peer_uids} }) {
-			my $group = defined $self->{socket_gid} ? $self->{socket_gid} : '(unknown)';
 			print STDERR "csf-ui (Server.pm) refuses to start:\n";
-			print STDERR "  - no account other than this one can reach the mode-A socket: group $group,"
-				. " which owns it, has no other member. Add the front web server's worker account to that group"
-				. " (the installer's own grant_socket_group() does this) and start again.\n";
+			print STDERR '  - ' . $self->_no_local_peer_message(\%peer_report) . "\n";
 			close $listener;
 			unlink($unix_path) if defined $unix_path;
 			return 1;

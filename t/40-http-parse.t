@@ -40,7 +40,7 @@ use lib "$FindBin::Bin/..", "$FindBin::Bin/../ui-src/lib";
 use File::Temp qw(tempdir);
 use Socket ();
 use Time::HiRes ();
-use Test::More tests => 264;
+use Test::More tests => 287;
 
 require_ok('ConfigServer::UI::HTTP');
 require_ok('ConfigServer::UI::Server');
@@ -1289,6 +1289,152 @@ sub _connect_unix {
 }
 
 ###############################################################################
+# FIX ROUND 1, F4: WAY 2 IS NOT REDUNDANT, and the host that settles it.
+#
+# The round-1 review argued way 2 ($gid == socket_gid) is redundant because
+# "a non-root account whose primary gid is the socket group is admitted by
+# the kernel's group bit anyway". That conflates two gates: passing the
+# kernel's group-bit check gets a process to connect(), it does not put its
+# uid in the accepted set this module derives.
+#
+# Measured on a purpose-built host (Debian, real groupadd/useradd, real
+# NSS, recorded in CHANGES.md): group csf-ui-sock gid 4242 with frontweb
+# (uid 3001) as a SUPPLEMENTARY member and primaryguy (uid 3002) with 4242
+# as its PRIMARY group. getgrgid(4242) returned members [frontweb] - the
+# primary-gid account appears in no member list, structurally. And because
+# the member list produced a non-self uid, the getpwent() fallback never
+# ran, so the derived set was {csfui, frontweb} and primaryguy was absent
+# from it. Way 2 is then the only thing that admits it: with way 2 present
+# a real connect() from primaryguy over a real socket was served 200; with
+# way 2 removed and nothing else changed, the same connect() was refused
+# with "uid 3002 ... is not an account that may reach it" - a message that
+# would also have been wrong, since primaryguy IS in that group.
+#
+# That host is reconstructed here as injected lookups, which is the part
+# this suite can carry: it cannot create accounts, and the real-account
+# measurement is the record above.
+###############################################################################
+{
+	my %report;
+	my $set = $S->can('unix_peer_uids')->(4242,
+		self_uid     => 3000,
+		# one supplementary member, exactly as getgrgid() reports it
+		group_lookup => sub { return ('csf-ui-sock', '', 4242, 'frontweb') },
+		name_lookup  => sub { return ('frontweb', '', 3001, 3001) },
+		passwd_scan  => sub { die "the passwd scan must not run when the member list found somebody\n" },
+		report       => \%report,
+	);
+	is_deeply([sort { $a <=> $b } keys %$set], [3000, 3001],
+		'F4: the derived set names the supplementary member and this process, and nothing else');
+	ok(!$set->{3002},
+		'F4: the account whose PRIMARY group is the socket group is absent from it - no member list can name such an account, and the fallback scan never ran');
+	is($report{scan_ran}, 0, 'F4: because the member list had already produced somebody');
+
+	my $server = $S->new(app => FakeApp->new, mode => 'a',
+		self_uid => 3000, socket_gid => 4242, peer_uids => $set);
+	ok($server->peer_uid_allowed(3002, 4242),
+		'F4: and way 2 is the only thing that admits it - a reachable, non-root effect, so way 2 stays');
+	my $no_way_2 = $S->new(app => FakeApp->new, mode => 'a',
+		self_uid => 3000, socket_gid => undef, peer_uids => $set);
+	ok(!$no_way_2->peer_uid_allowed(3002, 4242),
+		'F4: without it the same account is refused, which is what "redundant" would have to mean and does not');
+	ok($server->peer_uid_allowed(0, 4242),
+		'F4: way 2 also admits root after one setegid to the socket group - true, and CHANGES.md now says so instead of the opposite');
+}
+
+###############################################################################
+# FIX ROUND 1, F9: THE PASSWD SCAN'S BOUND IS REACHABLE WITH THE ANSWER
+# STILL INSIDE IT, and truncation is now reported instead of silent.
+#
+# The comment on $MAX_PASSWD_SCAN claimed "the bound is only ever reached
+# on a host where the answer was already 'no local account'". Demonstrated
+# false: with the bound at 3 and the target account 26th of 27, the
+# function returned nothing, and run() then refused with "has no other
+# member" while the account WAS in the group. getpwent() returns NSS order,
+# which no caller chooses, and csf's market is shared hosting.
+#
+# Driven against the REAL passwd database, with only the bound localised -
+# any host has more than one account, so "stopped at one entry with more to
+# come" is a fact about every host this can run on.
+###############################################################################
+{
+	my %report;
+	{
+		local $ConfigServer::UI::Server::MAX_PASSWD_SCAN = 1;
+		$S->can('_primary_group_members')->(-12345, report => \%report);
+	}
+	is($report{scanned}, 1,
+		'F9: exactly $MAX_PASSWD_SCAN entries are considered - the bound is the loop condition, not a test applied after a read that already happened');
+	is($report{scan_truncated}, 1,
+		'F9: and truncation is REPORTED, so a refusal built on this cannot state a membership fact the scan never established');
+}
+{
+	my %report;
+	{
+		local $ConfigServer::UI::Server::MAX_PASSWD_SCAN = 1000000;
+		$S->can('_primary_group_members')->(-12345, report => \%report);
+	}
+	is($report{scan_truncated}, 0,
+		'F9: a scan that reached the end of the account database does not claim to have been truncated');
+	cmp_ok($report{scanned}, '>', 0, 'F9: and it did read the database');
+}
+
+###############################################################################
+# FIX ROUND 1, F8: THE STARTUP REFUSAL SAYS WHAT WAS ACTUALLY ESTABLISHED.
+#
+# One sentence used to cover a condition with at least four distinct
+# causes, printing a numeric gid where it told the operator to add an
+# account to a group, and asserting "has no other member" on paths where
+# no group had been looked up at all. Each cause now names itself and its
+# own remedy.
+###############################################################################
+{
+	my $server = $S->new(app => FakeApp->new, mode => 'a', self_uid => 1000);
+
+	my $named = $server->_no_local_peer_message({
+		gid => 4242, group_found => 1, group_name => 'csf-ui-sock',
+		members_named => 0, scan_ran => 1, scan_truncated => 0,
+	});
+	# Pinned as the NAME-then-gid pair, not merely "the name appears
+	# somewhere": the name also turns up later in the sentence about
+	# primary groups, so a looser match would stay green with the
+	# identification itself back to a bare number.
+	like($named, qr/\bcsf-ui-sock \(gid 4242\), the group that owns it/,
+		"F8: the thing that owns the socket is identified by NAME first - what the operator has to type - with the gid beside it, where the message used to print the bare number");
+	like($named, qr/grant_socket_group/, 'F8: and the remedy is still named');
+	like($named, qr/primary group/, 'F8: and it says the primary-group search also came back empty, which on this path it did');
+
+	my $truncated = $server->_no_local_peer_message({
+		gid => 4242, group_found => 1, group_name => 'csf-ui-sock',
+		members_named => 0, scan_ran => 1, scan_truncated => 1,
+	});
+	like($truncated, qr/stopped after/,
+		'F8/F9: a truncated scan says so rather than asserting that no such account exists');
+	like($truncated, qr/getent passwd/, 'F8/F9: and names the command that would answer the question properly');
+	unlike($truncated, qr/no local account has/,
+		'F8/F9: and does not also claim the thing it just said it could not check');
+
+	my $no_group = $server->_no_local_peer_message({
+		gid => 4242, group_found => 0, group_name => undef,
+		members_named => 0, scan_ran => 1, scan_truncated => 0,
+	});
+	like($no_group, qr/no group with that gid exists/,
+		'F8: a gid with no group behind it is its own cause, not "the group has no other member"');
+	like($no_group, qr/Group=/, 'F8: and points at the unit setting that decides it');
+
+	my $no_gid = $server->_no_local_peer_message({
+		gid => undef, group_found => 0, group_name => undef,
+		members_named => 0, scan_ran => 0, scan_truncated => 0,
+	});
+	like($no_gid, qr/could not be determined/, 'F8: and so is a socket whose group could not be determined at all');
+	unlike($no_gid, qr/\(unknown\)/, 'F8: which no longer reads as if "(unknown)" were a group name');
+
+	my $injected = $server->_no_local_peer_message({});
+	like($injected, qr/supplied directly rather than derived/,
+		'F8: and a set handed to this process says so, rather than describing a group nothing consulted');
+}
+
+###############################################################################
 # admit_peer() - requirement 3. The mode-B allowlist check is REPLACED at
 # the same point in run()'s sequence, not dropped and deferred to
 # something later; and requirement 4, UI_ALLOW is not consulted in mode A.
@@ -1760,7 +1906,16 @@ sub _connect_unix {
 	is($rc, 1, 'run() refuses to start when no account but this one can reach the mode-A socket');
 	like($stderr, qr/no account other than this one/,
 		'the install whose front server was never granted the socket group is refused loudly, not left to 502 silently');
-	like($stderr, qr/grant_socket_group/, 'and the remedy is named');
+	# F8: this case injects peer_uids, so unix_peer_uids() never ran, no
+	# group was looked up, and the refusal must NOT claim a membership
+	# fact about one. It used to print "group (unknown), which owns it,
+	# has no other member" here - three assertions the code had not made.
+	like($stderr, qr/supplied directly rather than derived/,
+		'F8: and says which of the several ways the set can be empty this one actually was');
+	unlike($stderr, qr/has no other member|names no member other than/,
+		'F8: rather than asserting a membership fact from a group it never consulted');
+	unlike($stderr, qr/\(unknown\)/,
+		'F8: and without printing "(unknown)" as if it were the name of a group');
 	ok(!-e $path, 'and the socket it bound to find out is removed again rather than left behind as a stale one');
 	is($server->{mode}, 'a', 'run() read the mode from ui.conf rather than from whatever the constructor was told');
 	is($server->{allow}, undef,
