@@ -190,14 +190,40 @@ sub read_ui_conf {
 
 	# UI_LISTEN - a literal address only (Socket::inet_pton - never a
 	# hostname, never a DNS lookup at startup, per G3), default 127.0.0.1.
-	my $listen_text = defined $raw{UI_LISTEN} ? $raw{UI_LISTEN} : '127.0.0.1';
-	my $listen_family = ($listen_text =~ /:/) ? Socket::AF_INET6() : Socket::AF_INET();
-	my $listen_packed = eval { Socket::inet_pton($listen_family, $listen_text) };
-	unless (defined $listen_packed) {
-		push @problem, 'ui.conf: UI_LISTEN must be a literal IPv4 or IPv6 address, not a hostname';
+	#
+	# Section 10's "refuses to start when" column carries TWO rules for
+	# this key, not one: "mode B and the value is unparsable", AND "mode A
+	# and it is present" - "in mode A csf-ui listens on a unix socket and a
+	# listen address means the config contradicts itself". Only the first
+	# was ever implemented. The second needs something the default above
+	# would hide: once '127.0.0.1' has been substituted in, a file that
+	# SET UI_LISTEN="127.0.0.1" and a file that never mentioned the key at
+	# all produce an identical %conf, so "present" has to be read from
+	# %raw - before any default - and can never be inferred afterwards.
+	# exists, not defined: section 10's own last rule is that "defaults
+	# apply only to keys that are absent - an empty string is a value", so
+	# UI_LISTEN="" in mode A is present, and contradicts, like any other
+	# value.
+	#
+	# The refusal does not depend on whether the address would parse. An
+	# unparsable address in mode A is first of all an address in a mode
+	# that has none; answering "must be a literal IPv4 or IPv6 address"
+	# would send the reader off to correct the wrong half of the problem
+	# and leave the contradiction in place once they had.
+	my $mode_is_a = (defined $conf{UI_MODE} && $conf{UI_MODE} eq 'a') ? 1 : 0;
+	if ($mode_is_a && exists $raw{UI_LISTEN}) {
+		push @problem, 'ui.conf: UI_LISTEN must not be set when UI_MODE is "a"; in mode A csf-ui listens on a unix socket that a front web server proxies to, and a listen address means the file contradicts itself';
 	}
 	else {
-		$conf{UI_LISTEN} = $listen_text;
+		my $listen_text = defined $raw{UI_LISTEN} ? $raw{UI_LISTEN} : '127.0.0.1';
+		my $listen_family = ($listen_text =~ /:/) ? Socket::AF_INET6() : Socket::AF_INET();
+		my $listen_packed = eval { Socket::inet_pton($listen_family, $listen_text) };
+		unless (defined $listen_packed) {
+			push @problem, 'ui.conf: UI_LISTEN must be a literal IPv4 or IPv6 address, not a hostname';
+		}
+		else {
+			$conf{UI_LISTEN} = $listen_text;
+		}
 	}
 
 	# UI_PORT - 1024-65535 (csfui can never bind below 1024), default 8443.

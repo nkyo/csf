@@ -40,7 +40,7 @@ use lib "$FindBin::Bin/..", "$FindBin::Bin/../ui-src/lib";
 use File::Temp qw(tempdir);
 use Socket ();
 use Time::HiRes ();
-use Test::More tests => 130;
+use Test::More tests => 144;
 
 require_ok('ConfigServer::UI::HTTP');
 require_ok('ConfigServer::UI::Server');
@@ -466,6 +466,65 @@ sub _conf {
 	my ($conf, $problems) = $S->can('read_ui_conf')->('/nonexistent/path/ui.conf');
 	is($conf, undef, 'a ui.conf that cannot be opened at all refuses, rather than defaulting to something');
 	ok(scalar(@$problems) >= 1, 'with a problem explaining why');
+}
+
+###############################################################################
+# read_ui_conf() - docs/WEBUI-RPC.md section 10's SECOND rule for UI_LISTEN,
+# "mode A and it is present", which had no code at all until the mode-A
+# listener landed. The trap this set exists to catch is that UI_LISTEN has
+# a default, so by the time %conf is built a file that set it to the
+# default and a file that never mentioned it are the same hash: presence
+# has to be read from the raw file, with exists (not defined, and not
+# "differs from the default"), or the rule silently does nothing for the
+# files most likely to carry it.
+###############################################################################
+{
+	my $path = _conf(qq(UI_MODE="a"\nUI_LISTEN="192.0.2.10"\nUI_ALLOW="10.0.0.0/8"\n));
+	my ($conf, $problems) = $S->can('read_ui_conf')->($path);
+	is($conf, undef, 'mode A with UI_LISTEN set refuses to start');
+	ok((grep { /UI_LISTEN/ && /contradicts/ } @$problems),
+		'and says the file contradicts itself, naming UI_LISTEN');
+	ok(!(grep { /must be a literal IPv4/ } @$problems),
+		'and does not ALSO complain about the address itself - the address is not the problem');
+}
+{
+	# The sharpest case: the value IS the default. If presence were read
+	# from %conf rather than from the raw file, this file would be
+	# indistinguishable from one that omitted the key and would sail
+	# straight through - which is exactly what section 10's own "defaults
+	# apply only to keys that are absent" rule forbids.
+	my $path = _conf(qq(UI_MODE="a"\nUI_LISTEN="127.0.0.1"\nUI_ALLOW="10.0.0.0/8"\n));
+	my ($conf, $problems) = $S->can('read_ui_conf')->($path);
+	is($conf, undef, 'UI_LISTEN set to exactly its own default still counts as present in mode A');
+	ok((grep { /UI_LISTEN/ } @$problems), 'and is refused by name');
+}
+{
+	# Same rule, the other way an "empty means absent" reading would break
+	# it: section 10 is explicit that an empty string is a value.
+	my $path = _conf(qq(UI_MODE="a"\nUI_LISTEN=""\nUI_ALLOW="10.0.0.0/8"\n));
+	my ($conf, $problems) = $S->can('read_ui_conf')->($path);
+	is($conf, undef, 'mode A with an EMPTY UI_LISTEN refuses too - an empty string is a value, not an absence');
+	ok((grep { /UI_LISTEN/ } @$problems), 'naming UI_LISTEN');
+}
+{
+	my $path = _conf(qq(UI_MODE="a"\nUI_LISTEN="not-an-address"\nUI_ALLOW="10.0.0.0/8"\n));
+	my ($conf, $problems) = $S->can('read_ui_conf')->($path);
+	is($conf, undef, 'mode A with an unparsable UI_LISTEN refuses');
+	ok((grep { /contradicts/ } @$problems),
+		'for the contradiction, not for the syntax - correcting the syntax would not correct the file');
+}
+{
+	my $path = _conf(qq(UI_MODE="a"\nUI_ALLOW="10.0.0.0/8"\n));
+	my ($conf, $problems) = $S->can('read_ui_conf')->($path);
+	is_deeply($problems, [], 'mode A with UI_LISTEN absent is the normal, valid case');
+	is($conf->{UI_MODE}, 'a', 'and mode A is a mode read_ui_conf accepts');
+	is($conf->{UI_LISTEN}, '127.0.0.1', 'the default is still applied, and is simply never used in mode A');
+}
+{
+	my $path = _conf(qq(UI_MODE="b"\nUI_LISTEN="127.0.0.1"\nUI_ALLOW="10.0.0.0/8"\n));
+	my ($conf, $problems) = $S->can('read_ui_conf')->($path);
+	is_deeply($problems, [], 'mode B with UI_LISTEN set is untouched by the new rule');
+	is($conf->{UI_LISTEN}, '127.0.0.1', 'still round-tripping the value it was given');
 }
 
 ###############################################################################
