@@ -126,6 +126,7 @@ package ConfigServer::UI::Server;
 use strict;
 use warnings;
 
+use Fcntl ();
 use Socket ();
 use POSIX ();
 use Time::HiRes ();
@@ -1468,12 +1469,25 @@ sub _open_unix_listener {
 # lstat buffer: a symlink at this path is refused rather than followed,
 # because following one would unlink whatever it pointed at.
 #
-# self_uid is injectable for the same reason mode_a_preflight()'s
-# have_peercred is: creating a file owned by a second account needs root,
-# which this project's test suite deliberately does not have, so the
-# ownership comparison would otherwise be a branch no test could ever
-# enter. The comparison is the guard; the injection only supplies the
-# other side of it.
+# AND "STALE" NOW MEANS STALE (fix round 1, F14). The two checks above ask
+# "is this a socket" and "is it ours" and the word in the function's name
+# asks a third question they do not: is anybody LISTENING on it. Measured
+# without it: starting a second daemon on the same path left TWO alive -
+# the second serving every request, the first permanently orphaned, still
+# holding a listening socket nothing can reach, its own child cap and its
+# own file descriptors, with no EADDRINUSE anywhere and no way for it to
+# notice or exit. csf-ui.service prevents this by being a single unit; a
+# hand-rolled start, a second unit, or a non-systemd host does not.
+#
+# The probe is a non-blocking connect(), which is the only thing that
+# actually answers the question - a socket file says nothing about whether
+# a process is behind it. Non-blocking rather than plain: connect() to a
+# live unix socket whose backlog is full would otherwise block here, in
+# startup, waiting on the very daemon we are about to decide the fate of.
+#
+# FAIL CLOSED ON "CANNOT TELL". A refusal names its remedy and costs one
+# manual `rm`; guessing wrong in the other direction orphans a running
+# daemon silently, which is the thing being fixed.
 sub _unlink_stale_socket {
 	my ($path, %opt) = @_;
 	my $self_uid = defined $opt{self_uid} ? $opt{self_uid} + 0 : $> + 0;
@@ -1486,8 +1500,51 @@ sub _unlink_stale_socket {
 	die "Server.pm: the socket at $path is owned by uid $st[4], not by this process (uid $self_uid); refusing to unlink it\n"
 		unless $st[4] == $self_uid;
 
+	my $live = defined $opt{socket_is_live}
+		? $opt{socket_is_live}->($path)
+		: _socket_is_live($path);
+	if (!defined $live) {
+		die "Server.pm: could not determine whether anything is listening on $path ($!);"
+			. " refusing to unlink it. Remove it by hand once you have confirmed no csf-ui is running.\n";
+	}
+	if ($live) {
+		die "Server.pm: something is already listening on $path; refusing to unlink it."
+			. " Another csf-ui is running (systemctl status csf-ui) - unlinking its socket would"
+			. " leave that process alive and unreachable, holding its connection slots and file"
+			. " descriptors with no way to notice or exit. Stop it instead of starting a second one.\n";
+	}
+
 	unlink($path) or die "Server.pm: could not remove the stale socket at $path: $!\n";
 	return 1;
+}
+
+# 1 = something is listening, 0 = nothing is, undef = could not tell (and
+# $! is left set for the caller's message). socket_is_live is injectable
+# above for the same reason self_uid is: the "could not tell" arm needs a
+# connect() that fails with something other than ECONNREFUSED, which no
+# test can arrange on a path it owns.
+sub _socket_is_live {
+	my ($path) = @_;
+	socket(my $probe, Socket::PF_UNIX(), Socket::SOCK_STREAM(), 0) or return undef;
+
+	# Non-blocking, so a live socket with a full backlog answers the
+	# question instead of blocking startup on it.
+	my $flags = fcntl($probe, Fcntl::F_GETFL(), 0);
+	fcntl($probe, Fcntl::F_SETFL(), $flags | Fcntl::O_NONBLOCK()) if defined $flags;
+
+	my $connected = connect($probe, Socket::pack_sockaddr_un($path));
+	my $errno = $!;
+	close $probe;
+
+	return 1 if $connected;
+	# ECONNREFUSED is the answer for a socket file with no listener behind
+	# it - the actual stale case. ENOENT means it went away between the
+	# lstat above and here, which is also "nothing is listening".
+	return 0 if $errno == POSIX::ECONNREFUSED() || $errno == POSIX::ENOENT();
+	# A full backlog on a LIVE socket. Still a listener.
+	return 1 if $errno == POSIX::EAGAIN() || $errno == POSIX::EINPROGRESS();
+	$! = $errno;
+	return undef;
 }
 
 ###############################################################################

@@ -38,9 +38,10 @@ use FindBin ();
 use lib "$FindBin::Bin/..", "$FindBin::Bin/../ui-src/lib";
 
 use File::Temp qw(tempdir);
+use Fcntl ();
 use Socket ();
 use Time::HiRes ();
-use Test::More tests => 310;
+use Test::More tests => 322;
 
 require_ok('ConfigServer::UI::HTTP');
 require_ok('ConfigServer::UI::Server');
@@ -1047,18 +1048,25 @@ sub _connect_unix {
 		'requirement 2: read as an IPv4 sockaddr, a unix one still produces undef - which is what run() used to close on');
 }
 {
-	# A stale socket across a restart: bind() to an existing path is
-	# EADDRINUSE, not an overwrite. systemd normally removes the
-	# RuntimeDirectory on stop, but that is a property of one unit file,
-	# not of this code.
+	# A GENUINELY stale socket across a restart: bind() to an existing
+	# path is EADDRINUSE, not an overwrite, so the file left behind by a
+	# process that is gone has to be removed first. systemd normally
+	# removes the RuntimeDirectory on stop, but that is a property of one
+	# unit file, not of this code.
+	#
+	# "Gone" is now part of the setup rather than assumed: the first
+	# listener is CLOSED before the second start. Until fix round 1 (F14)
+	# this case left it open, and passed - which was the bug, not the
+	# test.
 	my $path = _sock_path();
 	my ($first) = $S->can('_open_unix_listener')->($path);
 	ok(-S $path, 'a first listener binds');
+	close $first; # the process that owned it is gone; only the file remains
 
 	my ($second, $second_gid);
 	my $error = '';
 	unless (eval { ($second, $second_gid) = $S->can('_open_unix_listener')->($path); 1 }) { $error = $@ }
-	is($error, '', 'a second start over the stale socket succeeds rather than dying with EADDRINUSE');
+	is($error, '', 'a second start over a genuinely stale socket succeeds rather than dying with EADDRINUSE');
 	ok(defined $second, 'and produces a working listener');
 
 	# Proven by which listener the connection actually lands on, not by
@@ -1067,7 +1075,92 @@ sub _connect_unix {
 	my $paddr = accept(my $connection, $second);
 	ok(defined $paddr, 'a connection to the path reaches the SECOND listener, so the path was genuinely rebound');
 
-	close $connection; close $client; close $first; close $second;
+	close $connection; close $client; close $second;
+	unlink $path;
+}
+{
+	# FIX ROUND 1, F14: "STALE" HAS TO MEAN STALE.
+	#
+	# _unlink_stale_socket() asked "is this a socket" and "is it ours" and
+	# not the third question its own name asks. Measured without the fix:
+	# starting a second daemon on the same path left TWO alive - the
+	# second serving every request, the first permanently orphaned, still
+	# holding a listening socket nothing can reach, its own child cap and
+	# its own descriptors, with no EADDRINUSE anywhere and no way to
+	# notice or exit.
+	#
+	# The first listener is left OPEN here, which is the whole point, and
+	# is checked to still be the one behind the path afterwards - "it
+	# refused" would also be true of a version that had unlinked the
+	# socket and then failed for some other reason.
+	my $path = _sock_path();
+	my ($live) = $S->can('_open_unix_listener')->($path);
+	my $error = _dies(sub { $S->can('_open_unix_listener')->($path) });
+	like($error, qr/something is already listening/,
+		'F14: a socket with a live listener behind it is refused, not unlinked and rebound over');
+	like($error, qr/systemctl status csf-ui/, 'F14: and the refusal names how to find the process that holds it');
+	ok(-S $path, 'F14: the socket is still there');
+
+	my $client = _connect_unix($path);
+	my $paddr = accept(my $connection, $live);
+	ok(defined $paddr,
+		'F14: and still reaches the FIRST listener - the running daemon was not orphaned behind a path that no longer names it');
+	close $connection; close $client; close $live;
+	unlink $path;
+}
+{
+	# The "cannot tell" arm, which fails closed. No test can make
+	# connect() fail with anything but ECONNREFUSED on a path this process
+	# owns, so the probe is injected - the decision it feeds is the guard.
+	my $path = _sock_path();
+	my ($listener) = $S->can('_open_unix_listener')->($path);
+	close $listener;
+	my $error = _dies(sub {
+		$S->can('_unlink_stale_socket')->($path, socket_is_live => sub { $! = 13; return undef });
+	});
+	like($error, qr/could not determine whether anything is listening/,
+		'F14: a probe that cannot answer refuses to unlink rather than guessing');
+	like($error, qr/Remove it by hand/, 'F14: and says what the operator can safely do instead');
+	ok(-S $path, 'F14: leaving the socket in place, because guessing wrong here orphans a live daemon');
+	unlink $path;
+}
+{
+	# And the probe itself, both answers, against real sockets.
+	my $path = _sock_path();
+	my ($listener) = $S->can('_open_unix_listener')->($path);
+	is($S->can('_socket_is_live')->($path), 1, 'F14: the probe reports a listening socket as live');
+	close $listener;
+	is($S->can('_socket_is_live')->($path), 0,
+		'F14: and a socket file whose listener is gone as not live - ECONNREFUSED is the stale case');
+	unlink $path;
+	is($S->can('_socket_is_live')->($path), 0, 'F14: a path that is not there at all is not live either');
+}
+{
+	# A LIVE socket whose backlog is FULL. This is the case the plain
+	# blocking connect() the probe does not use would have hung startup
+	# on, and the case a probe that read EAGAIN as "stale" would answer
+	# exactly backwards - unlinking the socket of a daemon that is not
+	# merely alive but busy.
+	my $path = _sock_path();
+	my ($listener) = $S->can('_open_unix_listener')->($path, backlog => 1);
+	# NON-BLOCKING connects: _connect_unix() above is blocking and would
+	# hang here the moment the backlog filled, which is the same hang the
+	# probe itself avoids by not using a blocking connect.
+	my @pending;
+	for (1 .. 6) {
+		socket(my $client, Socket::PF_UNIX(), Socket::SOCK_STREAM(), 0) or die "socket: $!";
+		my $flags = fcntl($client, Fcntl::F_GETFL(), 0);
+		fcntl($client, Fcntl::F_SETFL(), $flags | Fcntl::O_NONBLOCK()) if defined $flags;
+		connect($client, Socket::pack_sockaddr_un($path));
+		push @pending, $client;
+	}
+	is($S->can('_socket_is_live')->($path), 1,
+		'F14: a live socket whose backlog is full is still live - EAGAIN is not ECONNREFUSED');
+	my $error = _dies(sub { $S->can('_open_unix_listener')->($path) });
+	like($error, qr/something is already listening/,
+		'F14: and a busy daemon is refused over rather than unlinked out from under');
+	close $_ for grep { defined } @pending;
+	close $listener;
 	unlink $path;
 }
 {
