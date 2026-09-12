@@ -223,6 +223,20 @@ our $DEFAULT_HANDSHAKE_TIMEOUT = 10;
 #     unconditionally whenever the helper is merely slow, which is the
 #     failure this whole block exists to stop being one commit away.
 #
+#     AND THE THREE IS NOW COUNTED RATHER THAN ASSERTED (fix round 2,
+#     R108). t/40-http-parse.t derives the real maximum from
+#     ui-src/bin/csf-ui - it attributes every `->{client}->call(` site to
+#     the sub that encloses it and takes the largest per-sub count - and
+#     compares it to this constant twice: the budget must price the code
+#     (max <= this), and this constant must keep exactly the one-call
+#     headroom the paragraph above claims for it (this == max + 1). The
+#     second is the one that fires on the FOURTH call rather than waiting
+#     for the fifth, and it names the sub that grew. It also refuses a
+#     call site inside a LOOP, which counting sites cannot price at all.
+#     Before that, the only check was `>= 3` with the 3 written out by
+#     hand in the test - a restatement of this comment, not a check of
+#     it, while Task 10 and Task 11 are both places new routes land.
+#
 # WHAT THIS IS NOT. It is not a deadline over dispatch() - there is still
 # exactly one alarm over the request phase, and a route that hangs forever
 # is still killed, now at the sum below instead of at 35s. Giving

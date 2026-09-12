@@ -41,7 +41,7 @@ use File::Temp qw(tempdir);
 use Fcntl ();
 use Socket ();
 use Time::HiRes ();
-use Test::More tests => 324;
+use Test::More tests => 328;
 
 require_ok('ConfigServer::UI::HTTP');
 require_ok('ConfigServer::UI::Server');
@@ -2108,8 +2108,107 @@ sub _connect_unix {
 	is($default->{dispatch_timeout},
 		$ConfigServer::UI::Client::DEFAULT_TIMEOUT * $ConfigServer::UI::Server::MAX_HELPER_CALLS_PER_REQUEST,
 		"F1: and the default dispatch term is derived from ConfigServer::UI::Client's own per-call timeout, not copied from it");
-	cmp_ok($ConfigServer::UI::Server::MAX_HELPER_CALLS_PER_REQUEST, '>=', 3,
-		'F1: with room for the three sequential helper calls _route_ui_overview actually makes');
+}
+
+###############################################################################
+# $MAX_HELPER_CALLS_PER_REQUEST AGAINST THE CODE IT PRICES (fix round 2,
+# R108).
+#
+# The constant is the worst-case number of SEQUENTIAL helper calls one
+# route makes, and the dispatch term of the request budget is that number
+# times ConfigServer::UI::Client's own per-call timeout. Until now the
+# only assertion on it was `>= 3` with the 3 written out by hand - which
+# is a restatement of the comment, not a check of it. Nothing compared the
+# constant to ui-src/bin/csf-ui, so a fifth sequential call landing on any
+# route would have reintroduced F1's failure (an administrator getting no
+# response at all, because the watchdog fired mid-dispatch) at a bigger
+# constant, silently. Task 10 and Task 11 are both places new routes land.
+#
+# So the real maximum is DERIVED from the shipped file. The scan tracks
+# brace depth to attribute each `->{client}->call(` site to the `sub` that
+# encloses it; the depth returning to zero at EOF is asserted first,
+# because brace counting is a heuristic and a count taken from an
+# unbalanced scan is not evidence of anything.
+#
+# TWO relations, and they fail at different moments on purpose:
+#
+#   * the budget must PRICE the code: max <= the constant. This is the
+#     load-bearing one - it is what stops the watchdog firing inside a
+#     legitimate dispatch().
+#   * the constant must keep the ONE-CALL HEADROOM its own comment in
+#     Server.pm claims for it ("four here on purpose: a fourth call added
+#     to that route would otherwise make it unserviceable unconditionally
+#     whenever the helper is merely slow"). So constant == max + 1, which
+#     reddens on the FOURTH call rather than waiting for the fifth, and
+#     names the sub that grew. Bumping the constant is then a deliberate
+#     act, and one that has to be taken together with the front-server
+#     timeout t/80-templates.t pins to the same budget (R106).
+#
+# AND NO SITE MAY BE INSIDE A LOOP. A call in a loop cannot be priced by
+# counting sites at all - the count would say one where the run-time
+# answer is "as many as the list is long" - so that case is refused here
+# rather than silently mis-priced. None exists today (verified: 12 sites
+# across 10 subs, every one of them straight-line).
+###############################################################################
+sub _helper_call_sites {
+	my ($path) = @_;
+	open(my $fh, '<', $path) or die "cannot read $path: $!";
+	my @stack;            # one frame per open brace: which sub it belongs to, and whether a loop opened it
+	my $depth = 0;
+	my (%count, %in_loop, %site);
+	my $line_number = 0;
+	while (my $line = <$fh>) {
+		$line_number++;
+		my $sub_here  = ($line =~ /^\s*sub\s+([A-Za-z_]\w*)/) ? $1 : undef;
+		my $loop_here = ($line =~ /(?:^|[\s;{()])(?:for|foreach|while|until|map|grep)\b/) ? 1 : 0;
+		my $calls = 0;
+		$calls++ while $line =~ /->\{client\}->call\(/g;
+		if ($calls) {
+			my $name = (@stack && defined $stack[-1]{sub}) ? $stack[-1]{sub} : '(file scope)';
+			$count{$name} += $calls;
+			push @{ $site{$name} }, $line_number;
+			$in_loop{$name} = 1 if $loop_here || grep { $_->{loop} } @stack;
+		}
+		for my $char (split //, $line) {
+			if ($char eq '{') {
+				push @stack, {
+					sub  => (defined $sub_here ? $sub_here : (@stack ? $stack[-1]{sub} : undef)),
+					loop => $loop_here,
+				};
+				$sub_here  = undef; # only the first brace on the line opens the sub
+				$loop_here = 0;
+				$depth++;
+			}
+			elsif ($char eq '}') { pop @stack; $depth--; }
+		}
+	}
+	close $fh;
+	return { count => \%count, in_loop => \%in_loop, site => \%site, depth => $depth };
+}
+{
+	my $app_path = "$FindBin::Bin/../ui-src/bin/csf-ui";
+	my $scan = _helper_call_sites($app_path);
+	is($scan->{depth}, 0,
+		'R108: the brace scan of ui-src/bin/csf-ui balances - a count taken from an unbalanced scan would not be evidence of anything');
+
+	my @by_count = sort { $scan->{count}{$b} <=> $scan->{count}{$a} || $a cmp $b }
+		keys %{ $scan->{count} };
+	my $worst = @by_count ? $by_count[0] : '(none found)';
+	my $max   = @by_count ? $scan->{count}{$worst} : 0;
+	my $where = @by_count ? join(', ', @{ $scan->{site}{$worst} }) : '-';
+	my @looped = sort keys %{ $scan->{in_loop} };
+
+	cmp_ok($max, '>', 0,
+		'R108: the scan finds the helper calls at all - a scan that found none would pass every relation below vacuously');
+	is(scalar(@looped), 0,
+		"R108: no helper call sits inside a loop, so counting call sites prices them correctly (in a loop: @{[ @looped ? join(', ', @looped) : 'none' ]})");
+
+	no warnings 'once'; # $MAX_HELPER_CALLS_PER_REQUEST is read here and in the block above
+	my $constant = $ConfigServer::UI::Server::MAX_HELPER_CALLS_PER_REQUEST;
+	cmp_ok($max, '<=', $constant,
+		"R108: the request budget prices every sequential helper call the code makes - worst route is $worst with $max (lines $where), \$MAX_HELPER_CALLS_PER_REQUEST is $constant");
+	is($constant, $max + 1,
+		"R108: and keeps the deliberate one-call headroom Server.pm's own comment claims over the $max sequential calls $worst makes (lines $where) - a further call on any route has to move the constant, the request budget AND the front-server timeout t/80-templates.t pins to it, together and on purpose");
 }
 
 ###############################################################################
