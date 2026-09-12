@@ -1,6 +1,8 @@
 # WebUI RPC contract and threat model
 
-**Status: frozen 2026-09-11.** Binding spec: `docs/WEBUI-PLAN.md`. Implementation
+**Status: frozen 2026-09-11; amended 2026-09-13 under ruling R103** — four
+amendments, each recording a decision the mode A listener had already made and
+measured, listed in §11.10. Binding spec: `docs/WEBUI-PLAN.md`. Implementation
 plan: `docs/superpowers/plans/webui-implementation.md`.
 
 This document is the interface between the unprivileged web tier (`csf-ui`, user
@@ -20,6 +22,7 @@ becomes a wide one.
 |---|---|
 | know what the privilege split does and does not buy | §1 |
 | implement the socket and the peer check | §2 |
+| know who may connect to `csf-ui`'s own socket in mode A | §2.4 |
 | implement the framing and errors | §3 |
 | implement a validator | §4 |
 | implement or call an operation | §5 |
@@ -32,6 +35,7 @@ becomes a wide one.
 | know what a later task owes this document | §12 |
 | know why the UI does not live under /etc/csf | §13 |
 | implement the request Task 5 must hand `csf-ui`, or read it in `csf-ui` | §14 |
+| set the front web server's read timeout | §14.5 |
 
 ---
 
@@ -151,6 +155,11 @@ validators in §4 are strict, positive-match grammars and not blocklists.
 | Concurrency | one forked child per connection, hard cap 16 (§7) |
 | Requests per connection | exactly one (§3.1) |
 
+Every row above is the **helper's** socket, and §§2.1–2.2 are the helper's own
+preconditions and peer rule. In mode A `csf-ui` also binds a socket of its own, for
+the front web server rather than for the helper: its paths are §2.3's two
+`/run/csf-ui-web` rows, and its peer rule — which is **not** §2.2's — is §2.4.
+
 ### 2.1 Startup preconditions — all fail closed
 
 The helper refuses to start, with a message naming the failure, if any of these
@@ -236,6 +245,8 @@ G7.
 | `/var/run/csf-ui/` | **`0755 root:root`** — it must be traversable by `csfui` or the socket is unreachable | helper | `csfui` traverses it |
 | `/var/run/csf-ui/helper.sock` | `0660 root:csfui` (§2) | helper | `csf-ui` |
 | `/var/run/csf-ui/rate.state` | `0600 root:root` | helper (§7) | helper |
+| `/run/csf-ui-web/` — **mode A only** | `0750 csfui:csf-ui-sock` — traversable by the socket's group, and **never writable by group or other** | created by `csf-ui.service`'s `RuntimeDirectory=csf-ui-web` before `ExecStart` runs | `csf-ui` binds inside it; the front web server's worker account traverses it |
+| `/run/csf-ui-web/csf-ui.sock` — **mode A only** | `0660 csfui:csf-ui-sock` — the mode is set explicitly and read back, never inherited from `UMask=` | bound by `csf-ui` | the front web server's worker account (§2.4) |
 | `/var/log/csf-ui-audit.log` | `0640 root:root` | **the helper** — what actually ran | root |
 | `/var/log/csf-ui-access.log` | `0640 csfui:csfui` | **`csf-ui`** — who asked for it | root, `csfui` |
 
@@ -245,11 +256,170 @@ Note the pattern each time a directory and its contents both appear: the
 owner (§13.2). Getting this backwards is the single easiest way to ship a UI that
 cannot start, with no useful error.
 
+**The two `/run/csf-ui-web` rows are mode A's transport, and they are frozen here
+for the same reason the rest of this table is.** In mode A `csf-ui` binds no port:
+that socket is the whole of the path between the front web server and `csf-ui`, and
+the group that owns it is that path's entire access control (§2.4). It is **not**
+under `/var/run/csf-ui/`, because that directory is `0755 root:root` and frozen that
+way for the helper's own root-owned socket (§2.1) — `csfui` cannot create a file in
+it at all — so mode A's socket gets a directory of its own, and `csf-ui.service`'s
+`RuntimeDirectory=` is what creates it, fresh, before every start. The spelling
+`/run` rather than `/var/run` is systemd's, not a second convention:
+`RuntimeDirectory=` names a directory under `/run` and the unit does not get to
+choose otherwise.
+
+Implement against the tree, not against this table: the values above were read out of
+`Server.pm`'s `$DEFAULT_UNIX_SOCKET_PATH` and `$UNIX_SOCKET_MODE`,
+`csf-ui.service`'s `RuntimeDirectory=`, `RuntimeDirectoryMode=`, `User=` and
+`Group=`, and `install-webui.sh`'s `sock=`. All of them agreed when these rows were
+written, and `t/80-templates.t` is what keeps them agreeing: it compares the
+installer's `sock=` and the unit's `RuntimeDirectory=` against `Server.pm`'s path,
+and asserts the mode, the user and the group as literals of its own. Note what that
+cannot prove. The path comparisons make **`Server.pm` the self-declared authority**
+— agreement between implementations, not conformance to anything — and a literal in
+a test is a fourth copy of a number rather than a reading of this table. Freezing
+the values here is what turns either one into a conformance check, and the reason it
+is needed is that the path drifted across four files precisely because nothing froze
+it.
+
+**Left open deliberately.** Mode B's TLS material (`Server.pm`'s `$TLS_CERT_FILE`
+and `$TLS_KEY_FILE`) is still *not* in this table, on the analogy that §14.4 puts
+TLS outside this contract. That analogy is weak for the socket — the socket is the
+transport between two components §2 governs, which TLS material is not — and the
+socket rows are here for that reason. Whether the TLS paths should follow them into
+this table is a live question; this amendment does not answer it, and does not move
+them.
+
 The helper also reads, as root, files it does not own: `/etc/csf/csf.conf`,
 `/etc/csf/csf.deny`, `/etc/csf/csf.allow`, `/var/lib/csf/csf.tempban` and
 `/var/lib/csf/csf.tempallow`. Reading is all it does to them; every write goes
 through the `csf` binary (§5.0.1). `0600 root` is no obstacle to a root reader,
 which is why the split works at all.
+
+### 2.4 The mode A peer check — who may connect to `csf-ui`
+
+§2.2 is the door into `csf-ui-helper`. This is the other one: in mode A `csf-ui`
+binds `/run/csf-ui-web/csf-ui.sock` (§2.3) and a front web server connects to it.
+It is a section of its own, placed after §2.3 rather than folded into §2.2, for two
+reasons. §2.2 is specifically the *helper's* rule and the two rules are **not the
+same** — putting this beside it as a companion table would invite exactly the
+copying §2.2's `uid == 0` row must not receive. And §2's numbering is already spent to
+§2.3, so a companion rule needs a number of its own; renumbering is not available
+(eleven tasks and the rulings behind them cite these numbers), which is the same
+constraint §11.9 works within.
+
+**`SO_PEERCRED` is mandatory in mode A.** Not defence in depth, and not optional:
+it is the only thing that establishes that the peer which connected is the front web
+server. Without it a local unprivileged user connects to this socket directly, is
+never seen by the front server's `UI_ALLOW` at all (§10), and writes whatever
+`X-Real-IP` it likes into the rate-limit key and the access log — which is to say,
+picks which other visitor gets locked out and whose address the audit trail blames
+(§14.1). So mode A's startup preconditions refuse to start when
+`Socket::SO_PEERCRED` does not resolve, exactly as §2.1's floor demands for the
+helper, rather than serving without an identity.
+
+**The accepted set is derived from the group that owns the socket, and no `ui.conf`
+key names it.** §10 is frozen, and its own rules say adding a key is an amendment to
+that table first — so the listener invents none, and it does not need one. The
+install has already answered the question: `install-webui.sh`'s
+`grant_socket_group()` adds the detected front server's own worker account — from a
+fixed per-server candidate list — and nothing else, to `csf-ui-sock`, a group
+`create_account()` creates for this one purpose and which gates nothing else. That membership **is** the install's answer to
+"who may connect", and the kernel already enforces it on `connect()` through the
+socket's `0660` group bit. The check below is the second, independent gate, for the
+two cases a file mode cannot cover: a socket or directory relaxed by hand, and root,
+which bypasses mode bits entirely.
+
+Three routes into the accepted set — read from `peer_uid_allowed()` and
+`unix_peer_uids()`, cheapest first:
+
+| Admitted when | Answered from | Why the route exists |
+|---|---|---|
+| (a) the peer's uid is the daemon's own | the uid the daemon already knows it is running as | it owns the socket and the file mode admits it, and a process running as this uid already holds the session store and the rate-limit state — refusing it would protect nothing it could not simply take |
+| (b) the peer's **egid** equals the socket's gid | `SO_PEERCRED`, per connection, no name-service lookup at all | `getgrgid`'s member list does not name an account whose *primary* group is the socket group, and the `getpwent` fallback described further down is skipped whenever the member list produced anyone — so on a host with one supplementary member and one primary-gid account, (b) is the only thing admitting the latter |
+| (c) the peer's uid is in the socket group's member list | `getgrgid` then `getpwnam`, resolved **once at startup** — §2.2 resolves its own uid once for the same reason: a name-service lookup per connection puts NSS in the request path | it is the list `grant_socket_group()` writes, so it is the install's own designation, read back |
+
+The gid all of this is derived from is the **socket's own**, read off the socket
+after it is bound — not the directory's, and not the process's egid. Either of those
+could differ from it, and would then describe a different set of accounts than the
+one that can actually connect.
+
+**§2.2's `uid == 0` rule is deliberately not copied.** That rule belongs to the
+helper, whose only legitimate peer is `csf-ui`: root arriving there is always
+something other than the caller it exists for, and "if root wants to run `csf`, root
+runs `csf`" disposes of it completely. Neither half transfers. This socket's
+legitimate peer is the front server's worker account, which is never root, so root is
+not refused for *being* root — it is simply not in a set derived from group
+membership, exactly like any other uid the install did not designate. The difference
+matters in the one case where the two rules disagree: an administrator whose front
+server genuinely runs its workers as root (uncommon, its own problem, but real) can
+put root in the socket group and have it work, where a copied `uid == 0` would refuse
+forever and say only "root".
+
+**Route (b) is the subtle one, and its consequences are measured, not theoretical.**
+Measured in a container with real NSS — socket group gid 4242, one supplementary
+member, one account holding 4242 as its primary group: with (b) present the
+primary-gid account's real `connect()` over the real socket was served 200; with (b)
+removed and nothing else changed the same `connect()` was refused, and the refusal
+told the operator to add the account to a group `id` already showed it in. That is
+why it is kept. **But (b) admits any peer whose egid equals the socket's gid, not
+only group members**, because `SO_PEERCRED` reports the peer's *effective* gid: root
+therefore reaches the accepted set after a single `setegid`, and so does any member
+of that group that chooses to. Measured on the same host: the check answers "allowed"
+for uid 3003 with gid 4242, an account not in the group at all, and for uid 0 with
+gid 4242. Both halves are the rule. The set (b) widens to is bounded by the same
+group the install designated — those are the accounts that can reach the socket
+through its group bit in the first place — and that bound is the reason the route is
+acceptable, not a reason the widening is not real.
+
+Do not write "structurally cannot" about the member list, as an earlier draft of this
+reasoning did: `usermod -aG` puts a primary-gid account into that list too, so it
+*can* — it just never does by default. What removing (b) costs is therefore a
+*confusing* remedy rather than a futile one, and that is still enough to keep it.
+
+**A socket no other account can reach is a startup refusal.** `csf-ui` refuses to
+start in mode A when the accepted set names nobody but itself, rather than starting a
+UI nothing can talk to. That is the shape of an install whose front server was never
+granted the group — every proxied request a 502, with nothing in any log of ours.
+Because an empty member list is not proof of it (route (b) above), the local account
+database is enumerated in that path **only**, bounded, before the refusal is
+concluded: a startup that hangs in NSS is worse than one that refuses. The bound is
+reachable with the answer still inside it, so the refusal says what was actually
+consulted — the group's name, whether a group with that gid exists at all, and
+whether the scan stopped early — rather than asserting a membership fact it did not
+establish.
+
+**A refused connection here is not an `E_PEER` response.** §3.5 is the helper's wire
+protocol; this socket carries HTTP. The connection is closed before a byte is read,
+and one line per **distinct** refused uid goes to stderr — enough to diagnose an
+install whose front server is not in the group, without handing any local user who
+can see the socket an unbounded write into this daemon's journal.
+
+**What the identity establishes, and what it does not.** Peercred establishes the
+peer's *account*. It does not establish the front server *process*: any process
+running as that account can connect, and can forge `peer` by writing its own
+`X-Real-IP`. On a shared host that account is, in `install-webui.sh`'s own words,
+"often the SAME account other, untrusted sites on the same host run as". What holds
+the design up is that a forged value can only **deny**, never grant — it is a
+rate-limit key and a log line, and no operation, role or route is reachable because
+of it (§10, §14.1) — and the operator is entitled to know that much rather than to be
+told the peer is authenticated. Two things follow, and both are already enforced.
+The socket's directory must never be group- or other-**writable**: a local user who
+can write there can unlink the socket, bind their own in its place, and be handed the
+administrator's session, cookies and all, which no mode on the socket itself can
+defend against — the same rule §2.1 states for the helper's socket directory, tested
+as "neither the group write bit nor the other write bit". And the socket group stays
+single-purpose: a grant made to open one door must not open another, which is
+why `csf-ui-sock` exists at all instead of reusing `csfui`, which is the group the
+helper's own socket is served at (§2.3) and gates `ui.conf` and mode B's TLS key
+besides.
+
+**One thing §1.1 does not model, noted rather than decided.** Its four zones are the
+network, `csf-ui`, `csf-ui-helper` and the system. A **local unprivileged account**
+is not one of them — and mode A's socket is the one place where such an account
+matters, because it is reachable from the host without going near the network.
+Everything in this section is that account's answer. Whether §1.1 should gain a
+fifth zone is a live question this amendment does not settle.
 
 ---
 
@@ -1210,6 +1380,12 @@ tier, with different thresholds and a different purpose. These exist so that a
 compromised web tier cannot turn the helper into a firewall-flapping engine or a
 fork bomb.
 
+The web tier's own limits are not in this table, and one of them is a **relation**
+rather than a number: in mode A `csf-ui`'s request budget and the front web server's
+backend read timeout are derived from each other, frozen in §14.5. It follows the
+rule this section states above — a limit that cannot be counted is not a limit — and
+is recorded there rather than here because neither number is the helper's.
+
 ---
 
 ## 8. Audit
@@ -1322,13 +1498,37 @@ Rules that bind both readers and writers:
   makes every login burn root CPU and then return `E_BACKEND`, which is a
   self-inflicted lockout with no diagnostic. `csf-ui-passwd` refuses to create a
   hash outside the same range, so the file and the config cannot disagree.
-- **`UI_ALLOW` in mode A** is not enforced by `csf-ui` — in mode A `csf-ui`
-  listens on a unix socket and the peer address it sees is the front web server.
-  It does **not** trust `X-Forwarded-For` for access control; that header is
-  recorded in the web log, annotated as untrusted, and used for nothing else. In
-  mode A the value is what Task 9 renders into the nginx/Apache/LiteSpeed
-  template, and it must still be non-empty so that no template is ever generated
-  wide open.
+- **`UI_ALLOW` in mode A is not enforced by `csf-ui`** — and not "loaded and then
+  left unused" either: in mode A the daemon sets its parsed allowlist to `undef`,
+  so the peer check could not consult it even if a later edit tried to. In mode A
+  `csf-ui` listens on a unix socket (§2.3) and what it sees of its peer is an
+  *account*, not an address, so checking a list of visitor addresses there could
+  match nothing and would refuse every request. The key is still mandatory and
+  still non-empty in this mode because the value is still enforced — by the front
+  server, from this same value, rendered into the vhost the installer writes
+  (nginx's `allow`/`deny` include, Apache's `RequireAny`, LiteSpeed's
+  `accessControl`), so that no template is ever generated wide open. What replaces
+  the check *inside* `csf-ui` is §2.4's peer check.
+- **`X-Real-IP` in mode A is a header this tier reads, and it can deny.** This
+  bullet used to say only that `csf-ui` "does not trust `X-Forwarded-For` for
+  access control; that header is recorded in the web log, annotated as untrusted,
+  and used for nothing else". Nothing in `ui-src/` reads `X-Forwarded-For` at all —
+  verified by search — so it is not recorded in the web log, not annotated
+  anywhere, and the first clause is true only vacuously. What the sentence was
+  doing duty for is a claim about a **different** header, and that claim was wrong
+  twice over. In mode A `csf-ui` **does** take a per-client address out of a
+  header: `X-Real-IP`, which is where §14.1's `peer` comes from in that mode. That value is not inert. The web tier's own login rate limiter is peeked
+  **before** the login is sent to the helper, so a header-derived address that is
+  over its cap becomes a **429** with no `authenticate` call at all — measured:
+  a victim locked out by forged failures keyed on their address, at the shipped
+  thresholds of 5 failed logins per address per 900 s. That is a per-address deny
+  decision taken on a header, i.e. access control in the ordinary sense; and
+  §14.1's rule already reads "`X-Forwarded-For` **or similar**", so "it is a
+  different header" does not save it either. The grounding that does hold, and the
+  one to cite: **the value can only deny, never grant** — it is a rate-limit key
+  and a log line, and no operation, role or route is reachable because of it — and
+  **`SO_PEERCRED` bounds who can forge it** (§2.4, §14.1). Both halves are load
+  bearing; neither alone would make it sound.
 - Defaults apply **only** to keys that are absent. An empty string is a value,
   and for `UI_ALLOW` it is the value that refuses to start.
 
@@ -1506,6 +1706,21 @@ written down so that a later reader does not "simplify" them back:
   helper refuses the line itself. Deleting that check on the grounds that "the
   parser handles it" would silently re-open the case.
 
+### 11.10 Four amendments made after the mode A listener shipped
+
+Recorded here for the reason §11.9 gives: §11's other entries are departures from
+the *plan*, and these are changes to *this document*. All four were ruled on
+together (R103) after the mode A unix-socket listener shipped and was reviewed
+twice, and none of them designs anything — each writes down a decision the code had
+already made and, in three cases, measured.
+
+| Amendment | Section | Why it was needed |
+|---|---|---|
+| The mode A socket and its directory are frozen paths | §2.3 | §2.3 froze the helper's socket and was silent on the transport between the front web server and `csf-ui`. The path duly drifted across four files, and the cross-file test that now catches that compares them against `Server.pm` as a self-declared authority — agreement between implementations, not conformance to a contract |
+| The mode A peer rule, beside §2.2's helper rule | §2.4 | group membership of the socket's owning group is now mode A's **entire** access control, and it was frozen nowhere — it lived in code comments and `CHANGES.md`. §2.2 freezes exactly this class of decision for the helper's socket |
+| `X-Real-IP` is a header this tier reads, and it can deny | §10, §14.1 | §14.1 forbids `peer` coming from a client-supplied header while mode A has no other possible source, which read as a contradiction; and §10's "does not trust `X-Forwarded-For` for access control" neither described what mode A does nor survived its own "or similar". The grounding that holds is that the value can only deny, and that `SO_PEERCRED` bounds who can forge it |
+| The front server's read timeout is derived from the request budget | §14.5 | three shipped templates held 30 s against a 75 s budget, so a response the daemon served at 44 s reached the administrator as a 504 (nginx) or a 502 (Apache). The two numbers are one relation, and §7's rule — a limit that cannot be counted is not a limit — is why it is asserted as an equality |
+
 ---
 
 ## 12. Checklist for the tasks that implement this
@@ -1515,10 +1730,10 @@ written down so that a later reader does not "simplify" them back:
 | 2 — helper | §2 startup preconditions (including the Perl/Socket floor) and peer check, §3 framing and codes, §4 validators, §5 all 14 operations, §5.7's fixed `csf-ui` note, §5.14 failure counter, §7 limits, §8 helper log, §2.3 paths |
 | 3 — auth store | `/etc/csf-ui/users` `0600 root:root` (§2.3); `verify()` is called **by the helper**, not by `csf-ui` (§11.1); `$6$` only, `algo` field retained (§11.8); `UI_CRYPT_ROUNDS` range from §10; the dummy-`crypt()` path for unknown usernames (§5.14) |
 | 4 — `csf-ui` core | §3 client side, §5 role mapping, **login calls `authenticate` and never opens the users file** (§5.14), §8 access log, error→HTTP table in §3.5 |
-| 5 — HTTP/TLS core | §10 keys `UI_MODE`, `UI_LISTEN`, `UI_PORT`, `UI_ALLOW` and their refusals; `ui.conf` is at `/etc/csf-ui/ui.conf` (§2.3) |
+| 5 — HTTP/TLS core | §10 keys `UI_MODE`, `UI_LISTEN`, `UI_PORT`, `UI_ALLOW` and their refusals; `ui.conf` is at `/etc/csf-ui/ui.conf` (§2.3). **In mode A also**: §2.3's socket and directory rows, §2.4's peer check and startup refusal, §14.1's `peer` from the front server's header, and §14.5's derived read timeout |
 | 7 — screens | §5 mutating column (CSRF + role), §5.12 diff and second confirmation, §5.1's "cannot determine firewall state" case |
 | 8 — setup wizard | §10 — it writes `ui.conf` too, with these key names and these refusals |
-| 9 — installer | **§2.3 is the path layout and §13 is why**; creates `csfui`, the socket directory and the three `csf-ui` trees; writes every §10 key with these names; checks the Perl/Socket floor at install time (§11.7); the two post-install assertions in §13.5 |
+| 9 — installer | **§2.3 is the path layout and §13 is why**; creates `csfui`, the socket directory and the three `csf-ui` trees; writes every §10 key with these names; checks the Perl/Socket floor at install time (§11.7); the two post-install assertions in §13.5. **For mode A also**: grants the socket's group to exactly the front web server's worker account and to nothing else — that grant *is* §2.4's accepted set — renders `UI_ALLOW` into the front-server template (§10) and §14.5's read timeout into all three |
 | 10 — fuzzing | §6 is the test table: every row is a case |
 
 ---
@@ -1657,9 +1872,51 @@ problem to have specified better, not the producer's problem to guess at
 | `method` | string | yes | Matched case-insensitively against each route's own method; supply uppercase (`GET`, `POST`). **Unchecked** for shape — an absent or unrecognised value simply matches no route and is `WEB_NOT_FOUND`/`WEB_METHOD_NOT_ALLOWED`, which is not a distinct failure mode worth a separate check. |
 | `path` | string | yes | The decoded path **only** — no query string, no fragment. Always starts with `/`. Routing is **exact string match**, method then path (`ui-src/bin/csf-ui`'s `_route`), so a trailing slash, a doubled slash, a different case, a control byte, `%2F`, or `..` all simply match no registered route and fall out as `WEB_NOT_FOUND` — this is a property of the route table, not a normalisation rule this tier applies, and Task 5 is not required to reject or canonicalise any of those before constructing the structure. |
 | `query` | hashref or absent | no | The query string, already **parsed and URL-decoded** by the producer. `{}`, `undef`, and "absent" are equivalent. A repeated key: last value wins — the producer's choice how to fold one, this tier only ever sees the result. Percent-decoded **into raw bytes** — see §14.2, do not set Perl's internal UTF-8 flag on the result. Each value **≤ 65536 bytes** (unchecked by `csf-ui`, which receives these already parsed — a longer value simply fails whichever §4 grammar eventually sees it, at the cost of having parsed something oversized first; bounding it earlier is cheaper and is the producer's job). |
-| `headers` | hashref | yes (may be `{}`) | Header **names lowercased**, one string value per name. `csf-ui` reads exactly three: `cookie`, `content-type`, `x-csrf-token`. A repeated header's folding (comma-joined, last-wins, first-wins) is the producer's choice — **unspecified** by this contract, and today only `x-csrf-token` would ever be affected by it; a producer that folds it any consistent way is compliant. |
+| `headers` | hashref | yes (may be `{}`) | Header **names lowercased**, one string value per name. `csf-ui` reads exactly three: `cookie`, `content-type`, `x-csrf-token`. In mode A the **producer** reads one more out of this same hash before calling `dispatch()` — `x-real-ip`, to fill `peer` (see below) — which is its own read, one layer out, not `csf-ui`'s. A repeated header's folding (comma-joined, last-wins, first-wins) is the producer's choice — **unspecified** by this contract, and today only `x-csrf-token` would ever be affected by it; a producer that folds it any consistent way is compliant. |
 | `body` | string or absent | no | Raw bytes, **not** URL- or JSON-decoded — `csf-ui` decodes it itself, keyed on `content-type` (§14.2). `undef` or `''` for a bodyless request (typically any `GET`). **Checked**: a body over **65536 bytes** (the same figure as §3.1's wire line cap, chosen for consistency rather than derived from it — there is no wire request this large, but the number is easy to remember and already meaningful in this document) is refused by `csf-ui` itself with `WEB_BAD_REQUEST` before any parsing is attempted, so a producer that forgets its own limit is still protected, one layer in. Task 5 should still impose its own bound before ever reading this much into memory — `csf-ui`'s check happens after the bytes already exist as a Perl string. |
-| `peer` | string | **yes, and must be non-empty** | The connecting address, text form (IPv4 or IPv6), **no port, no brackets**. **Checked**: `csf-ui` refuses any request with a missing or empty `peer` outright, `WEB_BAD_REQUEST`, before routing, session lookup, or anything else runs (review Important 3) — an absent value used to silently disable `RateLimit.pm`'s per-address cap rather than fail visibly, which is exactly the failure mode this whole tier exists to not have. Two rules bind whoever fills this in: (1) it must be **per-connecting-client**, never a constant — a mode-A adapter that fills it with the front server's own fixed address collapses the per-address cap into one global bucket, where a handful of failed logins from any one visitor locks out every visitor; (2) it must **never** come from a client-supplied header (`X-Forwarded-For` or similar) that this tier, or the producer, treats as trusted for access control — §10 already says this for `UI_ALLOW`, and it applies here for exactly the same reason: a header the connecting peer wrote is not evidence of who the connecting peer is. |
+| `peer` | string | **yes, and must be non-empty** | The connecting address, text form (IPv4 or IPv6), **no port, no brackets**. **Checked**: `csf-ui` refuses any request with a missing or empty `peer` outright, `WEB_BAD_REQUEST`, before routing, session lookup, or anything else runs (review Important 3) — an absent value used to silently disable `RateLimit.pm`'s per-address cap rather than fail visibly, which is exactly the failure mode this whole tier exists to not have. Two rules bind whoever fills this in: (1) it must be **per-connecting-client**, never a constant — a mode-A adapter that fills it with the front server's own fixed address collapses the per-address cap into one global bucket, where a handful of failed logins from any one visitor locks out every visitor; (2) it must **never** come from a client-supplied header (`X-Forwarded-For` or similar) that this tier, or the producer, treats as trusted for access control — §10 already says this for `UI_ALLOW`, and it applies here for exactly the same reason: a header the connecting peer wrote is not evidence of who the connecting peer is. **In mode A a header is the only possible source; how both rules are met anyway is stated below this table.** |
+
+**`peer` in mode A: a header satisfies both rules, and what makes it do so.**
+Recorded because a reader of §14.1 alone would otherwise see a contradiction. Rule
+(1) demands a per-connecting-client value; rule (2) forbids a client-supplied
+header. On a unix socket the transport carries no client address at all, so the only
+possible source of a per-client value **is** a header — and the resolution turns on
+the word "client-supplied", which is doing more work than it looks. The header is not
+the client's: every front-end template this project ships sets `X-Real-IP` from the
+front server's own view of the connecting peer, overwriting whatever the client sent
+(nginx's `proxy_set_header`, Apache's `RequestHeader set`, LiteSpeed's
+`extraHeaders`, all three saying so at the point of the directive). So the value is
+the front server's statement rather than the client's — **conditional on the peer
+being that front server, which only `SO_PEERCRED` establishes** (§2.4). That is why
+§2.4's check is mandatory rather than defence in depth: without it the statement has
+no stated-by, and rule (2) is broken in substance while being obeyed in letter.
+
+Three properties of the implementation keep that conditional true, and each was
+verified in the code rather than assumed:
+
+- **The order cannot be inverted or skipped.** The mode is set once, from `ui.conf`,
+  and both the peer check and the request-handling path branch on that same field —
+  so a request whose `peer` comes from the header is by construction one whose
+  connection already passed the peercred check, which runs immediately after
+  `accept()` and before any byte is parsed.
+- **A missing header is refused, not defaulted.** A front server that does not send
+  it is one that was never configured to this contract; serving it anyway would mean
+  either a constant `peer` (rule (1) broken, silently) or an empty one, which
+  `csf-ui` refuses one layer in with a worse message. It is a 400 naming the header.
+- **The value is validated as one address, then canonicalised.** A comma-joined
+  proxy chain, a bracketed literal, an address with a port, a zone index and a
+  prefix are all refused — a prefix is not one client — and two spellings of one
+  IPv6 address must not become two rate-limit buckets and two kinds of access-log
+  line.
+
+Apache's directive is inside an `<IfModule mod_headers.c>` guard, so "unconditional"
+means *with respect to the client's own value*, not "present in every configuration":
+on a host without `mod_headers` the header is absent and the request is refused by
+the rule above, which is the fail-closed outcome, not a trusted client value.
+
+What none of this buys is stated in §2.4 and belongs here too: the identity
+established is the peer's **account**, so any process running as the front server's
+worker can forge this value. It can only ever **deny** — §10.
 
 ### 14.2 Body decoding — what `csf-ui` does with it, and the encoding rule
 
@@ -1723,6 +1980,67 @@ never returns anything else:
   `name=value` pairs); any cookie this tier does not name
   (`$ConfigServer::UI::Session::COOKIE_NAME`) is ignored, whatever else the
   header contains.
+
+### 14.5 The front web server's read timeout is derived, not chosen
+
+One thing about mode A's front server **is** specified here, against §14.4's grain,
+because it is not a property of HTTP framing but a relation between two limits that
+must hold or a served response is thrown away one hop out.
+
+**In mode A `csf-ui` is never the last word on whether a request succeeded.** A
+front server is reading its response with a deadline of its own, and if that deadline
+is the shorter one the administrator gets an error page for a request the daemon was
+about to answer. So:
+
+| Quantity | Value |
+|---|---|
+| `csf-ui`'s request budget | the sum of its header, body, write and dispatch deadlines — **75 s** as shipped |
+| margin | **5 s**, the same figure the templates already give their connect step |
+| the front server's backend read timeout | **the budget plus the margin — 80 s.** Derived, never set independently |
+
+There is one place these numbers live: the daemon derives the third from the first
+two (`Server.pm`'s `front_server_read_timeout()` is `default_request_budget()` plus
+`$FRONT_SERVER_TIMEOUT_MARGIN`), and each template carries that result — nginx's
+`proxy_read_timeout`, Apache's `ProxyPass timeout=`, LiteSpeed's `initTimeout`.
+
+The **ordering** is the point, not the arithmetic: **the daemon's own watchdog must
+always be the deadline that fires first**, because it is the one that knows what it
+was bounding — the front server only knows that nothing has arrived yet.
+
+**Measured, behind real front servers, against the real mode A listener** with a
+dispatch of 44 s:
+
+| Front server | Backend read timeout | Result |
+|---|---|---|
+| — (direct) | — | 200 OK at 44 s |
+| nginx 1.24 | `proxy_read_timeout 30s` | **504 Gateway Time-out at 30.03 s** |
+| Apache 2.4.58 | `ProxyPass timeout=30` | **502 Proxy Error at 30.03 s** — Apache renders it 502, not 504 |
+| nginx 1.24 | `proxy_read_timeout 80s` | 200 OK at 44.00 s |
+| Apache 2.4.58 | `ProxyPass timeout=80` | 200 OK at 44.00 s |
+
+One reason three files came to hold 30 against a budget of 75 is that the deadline
+is spelled differently in each of them, and the third spelling — LiteSpeed's
+`initTimeout` — does not read as a read timeout at all.
+
+**The relation is asserted as an equality, not as `>=`.** This follows §7's rule that
+a limit which cannot be counted is not a limit: `>=` lets any one of these numbers
+drift on its own as long as it drifts the harmless way, which is exactly how the
+three files drifted in the first place. The daemon derives the figure once and each
+template is asserted to carry precisely that, so moving the budget, the margin or any
+one template alone reddens the suite.
+
+**Why the full budget and not the smaller time a proxy can actually reach.** A front
+server that buffers a whole request before connecting spends the header and body
+phases on its own clock, so the time reachable through it is shorter than the budget —
+true, and measured for nginx. It is still the wrong number to freeze, for one reason
+in two halves: it is not a single number (Apache streams a request body rather than
+spooling it, and LiteSpeed's behaviour is unverified, so one tighter figure would be
+wrong for at least one shipped front server), and all of it rests on a third-party
+default an operator can turn off in one documented line with nothing here to notice.
+The budget is the only figure in this relation that can be counted from inside this
+tree. What that choice costs is slack on a **hung** UI — a browser waits for the
+daemon's own watchdog instead of for an answer the front server invented — and that
+is the cost worth paying.
 
 ---
 
