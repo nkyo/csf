@@ -65,10 +65,22 @@ context / {
 	extraHeaders            X-Real-IP %{REMOTE_ADDR}
 }
 
+# Fix round 1 (task-9-review.md C3): a bare top-level `include` of
+# "allow ..." lines is not itself an ACL in LiteSpeed's native config -
+# with no accessControl wrapper and no default deny, LiteSpeed simply had
+# no restriction to apply, so the vhost shipped reachable from anywhere
+# while this file's own (now former) comment described it as enforced.
 # docs/WEBUI-RPC.md S10: UI_ALLOW is enforced HERE in mode A, never by
 # csf-ui itself, and the generated file this includes is never empty - the
 # installer refuses to render this vhost at all while UI_ALLOW is empty.
-include @@UI_ALLOW_INCLUDE@@
+# `deny ALL` is the default-deny; LiteSpeed resolves an address that
+# matches both an allow and a deny entry by longest-prefix match, so each
+# specific `allow` line generated into the include below still wins over
+# this catch-all.
+accessControl  {
+	include @@UI_ALLOW_INCLUDE@@
+	deny                    ALL
+}
 
 vhssl {
 	keyFile                 /etc/csf-ui/ssl/key.pem
@@ -76,8 +88,11 @@ vhssl {
 	sslProtocol             24
 }
 
-# docs/WEBUI-RPC.md S3.1/S14.1: matches the 65536-byte wire/body cap on the
-# csf-ui side of the socket. LiteSpeed's own per-context body limit,
-# maxReqBodySize, is set at the listener/vhost-map level in
-# httpd_config.conf; install-webui.sh's printed wiring note includes it as
-# 65536 for the map this vhost is bound to.
+# docs/WEBUI-RPC.md S3.1/S14.1: matches the 65536-byte wire/body cap on
+# the csf-ui side of the socket. LiteSpeed's own per-context body limit,
+# maxReqBodySize, is NOT set by this file - it lives at the
+# listener/vhost-map level in httpd_config.conf, which this vhost include
+# does not control. install-webui.sh's printed instructions (fix round 1:
+# this used to claim the note already did this, and it did not) tell the
+# operator to set it there, next to the listener/map entry LiteSpeed's own
+# admin console needs anyway.

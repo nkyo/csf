@@ -226,28 +226,37 @@ apache_confd() {
 	fi
 }
 
-###############################################################################
-# grant_frontend_group - adds the front server's own worker account(s) to
-# group csfui, so it can read the TLS key (S2.3's ssl/ tree) and, once a
-# listener exists there, connect to the proxy socket - without widening
-# either past group-read. Scoped to the vendor actually being configured,
-# not applied for a vendor merely detected but never chosen.
-###############################################################################
-grant_frontend_group() {
-	front=$1
-	case "$front" in
-		nginx)     candidates="nginx www-data" ;;
-		apache)    candidates="apache www-data" ;;
-		litespeed) candidates="nobody lsadm" ;;
-		*)         candidates="" ;;
-	esac
-	for u in $candidates; do
-		if getent passwd "$u" >/dev/null 2>&1; then
-			usermod -aG csfui "$u" 2>/dev/null \
-				&& echo "csf-ui: added '$u' to group csfui (so $front can read the WebUI's TLS key)"
-		fi
-	done
-}
+# Fix round 1 (task-9-review.md Important): a grant_frontend_group()
+# function used to live here, adding nginx/Apache/LiteSpeed's own worker
+# account to group csfui "so it can read the TLS key". Removed outright,
+# not narrowed, because the premise was wrong, not merely too broad: all
+# three of these servers open ssl_certificate_key from their ROOT-run
+# master/admin process at config-load time (nginx and Apache fork workers
+# AFTER the master has already parsed the SSL context; LiteSpeed's own
+# admin process does the equivalent) - the unprivileged WORKER account
+# this function targeted never opens /etc/csf-ui/ssl/key.pem itself in
+# the ordinary case, so there was nothing here for the grant to fix.
+#
+# What it actually did was worse than a no-op: group csfui is also the
+# group /var/run/csf-ui/helper.sock is served at (docs/WEBUI-RPC.md
+# S2.3 - the frozen table this project's own trust-boundary design
+# (S1.2) depends on). Adding www-data (or any shared web-serving account -
+# often the SAME account other, untrusted sites on the same host run as)
+# to that group gives it socket-permission access to the ROOT-privileged
+# helper - past the file mode, though NOT past the helper's own S2.2 peer
+# check (SO_PEERCRED's uid compared against csfui's, `E_PEER` otherwise),
+# which is a second, independent gate this grant did not open and closes
+# the connection before a single byte is read. Fail-closed, so this was a
+# standing widening bought for a benefit that never existed, not a
+# working bypass of the split S1.2 describes - correcting the premise is
+# still worth doing on its own, without overstating what was actually at
+# risk.
+#
+# The real question this leaves open - how a future Mode A listener's
+# socket becomes reachable by the front server without reusing csfui's
+# own group - is part of the listener work this task is not scoped to
+# solve (see the task report); it is flagged there rather than answered
+# here with another guess.
 
 ###############################################################################
 # write_allow_include - docs/WEBUI-RPC.md S10: "UI_ALLOW in mode A is not
@@ -312,6 +321,33 @@ write_ui_conf() {
 }
 
 ###############################################################################
+# _enable_now UNIT - enables and starts UNIT, then reports what actually
+# happened rather than what was attempted (fix round 1, task-9-review.md
+# Important: "'enabled and started' is printed without asking systemctl
+# whether either happened"). `systemctl enable --now` can fail silently
+# to a caller that only checks nothing crashed - a masked unit, a syntax
+# error systemd itself rejects, or a unit file that failed to copy all
+# return non-zero, or return zero while the service still fails its own
+# startup checks (Server.pm's preflight() among them) - `is-enabled` and
+# `is-active` are asked afterwards rather than inferred from the enable
+# call's own exit status.
+###############################################################################
+_enable_now() {
+	unit=$1
+	systemctl enable --now "$unit" >/dev/null 2>&1
+
+	enabled=$(systemctl is-enabled "$unit" 2>/dev/null)
+	active=$(systemctl is-active "$unit" 2>/dev/null)
+	[ -n "$enabled" ] || enabled=unknown
+	[ -n "$active" ] || active=unknown
+
+	echo "csf-ui: $unit: enabled=$enabled active=$active"
+	if [ "$active" != "active" ]; then
+		echo "csf-ui:   (not running - check 'systemctl status $unit' and 'journalctl -u $unit')"
+	fi
+}
+
+###############################################################################
 # setup_mode_b - standalone: csf-ui terminates TLS itself
 # (ConfigServer::UI::Server, Task 5). Both units are meaningful here, so
 # both are enabled.
@@ -326,9 +362,10 @@ setup_mode_b() {
 	echo "csf-ui:   /usr/local/csf-ui/bin/csf-ui-passwd useradd <name> --role admin"
 
 	if command -v systemctl >/dev/null 2>&1; then
-		systemctl enable --now csf-ui-helper.service 2>/dev/null
-		systemctl enable --now csf-ui.service 2>/dev/null
-		echo "csf-ui: csf-ui-helper.service and csf-ui.service enabled and started."
+		_enable_now csf-ui-helper.service
+		_enable_now csf-ui.service
+	else
+		echo "csf-ui: no systemctl found - csf-ui-helper.service and csf-ui.service were not started"
 	fi
 }
 
@@ -356,7 +393,13 @@ setup_mode_a() {
 	port=$2
 	allow=$3
 
-	sock=/var/run/csf-ui/csf-ui.sock
+	# /run/csf-ui-web is csf-ui.service's own RuntimeDirectory (fix round
+	# 1, task-9-review.md Important): /var/run/csf-ui is 0755 root:root
+	# (docs/WEBUI-RPC.md S2.3, frozen for csf-ui-helper's own root-owned
+	# socket) and csfui - the user this unit runs as - cannot create a
+	# file there at all. This path is the one csfui can actually bind() to
+	# once a Mode A listener exists.
+	sock=/run/csf-ui-web/csf-ui.sock
 	allow_include="/etc/csf-ui/allow-$front.conf"
 	write_allow_include "$front" "$allow" "$allow_include"
 
@@ -386,25 +429,38 @@ setup_mode_a() {
 		return 1
 	fi
 
-	grant_frontend_group "$front"
 	write_ui_conf a "$port" "$allow"
 
-	echo "csf-ui: $front vhost written to $out - reload/restart $front to pick it up."
+	echo "csf-ui: $front vhost written to $out."
 	if [ "$front" = "apache" ] && command -v a2enconf >/dev/null 2>&1; then
 		a2enconf csf-ui >/dev/null 2>&1
 	fi
 	if [ "$front" = "litespeed" ]; then
 		echo "csf-ui: add a matching 'listener'/vhost-map entry in LiteSpeed's own"
-		echo "csf-ui: httpd_config.conf pointing at $out (its admin console can do this)."
+		echo "csf-ui: httpd_config.conf pointing at $out (its admin console can do this),"
+		echo "csf-ui: and set maxReqBodySize to 65536 on that same listener/map - it is"
+		echo "csf-ui: NOT set by $out itself (docs/WEBUI-RPC.md S3.1/S14.1's 65536-byte cap)."
 	fi
 
-	echo "csf-ui: NOTE - this build's csf-ui does not yet listen on $sock in Mode A"
-	echo "csf-ui: (see the Task 9 report). csf-ui.service is NOT enabled for that"
-	echo "csf-ui: reason; csf-ui-helper.service is, and everything above is ready"
-	echo "csf-ui: for when a Mode A listener exists."
+	# Fix round 1 (task-9-review.md Important): say what actually happens
+	# on this host, not only what this script itself did not do. The vhost
+	# file at $out is live configuration the moment $front next reads it -
+	# which is $front's own timeline, not this script's, and this script
+	# never reloads $front itself.
+	echo "csf-ui: IMPORTANT - this build's csf-ui has no Mode A listener yet (no code"
+	echo "csf-ui: anywhere in this release binds $sock; see the Task 9 report), so"
+	echo "csf-ui: csf-ui.service is deliberately NOT enabled. But $out is otherwise"
+	echo "csf-ui: ordinary, live $front configuration: the NEXT time $front reloads or"
+	echo "csf-ui: restarts - for this or any unrelated reason - it WILL start accepting"
+	echo "csf-ui: HTTPS on port $port and WILL return 502 for every request, because"
+	echo "csf-ui: nothing listens on $sock yet. Do not reload $front expecting this to"
+	echo "csf-ui: start working; remove $out first if you do not want a 502'ing port"
+	echo "csf-ui: live before a Mode A listener ships."
 
 	if command -v systemctl >/dev/null 2>&1; then
-		systemctl enable --now csf-ui-helper.service 2>/dev/null
+		_enable_now csf-ui-helper.service
+	else
+		echo "csf-ui: no systemctl found - csf-ui-helper.service was not started"
 	fi
 	return 0
 }
@@ -457,10 +513,23 @@ interactive_setup() {
 	port=8443
 	printf 'csf-ui: WebUI port [%s]: ' "$port"
 	read -r input_port
+	# docs/WEBUI-RPC.md S10: UI_PORT must be 1024-65535 in EITHER mode -
+	# fix round 1 (task-9-review.md Important) found any digit string was
+	# accepted here, so a value ui.conf's own grammar refuses (e.g. "80",
+	# "99999") would be written and only fail loudly later, at csf-ui
+	# start time, instead of being caught where the operator can retype it.
 	case "$input_port" in
 		'') : ;;
-		*[!0-9]*) echo "csf-ui: '$input_port' is not a number - keeping $port" ;;
-		*) port=$input_port ;;
+		*[!0-9]*)
+			echo "csf-ui: '$input_port' is not a number - keeping $port"
+			;;
+		*)
+			if [ "$input_port" -ge 1024 ] 2>/dev/null && [ "$input_port" -le 65535 ] 2>/dev/null; then
+				port=$input_port
+			else
+				echo "csf-ui: '$input_port' is out of range (must be 1024-65535, docs/WEBUI-RPC.md S10) - keeping $port"
+			fi
+			;;
 	esac
 
 	if [ "$mode" = "a" ]; then
@@ -484,28 +553,136 @@ interactive_setup() {
 # cannot reach them, and re-reading the same mode 60 seconds later would
 # reconfirm the same answer on a correct install, never a different one.
 ###############################################################################
+###############################################################################
+# _check_path PATH MODE OWNER GROUP LABEL
+#
+# Fix round 1 (task-9-review.md Important - "checks existence only, and
+# test -x as root is close to vacuous... ownership and modes from S2.3
+# are never checked in either direction"). `test -x` as root is true for
+# almost anything, since root's execute check does not require ANY execute
+# bit to be set for a regular file it owns in some implementations, and
+# tells you nothing about whether a file is 0750 or 0777. This checks the
+# exact mode and the exact owner/group `stat` reports - unlike
+# t/71-rollback.t's own S2.3 check, which deliberately only checks the
+# executable bit because a git checkout cannot carry a literal 0750 (its
+# own comment explains why). This function runs against an actual
+# INSTALL, where install_files()/setup_directories() just set every mode
+# and owner explicitly, so there is no umask excuse for a mismatch here.
+###############################################################################
+_check_path() {
+	path=$1
+	want_mode=$2
+	want_owner=$3
+	want_group=$4
+	label=$5
+
+	if [ ! -e "$path" ]; then
+		echo "csf-ui: *VERIFY FAILED* $label ($path) does not exist"
+		return 1
+	fi
+
+	if ! command -v stat >/dev/null 2>&1; then
+		echo "csf-ui: WebUI verify: 'stat' not found - cannot check $path's mode/owner"
+		return 0
+	fi
+
+	got_mode=$(stat -c '%a' "$path" 2>/dev/null)
+	got_owner=$(stat -c '%U' "$path" 2>/dev/null)
+	got_group=$(stat -c '%G' "$path" 2>/dev/null)
+	ok=1
+
+	if [ "$got_mode" != "$want_mode" ]; then
+		echo "csf-ui: *VERIFY FAILED* $label ($path) is mode $got_mode, expected $want_mode"
+		ok=0
+	fi
+	if [ "$got_owner" != "$want_owner" ]; then
+		echo "csf-ui: *VERIFY FAILED* $label ($path) is owned by $got_owner, expected $want_owner"
+		ok=0
+	fi
+	if [ "$got_group" != "$want_group" ]; then
+		echo "csf-ui: *VERIFY FAILED* $label ($path) has group $got_group, expected $want_group"
+		ok=0
+	fi
+	[ "$ok" -eq 1 ]
+}
+
 verify_install() {
 	problems=0
 
+	# The four S2.3-frozen binaries: 0750 root:csfui, by name, so a
+	# dropped exec bit (the exact defect that killed Task 8's rollback
+	# timer while 2400 tests passed) is caught here rather than
+	# discovered at start time.
 	for bin in csf-ui csf-ui-helper csf-ui-passwd csf-ui-setup; do
-		path="/usr/local/csf-ui/bin/$bin"
-		if [ ! -x "$path" ]; then
-			echo "csf-ui: *VERIFY FAILED* $path is missing or not executable"
-			problems=$((problems + 1))
-		fi
+		_check_path "/usr/local/csf-ui/bin/$bin" 750 root csfui "binary $bin" \
+			|| problems=$((problems + 1))
 	done
 
-	for d in /usr/local/csf-ui/lib/ConfigServer/UI /usr/local/csf-ui/web \
-		/etc/csf-ui /etc/csf-ui/ssl /var/lib/csf-ui /var/lib/csf-ui/helper \
-		/var/lib/csf-ui/sessions /var/lib/csf-ui/rl /var/run/csf-ui; do
-		if [ ! -d "$d" ]; then
-			echo "csf-ui: *VERIFY FAILED* $d does not exist"
-			problems=$((problems + 1))
-		fi
+	# Fix round 1 (task-9-review.md M9): the report previously claimed
+	# this function checks the installed bin/ holds ONLY those four names.
+	# It did not - only their individual presence was checked, so a fifth
+	# file (a stray copy, a leftover from Task 11 deleting assets, a
+	# future mistake) would pass silently. t/71-rollback.t already proves
+	# this for the SOURCE tree; this is the actual check for the
+	# INSTALLED one.
+	bin_dir=/usr/local/csf-ui/bin
+	if [ -d "$bin_dir" ]; then
+		for f in "$bin_dir"/*; do
+			[ -f "$f" ] || continue
+			name=$(basename "$f")
+			case "$name" in
+				csf-ui | csf-ui-helper | csf-ui-passwd | csf-ui-setup) : ;;
+				*)
+					echo "csf-ui: *VERIFY FAILED* $bin_dir/$name is not one of the four docs/WEBUI-RPC.md S2.3 names"
+					problems=$((problems + 1))
+					;;
+			esac
+		done
+	fi
+
+	# Directories and their contents, docs/WEBUI-RPC.md S2.3 verbatim
+	# (plus /etc/csf-ui/ssl and /usr/local/csf-ui/{lib,web}'s own
+	# subtrees, which S2.3 treats as part of the same pattern rather than
+	# itemizing). "path:mode:owner:group:label" - colon-separated so a
+	# single loop can walk it without a fifth positional array.
+	for row in \
+		"/usr/local/csf-ui:755:root:root:top-level install directory" \
+		"/usr/local/csf-ui/bin:755:root:root:binary directory" \
+		"/usr/local/csf-ui/lib:755:root:root:lib directory" \
+		"/usr/local/csf-ui/lib/ConfigServer:755:root:root:lib/ConfigServer directory" \
+		"/usr/local/csf-ui/lib/ConfigServer/UI:755:root:root:lib/ConfigServer/UI directory" \
+		"/usr/local/csf-ui/web:755:root:root:web directory" \
+		"/etc/csf-ui:750:root:csfui:/etc/csf-ui" \
+		"/etc/csf-ui/ssl:750:root:csfui:TLS material directory" \
+		"/var/lib/csf-ui:755:root:root:/var/lib/csf-ui" \
+		"/var/lib/csf-ui/helper:700:root:root:helper state directory" \
+		"/var/lib/csf-ui/sessions:700:csfui:csfui:session store" \
+		"/var/lib/csf-ui/rl:700:csfui:csfui:rate-limit store" \
+		"/var/run/csf-ui:755:root:root:/var/run/csf-ui" \
+		"/var/log/csf-ui-audit.log:640:root:root:audit log" \
+		"/var/log/csf-ui-access.log:640:csfui:csfui:access log" \
+	; do
+		path=${row%%:*}; rest=${row#*:}
+		mode=${rest%%:*}; rest=${rest#*:}
+		owner=${rest%%:*}; rest=${rest#*:}
+		group=${rest%%:*}; label=${rest#*:}
+		_check_path "$path" "$mode" "$owner" "$group" "$label" \
+			|| problems=$((problems + 1))
 	done
+
+	if [ -f /etc/csf-ui/ssl/cert.pem ]; then
+		_check_path /etc/csf-ui/ssl/cert.pem 644 root csfui "TLS certificate" \
+			|| problems=$((problems + 1))
+	fi
+	if [ -f /etc/csf-ui/ssl/key.pem ]; then
+		_check_path /etc/csf-ui/ssl/key.pem 640 root csfui "TLS private key" \
+			|| problems=$((problems + 1))
+	fi
 
 	if getent passwd csfui >/dev/null 2>&1; then
 		if [ -f /etc/csf-ui/ui.conf ]; then
+			_check_path /etc/csf-ui/ui.conf 640 root csfui "ui.conf" \
+				|| problems=$((problems + 1))
 			if command -v su >/dev/null 2>&1 \
 				&& ! su -s /bin/sh -c 'test -r /etc/csf-ui/ui.conf' csfui 2>/dev/null; then
 				echo "csf-ui: *VERIFY FAILED* csfui cannot read /etc/csf-ui/ui.conf - the WebUI will refuse to start"

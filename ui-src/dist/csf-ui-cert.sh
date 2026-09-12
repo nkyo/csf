@@ -144,10 +144,21 @@ cp -f "$TMP/key.pem" "$KEY" && cp -f "$TMP/cert.pem" "$CRT" || {
 
 # docs/WEBUI-RPC.md S2.3's own pattern: the directory is traversable, the
 # contents are not, except the certificate itself (public by definition).
-# csfui reads KEY directly in mode B (Server.pm terminates TLS itself); in
-# mode A a front web server's own worker user reads both - install-webui.sh
-# adds that user to the csfui group for exactly this file, rather than
-# widening the mode past group-read.
+# csfui reads KEY directly in mode B (Server.pm terminates TLS itself).
+#
+# Fix round 1 (task-9-review.md Important): this comment used to also
+# claim a mode-A front server's WORKER account needed group-csfui read
+# access here, and install-webui.sh granted it. That premise was wrong -
+# nginx/Apache/LiteSpeed all open their configured TLS key from their
+# ROOT-run master/admin process at config-load time, before any
+# unprivileged worker exists, so the worker never reads this file itself
+# in the ordinary case - and granting it was a standing widening bought
+# for nothing: group csfui is also the group /var/run/csf-ui/helper.sock
+# is served at, so adding a shared web-serving account to it gave
+# socket-permission access to the root-privileged helper, though not past
+# the helper's own independent S2.2 peer check (SO_PEERCRED's uid, not
+# group). Fail-closed, but pointless and worth removing outright; see the
+# Task 9 report.
 chmod 0750 "$SSLDIR" 2>/dev/null
 chmod 0640 "$KEY"
 chmod 0644 "$CRT"

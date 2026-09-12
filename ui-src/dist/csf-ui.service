@@ -29,6 +29,23 @@ Restart=on-failure
 RestartSec=5
 UMask=0077
 
+# Fix round 1 (task-9-review.md, Important): the interim Mode A socket
+# path this task hands off, /run/csf-ui-web/csf-ui.sock, has to be one
+# csfui can actually bind() - /var/run/csf-ui (docs/WEBUI-RPC.md S2.3) is
+# 0755 root:root, frozen that way for csf-ui-helper's OWN root-owned
+# socket, and a non-root user cannot create a file in a directory it does
+# not own or have write access to. RuntimeDirectory is systemd's own
+# mechanism for exactly this: it creates /run/csf-ui-web fresh before
+# every start, owned by this unit's User/Group, and it is compatible with
+# ProtectSystem=strict without needing a matching ReadWritePaths entry.
+# The socket's own mode (once something binds one there) is still that
+# code's responsibility to set explicitly, the same way ui-src/bin/
+# csf-ui-helper's own preflight() chmod()s its socket rather than trusting
+# UMask= - this directory being writable is necessary but not sufficient
+# for the front server to reach a socket inside it.
+RuntimeDirectory=csf-ui-web
+RuntimeDirectoryMode=0750
+
 # The mandatory set (task-9-brief.md). This process is the half of the
 # split that parses bytes a network peer - or, in mode A, a peer only one
 # step removed - chose (docs/WEBUI-RPC.md S1.2); it never needs a second

@@ -20,6 +20,16 @@
 
 umask 0177
 
+# Added 2026-09-12 in https://github.com/nkyo/csf - see CHANGES.md.
+#
+# Captured before this script (or anything it calls) ever changes
+# directory - kept consistent with the other six install.*.sh even though
+# this one has no `cd` before its own WebUI packaging call today; a future
+# `cd` added anywhere above must not be able to reintroduce fix round 1's
+# silent-skip bug here too. Every reference to ui-src/dist/ below uses
+# this instead of a path relative to the current directory.
+CSF_SRC_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd) || CSF_SRC_ROOT=.
+
 if [ -e "/usr/local/cpanel/version" ]; then
 	echo "Running csf cPanel installer"
 	echo
@@ -561,8 +571,10 @@ service lscpd restart
 # install enables neither mode" (an unattended run installs it disabled).
 # Exit status is deliberately not checked here - see
 # ui-src/dist/install-webui.sh's own header comment for why.
-if [ -f ui-src/dist/install-webui.sh ]; then
-	sh ui-src/dist/install-webui.sh
+if [ -f "$CSF_SRC_ROOT/ui-src/dist/install-webui.sh" ]; then
+	sh "$CSF_SRC_ROOT/ui-src/dist/install-webui.sh"
+else
+	echo "csf-ui: ui-src/dist/install-webui.sh not found under $CSF_SRC_ROOT - WebUI packaging was not run"
 fi
 
 echo

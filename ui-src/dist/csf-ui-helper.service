@@ -8,18 +8,20 @@
 # answers exactly the 14 operations in docs/WEBUI-RPC.md S5 over
 # /var/run/csf-ui/helper.sock and does not parse or route HTTP.
 #
-# "Narrowest set that still works", worked out from what the helper
-# actually does (ui-src/bin/csf-ui-helper, ConfigServer::UI::Firewall's
-# _run_argv): it reads files it does not own (root already owns
-# /etc/csf/*, so no DAC_OVERRIDE is needed to read them), execs
-# /usr/sbin/csf as its own child (a plain exec, not a privilege gain), and
-# creates its own state under paths it owns outright. The one exception
-# is /var/run/csf-ui/helper.sock, which docs/WEBUI-RPC.md S2 requires at
-# group csfui - SupplementaryGroups= grants that group membership so the
-# chgrp succeeds as an ordinary (non-CAP_CHOWN) operation on a file this
-# process already owns, rather than granting CAP_CHOWN to change ANY
-# file's owner. Measured against that, the capability bounding set this
-# process actually needs is empty.
+# Fix round 1 (task-9-review.md C2): "narrowest set that still works" had
+# shipped as the narrowest set, full stop - it stopped every /usr/sbin/csf
+# invocation, including read-only `reconcile`. The error was treating
+# csf-ui-helper's own direct exec (ui-src/bin/csf-ui-helper: the ONLY
+# child it ever execs, by grep, is /usr/sbin/csf - never iptables, nft or
+# ipset directly) as the whole picture. csf is ~250KB of existing, already
+# root-privileged Perl that itself execs iptables/ip6tables/ipset
+# depending on the host's detected backend (ConfigServer::UI::Firewall's
+# own detection - iptables-legacy, iptables-nft, or nftables - is the
+# proof this is a host-time choice, not a build-time one), and every
+# directive below is sized for THAT grandchild, not for csf-ui-helper
+# itself, because seccomp filters and the capability bounding set are
+# inherited across exec and reach it regardless of how many generations
+# away it is.
 [Unit]
 Description=ConfigServer Security & Firewall - WebUI (privileged helper)
 Documentation=https://github.com/nkyo/csf
@@ -34,17 +36,75 @@ UMask=0077
 SupplementaryGroups=csfui
 
 NoNewPrivileges=yes
+
+# csf owns /etc/csf, /var/lib/csf and /usr/local/csf outright - every
+# other document in this project (docs/WEBUI-RPC.md S13, Ruling R11) says
+# so precisely because lfd enforces 0600 on exactly these three trees
+# forever. Granting them here is not a guess: it is the same three paths,
+# taken from the same source of truth, rather than an attempt to
+# enumerate which of csf.pl's ~30 flags touches which file - that
+# enumeration is what produced the empty set this fix round exists to
+# correct, and getting it precisely-but-still-wrong a second time is a
+# worse outcome than granting the whole tree csf.pl already assumes it
+# owns. /run is added for the same reason, on review's own finding: even
+# a READ-ONLY `iptables -S`/`-L` takes out /run/xtables.lock first, to
+# serialise against a concurrent writer - so reconcile (S5.11), the
+# operation this fix round's own review used to prove the sandbox was
+# broken, needs a writable /run just as much as deny/allow/temp* do.
+# ProtectSystem=strict still confines everything else (/usr, /boot,
+# arbitrary other paths this process has no business in).
 ProtectSystem=strict
+ReadWritePaths=/etc/csf /var/lib/csf /usr/local/csf /run /var/lib/csf-ui/helper /var/log/csf-ui-audit.log
+
 ProtectHome=yes
 PrivateTmp=yes
-RestrictAddressFamilies=AF_UNIX
-CapabilityBoundingSet=
-ReadWritePaths=/var/lib/csf-ui/helper /var/run/csf-ui /var/log/csf-ui-audit.log
 
-# Narrowing beyond the mandatory csf-ui set this unit mirrors - none of
-# these touch a path, family or child-process ability this service
-# actually uses (a plain fork+exec of /usr/sbin/csf needs no more than
-# @system-service already allows).
+# AF_UNIX: this process's own listening socket. AF_NETLINK: how
+# iptables-nft, nft and modern ipset talk to the kernel's netfilter
+# subsystem (libmnl/libnftnl, NETLINK_NETFILTER) - ConfigServer::UI::
+# Firewall's own backend detection is the proof more than one of these is
+# live on real hosts. AF_INET/AF_INET6: how iptables-legacy and
+# ip6tables-legacy still talk to the kernel, via getsockopt/setsockopt on
+# a raw socket, on a host where nf_tables Ruleset compatibility is not in
+# use. All four are host-time facts this unit cannot know in advance, so
+# all four are granted; none of the ones this fix round removed
+# (AF_INET6, AF_NETLINK) were ever exercised by anything of ours - only
+# by csf's own children.
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6
+
+# CAP_NET_ADMIN: required by the kernel for any netfilter rule mutation,
+# on both backends (documented Linux capability requirement, not derived
+# from this codebase). CAP_NET_RAW: required to open the SOCK_RAW socket
+# iptables-legacy's getsockopt/setsockopt approach uses in the first
+# place - without it, socket() itself fails before csf's child ever
+# reaches the operation this whole unit exists to allow. CAP_DAC_READ_SEARCH:
+# the one this fix round's first pass missed entirely - /etc/csf is reset
+# to 0600 by lfd on every main-loop pass (lfd.pl:1187-1201, S13.3), and a
+# 0600 DIRECTORY has no execute/search bit for ANYONE, INCLUDING its own
+# root owner (S13.2's own demonstration) - reaching csf.conf/csf.deny at
+# all, not merely reading or writing them once reached, needs this
+# capability to bypass that missing search bit, on every single pass
+# through /etc/csf regardless of which of the three write paths above the
+# ReadWritePaths grant already covers.
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_DAC_READ_SEARCH
+
+# Narrowing beyond the mandatory csf-ui set this unit mirrors - each
+# still believed to touch nothing this service or its csf/iptables/nft
+# descendants use. Not empirically exercised against a live csf install
+# in this fix round (this environment has no systemd and no
+# /usr/sbin/csf - see the task report); flagged here so the next person
+# tightening or loosening any one of them knows it rests on documented
+# behaviour, not a measurement.
+#
+# SystemCallFilter's own `~@privileged` narrowing line, present in the
+# previous round, is REMOVED here rather than kept: review could not
+# rule out that one of its excluded syscalls (bpf, capset, mount, setns,
+# sysfs and the rest of that group) is reached somewhere in csf.pl's
+# ~250KB or in iptables/nft/ipset's own startup path, and "narrowest set
+# that still works" means WORKS wins the tie. @system-service alone is
+# still a real restriction (it excludes debugging, raw io port access,
+# kernel module and namespace syscalls entirely) - it is just not
+# narrowed a second time on a guess.
 AmbientCapabilities=
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
@@ -60,7 +120,6 @@ RestrictRealtime=yes
 RestrictSUIDSGID=yes
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
-SystemCallFilter=~@privileged @resources
 
 [Install]
 WantedBy=multi-user.target

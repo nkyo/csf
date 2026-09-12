@@ -43,7 +43,7 @@ use FindBin ();
 use lib "$FindBin::Bin/..", "$FindBin::Bin/../ui-src/lib";
 
 use File::Temp qw(tempdir tempfile);
-use Test::More tests => 75;
+use Test::More tests => 126;
 
 my $DIST = "$FindBin::Bin/../ui-src/dist";
 my $RENDERER = "$DIST/render-template.sh";
@@ -91,7 +91,7 @@ for my $name (sort keys %TEMPLATE) {
 	my $tpl = $TEMPLATE{$name};
 	ok(-f $tpl, "$name.conf.tpl exists");
 
-	my $sock    = '/var/run/csf-ui/csf-ui.sock';
+	my $sock    = '/run/csf-ui-web/csf-ui.sock';
 	my $allow_f = "/etc/csf-ui/allow-$name.conf";
 	my ($rc, $content) = render($tpl, "UI_PORT=8443", "UI_SOCK=$sock", "UI_ALLOW_INCLUDE=$allow_f");
 
@@ -178,10 +178,49 @@ like($csf_ui, qr{^ExecStart=/usr/local/csf-ui/bin/csf-ui$}m,
 # to root), which is itself part of what "runs as root" is tested for.
 unlike($csf_ui_helper, qr/^User=/m, 'csf-ui-helper.service has no User= - it runs as root');
 like($csf_ui_helper, qr/^NoNewPrivileges=yes$/m, 'csf-ui-helper.service: NoNewPrivileges=yes');
-like($csf_ui_helper, qr/^CapabilityBoundingSet=\s*$/m, 'csf-ui-helper.service: CapabilityBoundingSet is empty');
 like($csf_ui_helper, qr/^ProtectSystem=strict$/m, 'csf-ui-helper.service: ProtectSystem=strict');
 like($csf_ui_helper, qr{^ExecStart=/usr/local/csf-ui/bin/csf-ui-helper$}m,
 	'csf-ui-helper.service execs the S2.3 frozen path');
+
+# Fix round 1 (task-9-review.md C2): the helper's only direct child is
+# /usr/sbin/csf (ui-src/bin/csf-ui-helper never execs iptables/nft/ipset
+# itself), and csf shells out to whichever of those the host's detected
+# backend uses - a host-time fact, not a build-time one
+# (ConfigServer::UI::Firewall detects iptables-legacy, iptables-nft OR
+# nftables). The unit has to grant what EITHER backend needs, or it works
+# on some hosts and silently fails on others depending on which backend
+# they run - exactly the class of defect this fix round exists to close.
+like($csf_ui_helper, qr/^RestrictAddressFamilies=.*\bAF_UNIX\b/m,
+	'csf-ui-helper.service: RestrictAddressFamilies keeps AF_UNIX (its own listening socket)');
+like($csf_ui_helper, qr/^RestrictAddressFamilies=.*\bAF_NETLINK\b/m,
+	'csf-ui-helper.service: RestrictAddressFamilies allows AF_NETLINK (nft/iptables-nft/modern ipset)');
+like($csf_ui_helper, qr/^RestrictAddressFamilies=.*\bAF_INET\b/m,
+	'csf-ui-helper.service: RestrictAddressFamilies allows AF_INET (iptables-legacy raw sockets)');
+like($csf_ui_helper, qr/^RestrictAddressFamilies=.*\bAF_INET6\b/m,
+	'csf-ui-helper.service: RestrictAddressFamilies allows AF_INET6 (ip6tables-legacy raw sockets)');
+like($csf_ui_helper, qr/^CapabilityBoundingSet=.*\bCAP_NET_ADMIN\b/m,
+	'csf-ui-helper.service: CapabilityBoundingSet grants CAP_NET_ADMIN (netfilter rule mutation, both backends)');
+like($csf_ui_helper, qr/^CapabilityBoundingSet=.*\bCAP_NET_RAW\b/m,
+	'csf-ui-helper.service: CapabilityBoundingSet grants CAP_NET_RAW (iptables-legacy raw socket creation)');
+like($csf_ui_helper, qr/^CapabilityBoundingSet=.*\bCAP_DAC_READ_SEARCH\b/m,
+	'csf-ui-helper.service: CapabilityBoundingSet grants CAP_DAC_READ_SEARCH (/etc/csf is a 0600 directory - S13.2)');
+for my $tree (qw(/etc/csf /var/lib/csf /usr/local/csf /run)) {
+	like($csf_ui_helper, qr{^ReadWritePaths=.*\Q$tree\E}m,
+		"csf-ui-helper.service: ReadWritePaths includes $tree (csf.pl's own tree or /run/xtables.lock, not this task's)");
+}
+unlike($csf_ui_helper, qr/^SystemCallFilter=~/m,
+	'csf-ui-helper.service: no narrowing SystemCallFilter=~... line (fix round 1: could not rule out it blocks a syscall csf/iptables/nft needs)');
+
+# Fix round 1 (task-9-review.md I2): the interim Mode A socket must live
+# somewhere csfui can actually create it. /var/run/csf-ui (S2.3) is 0755
+# root:root, frozen for csf-ui-helper's own root-owned socket - csfui has
+# no write access there at all. RuntimeDirectory is systemd's mechanism
+# for handing this unit a directory it owns, compatible with
+# ProtectSystem=strict without a matching ReadWritePaths entry.
+like($csf_ui, qr/^RuntimeDirectory=csf-ui-web$/m,
+	'csf-ui.service: RuntimeDirectory=csf-ui-web (a directory csfui can actually write to)');
+like($csf_ui, qr/^RuntimeDirectoryMode=0750$/m,
+	'csf-ui.service: RuntimeDirectoryMode=0750');
 
 SKIP: {
 	my $analyzer = `command -v systemd-analyze 2>/dev/null`;
@@ -205,7 +244,7 @@ SKIP: {
 {
 	my ($rc, $content) = render($TEMPLATE{nginx},
 		'UI_PORT=8443',
-		'UI_SOCK=/var/run/csf-ui/csf-ui.sock',
+		'UI_SOCK=/run/csf-ui-web/csf-ui.sock',
 		'UI_ALLOW_INCLUDE=/etc/csf-ui/weird&name#with\\backslash.conf');
 	is($rc, 0, 'a value containing sed-special characters (& # \\) still renders');
 	like($content, qr{/etc/csf-ui/weird&name#with\\backslash\.conf},
@@ -239,6 +278,80 @@ SKIP: {
 }
 
 ###############################################################################
+# LiteSpeed's accessControl wrapper and deny-by-default (fix round 1,
+# task-9-review.md C3): a bare `include` of "allow ..." lines is not
+# itself an ACL in LiteSpeed's native config - nothing enforced it before
+# this fix, so the vhost was reachable from anywhere despite the
+# template's own comments describing it as restricted.
+###############################################################################
+{
+	my (undef, $content) = render($TEMPLATE{litespeed},
+		"UI_PORT=8443", "UI_SOCK=/run/csf-ui-web/csf-ui.sock",
+		"UI_ALLOW_INCLUDE=/etc/csf-ui/allow-litespeed.conf");
+	like($content, qr/accessControl\s*\{/, 'litespeed.conf.tpl: the UI_ALLOW include sits inside an accessControl block');
+	like($content, qr/accessControl\s*\{[^}]*deny\s+ALL/s, 'litespeed.conf.tpl: accessControl has a default deny');
+	like($content, qr/accessControl\s*\{[^}]*include\s+\/etc\/csf-ui\/allow-litespeed\.conf/s,
+		'litespeed.conf.tpl: the generated allow list is inside the same accessControl block, not a bare top-level include');
+}
+
+###############################################################################
+# Apache module guards (fix round 1, task-9-review.md I6): an unguarded
+# directive from a module that is not loaded is a FATAL error for
+# Apache's ENTIRE configuration, not just this vhost - confirmed for real
+# against a stock Ubuntu apache2 install with mod_ssl/mod_proxy_http/
+# mod_headers all disabled (see the task report for the reproduction);
+# this is the regression test that keeps it fixed.
+###############################################################################
+{
+	my (undef, $content) = render($TEMPLATE{apache},
+		"UI_PORT=8443", "UI_SOCK=/run/csf-ui-web/csf-ui.sock",
+		"UI_ALLOW_INCLUDE=/etc/csf-ui/allow-apache.conf");
+	like($content, qr/<IfModule\s+mod_ssl\.c>/, 'apache.conf.tpl: SSLEngine et al are guarded by <IfModule mod_ssl.c>');
+	like($content, qr/<IfModule\s+mod_proxy_http\.c>/, 'apache.conf.tpl: the proxy directives are guarded by <IfModule mod_proxy_http.c>');
+	like($content, qr/<IfModule\s+mod_headers\.c>\s*\n\s*RequestHeader/,
+		'apache.conf.tpl: RequestHeader is guarded by <IfModule mod_headers.c>');
+	like($content, qr/LimitRequestFields 64\b/,
+		'apache.conf.tpl: LimitRequestFields matches ConfigServer::UI::HTTP\'s $MAX_HEADERS (64), not 100');
+}
+
+###############################################################################
+# C1 (task-9-review.md): the installer must find install-webui.sh even
+# after the calling script has `cd`ed elsewhere - `cd webmin ; tar -czf
+# ...` near the end of six of the seven install.*.sh does exactly that,
+# and a bare relative `[ -f ui-src/dist/install-webui.sh ]` silently
+# skipped the entire WebUI setup on every one of them. This reproduces
+# the failure mode directly: capture CSF_SRC_ROOT the way each installer
+# now does, `cd` away, and confirm the captured root still resolves.
+###############################################################################
+{
+	my $dir = tempdir(CLEANUP => 1);
+	mkdir("$dir/webmin") or die "mkdir: $!";
+	mkdir("$dir/ui-src") or die "mkdir: $!";
+	mkdir("$dir/ui-src/dist") or die "mkdir: $!";
+	open(my $fh, '>', "$dir/ui-src/dist/install-webui.sh") or die "open: $!";
+	print $fh "#!/bin/sh\necho ran\n";
+	close $fh;
+
+	my $script = "$dir/repro.sh";
+	open(my $sh, '>', $script) or die "open: $!";
+	print $sh <<'SCRIPT';
+#!/bin/sh
+CSF_SRC_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd) || CSF_SRC_ROOT=.
+cd webmin
+if [ -f "$CSF_SRC_ROOT/ui-src/dist/install-webui.sh" ]; then
+	sh "$CSF_SRC_ROOT/ui-src/dist/install-webui.sh"
+else
+	echo "csf-ui: ui-src/dist/install-webui.sh not found under $CSF_SRC_ROOT - WebUI packaging was not run"
+fi
+SCRIPT
+	close $sh;
+
+	my $out = `sh "$script" 2>&1`;
+	like($out, qr/^ran$/m, 'C1 regression: install-webui.sh still runs after the calling script cd-s into webmin/');
+	unlike($out, qr/not found under/, 'and the "not found" fallback message is not the one that fired');
+}
+
+###############################################################################
 # Every installer script this task touches must stay `sh -n` clean -
 # task-9-brief.md's own Tests paragraph and the global constraint both
 # say so. Includes the three new ui-src/dist/*.sh files and all seven
@@ -265,4 +378,69 @@ for my $path (@SH_FILES) {
 	ok(-f $path, "$label exists");
 	my $rc = system('sh', '-n', $path);
 	is($rc, 0, "$label is sh -n clean");
+}
+
+###############################################################################
+# The synthetic reproduction earlier in this file proves the
+# CSF_SRC_ROOT pattern is sound; this proves each of the seven REAL
+# install.*.sh files actually uses it - the gap a synthetic-only test
+# would leave, since C1 (task-9-review.md) was a bug in six real files,
+# not in the pattern itself. Running all seven end to end (each does
+# ~500 lines of real file/systemctl/useradd work with no `set -e`,
+# against paths that do not exist in a bare checkout) is fragile to the
+# point of being its own source of false reds, so this checks statically
+# that (a) the capture line exists and (b) the WebUI invocation
+# references it rather than a bare relative path - exactly the two ways
+# C1's fix could silently regress.
+###############################################################################
+for my $installer (@SH_FILES) {
+	next unless $installer =~ m{install\.\w+\.sh$};
+	my $src = slurp($installer);
+	my $label = $installer;
+	$label =~ s{.*/}{};
+	like($src, qr/^CSF_SRC_ROOT=\$\(CDPATH=/m,
+		"$label: captures CSF_SRC_ROOT before anything can cd elsewhere");
+	like($src, qr{if \[ -f "\$CSF_SRC_ROOT/ui-src/dist/install-webui\.sh" \]},
+		"$label: the WebUI invocation guard uses \$CSF_SRC_ROOT, not a bare relative path");
+	like($src, qr{sh "\$CSF_SRC_ROOT/ui-src/dist/install-webui\.sh"},
+		"$label: the WebUI invocation itself uses \$CSF_SRC_ROOT, not a bare relative path");
+}
+
+###############################################################################
+# install-webui.sh static properties, fix round 1 (task-9-review.md I4,
+# I5): behaviours that need root/systemd/useradd to exercise end to end,
+# checked here the way this file already checks the rest of it - directly
+# against the shipped source, for the specific properties the review
+# named.
+###############################################################################
+{
+	my $install_webui = slurp("$DIST/install-webui.sh");
+
+	# I5: the function existed and this task removed it outright, not
+	# narrowed it - if it comes back, group csfui (which also gates
+	# /var/run/csf-ui/helper.sock, S2.3) must not be the mechanism again.
+	unlike($install_webui, qr/^grant_frontend_group\s*\(\)/m,
+		'install-webui.sh: grant_frontend_group() was removed, not narrowed (I5 - false premise, standing widening)');
+	unlike($install_webui, qr/usermod -aG csfui/,
+		'install-webui.sh: nothing adds a front-server account to group csfui anywhere');
+
+	# I4: the port must be range-checked against docs/WEBUI-RPC.md S10
+	# (1024-65535) before it reaches write_ui_conf(), and _enable_now()
+	# must ask systemctl what actually happened rather than assume it.
+	like($install_webui, qr/-ge 1024.*-le 65535|-ge 1024\b[\s\S]*-le 65535/,
+		'install-webui.sh: the interactive port prompt range-checks against 1024-65535 (S10)');
+	like($install_webui, qr/^_enable_now\s*\(\)/m,
+		'install-webui.sh: an _enable_now() helper exists');
+	like($install_webui, qr/systemctl is-enabled/,
+		'install-webui.sh: _enable_now() asks systemctl is-enabled rather than assuming');
+	like($install_webui, qr/systemctl is-active/,
+		'install-webui.sh: _enable_now() asks systemctl is-active rather than assuming');
+
+	# I3 / M9: verify_install() must check §2.3's modes/owners, not only
+	# existence, and must check the installed bin/ holds only the four
+	# names (the report previously claimed this and the code did not).
+	like($install_webui, qr/_check_path\b/,
+		'install-webui.sh: verify_install() uses a mode/owner-checking helper, not just -e/-x');
+	like($install_webui, qr/is not one of the four docs\/WEBUI-RPC\.md S2\.3 names/,
+		'install-webui.sh: verify_install() checks the installed bin/ holds only the four S2.3 names');
 }

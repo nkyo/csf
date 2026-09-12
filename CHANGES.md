@@ -37,6 +37,135 @@ line is added below the original notice; the original stays intact.
 
 ### Unreleased
 
+#### Task 9 fix round 1 — the installer that never ran on six of seven platforms, a sandbox that blocked its own firewall, and a vhost with no lock on the door
+
+**2026-09-12** — Three Critical, six Important and two Minor findings from review, all addressed. 2675 tests (was 2549).
+
+- **Critical 1 — six of the seven installers never invoked `install-webui.sh` at
+  all, silently.** `cd webmin ; tar -czf ...` near the end of `install.generic.sh`
+  (and five siblings) left the shell in `webmin/` before the appended block's
+  `[ -f ui-src/dist/install-webui.sh ]` ran - a bare relative path, now false, so
+  the whole block was skipped with no message. Only `install.cyberpanel.sh`
+  worked, because it has no such `cd`. Reproduced directly (a minimal script with
+  the same `cd` + guard shape), fixed by capturing
+  `CSF_SRC_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)` as the FIRST thing
+  each installer does - before any `cd` anywhere in the script - and referencing
+  `$CSF_SRC_ROOT` instead of a bare relative path everywhere the WebUI is
+  invoked. Verified against the reproduction (red before, green after) and
+  against a static check that all seven real files use the pattern, not only a
+  synthetic one that proves the pattern itself works.
+
+- **Critical 2 — `csf-ui-helper.service`'s sandbox blocked every operation it
+  exists to perform, including read-only `reconcile`.** The previous round
+  measured only the helper's own direct exec (`/usr/sbin/csf`) and stopped
+  there; `csf` itself execs `iptables`/`ip6tables`/`ipset` depending on the
+  host's detected backend, and every one of those inherits the same seccomp
+  filter and capability bounding set. Fixed: `RestrictAddressFamilies` gained
+  `AF_NETLINK` (nft/iptables-nft/modern ipset) and `AF_INET`/`AF_INET6`
+  (iptables-legacy/ip6tables-legacy raw sockets); `CapabilityBoundingSet` gained
+  `CAP_NET_ADMIN`, `CAP_NET_RAW`, and `CAP_DAC_READ_SEARCH` (missed even in the
+  fix pass that added the first two — `/etc/csf` is reset to `0600` by `lfd` on
+  every main-loop pass, and a `0600` directory has no search bit for anyone,
+  including root, without this capability — S13.2's own demonstration, reached
+  from a completely different angle); `ReadWritePaths` gained `/etc/csf`,
+  `/var/lib/csf`, `/usr/local/csf` (the three trees csf.pl already assumes it
+  owns, granted wholesale rather than guessed at file-by-file a second time) and
+  `/run` (even a read-only `iptables -S` takes `/run/xtables.lock` first); the
+  narrowing `SystemCallFilter=~@privileged @resources` line was removed outright
+  rather than re-guessed, since nothing here could rule out it blocking a
+  syscall somewhere in csf.pl's ~250KB or in iptables/nft/ipset's own startup
+  path. "Narrowest set that still works" means *works* wins the tie.
+
+- **Critical 3 — the LiteSpeed vhost shipped wide open.** A bare top-level
+  `include` of generated `allow ...` lines is not an ACL in LiteSpeed's native
+  config; wrapped in `accessControl { include ...; deny ALL }`, matching nginx's
+  `deny all;` and Apache's `<RequireAny>` default-deny. The template also
+  claimed `install-webui.sh`'s printed instructions already covered
+  `maxReqBodySize` — they did not; the instructions now do, and the template's
+  comment no longer claims otherwise.
+
+- **Important — Apache's `RequestHeader` (and the whole vhost's `SSLEngine`/
+  `Listen ... https`/`ProxyPass`) needs modules this template never declared as
+  optional.** An unrecognised directive is a FATAL error for Apache's entire
+  configuration, not a skipped feature — taking down every other site the host
+  serves, not just this UI. Reproduced for real against a stock Ubuntu apache2
+  install with `mod_ssl`/`mod_proxy_http`/`mod_headers` all disabled
+  (`AH00526: Invalid command 'SSLEngine'`), then fixed by wrapping the whole
+  vhost in `<IfModule mod_ssl.c><IfModule mod_proxy_http.c>...</IfModule></IfModule>`
+  and `RequestHeader` in its own `<IfModule mod_headers.c>` — confirmed clean
+  (`Syntax OK`) both with all three modules disabled and with all three enabled.
+
+- **Important — `grant_frontend_group()` rested on a false premise and was
+  removed, not narrowed.** It added the front server's worker account to group
+  `csfui` "so it can read the TLS key"; nginx/Apache/LiteSpeed all open their
+  configured key from their root-run master/admin process at config-load time,
+  before any unprivileged worker exists, so the grant fixed nothing. It also
+  handed that account socket-permission reach to the root-privileged helper's
+  RPC socket (group `csfui` also gates `/var/run/csf-ui/helper.sock`) — fail-closed
+  by the helper's own independent `SO_PEERCRED` uid check, so not a working
+  bypass, but a standing widening bought for a benefit that never existed.
+
+- **Important — Mode A's messaging said less than it should while doing more
+  than it said.** `install-webui.sh` renders a real, live vhost the moment the
+  front server next reloads for *any* reason, and (previously) permanently added
+  an account to group `csfui` — while announcing only that `csf-ui.service` was
+  not enabled. The printed notice now says plainly that the vhost is live
+  configuration that will 502 on port until a Mode A listener exists, and not to
+  reload the front server expecting it to work.
+
+- **Important — the interim Mode A socket path could not be created by the
+  account that would own it.** `/var/run/csf-ui` is `0755 root:root`, frozen for
+  `csf-ui-helper`'s own root-owned socket; `csf-ui.service` runs as `csfui`,
+  which cannot write there at all. `csf-ui.service` now declares
+  `RuntimeDirectory=csf-ui-web` (`RuntimeDirectoryMode=0750`), and the interim
+  socket path is `/run/csf-ui-web/csf-ui.sock` — a directory `csfui` actually
+  owns, compatible with `ProtectSystem=strict` without a matching
+  `ReadWritePaths` entry. The previous report's claim that the old path "doesn't
+  contradict anything §2.3 does freeze" was wrong: it did, functionally, since
+  §2.3's frozen mode on that directory made the path unusable regardless of what
+  the (still unwritten) listener code might do. Corrected here rather than left
+  standing.
+
+- **Important — `verify_install()` checked existence only.** `test -x` as root
+  is close to vacuous (true if *any* execute bit is set, on almost any file);
+  ownership was never checked in either direction, so a binary left
+  `0750 root:root` by a failed `chown` — unexecutable by `csfui` — passed. Replaced
+  with a `_check_path` helper that compares `stat -c '%a %U %G'` against §2.3's
+  exact modes and owners for every binary, directory, log file, certificate, key
+  and `ui.conf`; verified directly (a temp file with a deliberately wrong mode,
+  owner and group each fail with a specific message; a correct one passes
+  silently). `verify_install()` also now checks that the installed `bin/`
+  contains only the four §2.3 names — the previous report claimed this check
+  existed; it did not, and the report's own overstatement is the correction
+  recorded here.
+
+- **Important — `ui.conf`'s `UI_PORT` accepted any digit string, and Mode B
+  reported success without asking.** `80` and `99999` are both rejected by §10's
+  own `1024-65535` range but were written to `ui.conf` unvalidated, to fail only
+  later at `csf-ui` start time. The interactive prompt now range-checks before
+  accepting a value. `setup_mode_b()`/`setup_mode_a()` no longer print "enabled
+  and started" unconditionally after `systemctl enable --now`; a new
+  `_enable_now()` helper asks `systemctl is-enabled`/`is-active` afterwards and
+  reports what is actually true, with a pointer to `systemctl status`/
+  `journalctl` when it is not running.
+
+- **Minor — `apache.conf.tpl`'s `LimitRequestFields 100` exceeded
+  `ConfigServer::UI::HTTP`'s own `$MAX_HEADERS` (64)**, so a request Apache
+  accepted at the edge would still get a 431 from the backend instead of being
+  capped where the comment said it was. Set to 64.
+
+- **Minor — the report's own two inaccuracies, corrected rather than left
+  standing:** the `verify_install()` "only four names" claim (above), and the
+  Mode A socket path claim (above, under "could not be created").
+
+All three templates re-verified by rendering and, for nginx and Apache, by
+installing `apache2`/`nginx` (Ubuntu packages) and running `nginx -t` /
+`apache2ctl configtest` for real against the rendered output — including the
+specific negative case (Apache with the three modules disabled) that proves the
+`<IfModule>` guards do what they claim rather than merely existing. LiteSpeed
+has no equivalent available in this environment; that template's fixes remain
+reasoned from documented `accessControl` behaviour, as before.
+
 #### Task 9 — packaging: the mode-B entry point, TLS material, systemd units, front-end templates, and an installer that verifies what it installed
 
 **2026-09-12** — Makes the replacement WebUI installable: `ui-src/dist/{nginx,apache,litespeed}.conf.tpl`,
