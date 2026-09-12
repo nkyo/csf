@@ -40,7 +40,7 @@ use lib "$FindBin::Bin/..", "$FindBin::Bin/../ui-src/lib";
 use File::Temp qw(tempdir);
 use Socket ();
 use Time::HiRes ();
-use Test::More tests => 249;
+use Test::More tests => 254;
 
 require_ok('ConfigServer::UI::HTTP');
 require_ok('ConfigServer::UI::Server');
@@ -1077,12 +1077,47 @@ sub _connect_unix {
 		'a socket directory this process does not own refuses - it could not create a socket there anyway');
 }
 {
-	my $wide = tempdir(CLEANUP => 1);
-	chmod(0777, $wide) or die "chmod: $!";
-	my @problems = $S->can('mode_a_preflight')->(socket_path => "$wide/csf-ui.sock");
-	ok((grep { /writable by other/ } @problems),
-		'a world-writable socket directory refuses: any local user could replace the socket the front server connects to');
-	chmod(0700, $wide);
+	# FIX ROUND 1, F3: NO GROUP WRITE BIT EITHER, not only no other write
+	# bit. The check read 0002 alone and therefore accepted 0770 and 0775
+	# in silence - measured, and then demonstrated end to end: a member of
+	# the socket group unlinked the running daemon's socket, bound its own
+	# in its place, and the administrator's request INCLUDING COOKIES was
+	# delivered to a non-csfui account while that account's reply went back
+	# through the administrator's real TLS as the UI.
+	#
+	# This is not a group that happens to have other members - the socket
+	# is 0660 group-owned by a group the installer deliberately puts the
+	# front server's worker account into, so "writable by that group"
+	# always means "writable by an account that is not us".
+	# docs/WEBUI-RPC.md section 2.1's template for the identical hazard on
+	# the helper's socket directory already demanded both bits.
+	#
+	# Every mode is asserted in one table so that a future narrowing or
+	# widening of the mask cannot pass by half: the shipped 0750 must still
+	# be accepted (a directory the group cannot write but CAN traverse is
+	# exactly the deployment), and 0700 as well.
+	my @case = (
+		[0700, 0, 'a directory only this process can enter is accepted'],
+		[0750, 0, 'the shipped 0750 csfui:csf-ui-sock is accepted - the group traverses it, it does not write there'],
+		[0770, 1, 'F3: a GROUP-writable socket directory refuses: a member of the socket group could replace the socket and be handed the administrator session'],
+		[0775, 1, 'F3: and so does 0775, which the 0002-only check accepted in silence'],
+		[0777, 1, 'a world-writable socket directory refuses'],
+	);
+	for my $case (@case) {
+		my ($mode, $expect, $name) = @$case;
+		my $dir = tempdir(CLEANUP => 1);
+		chmod($mode, $dir) or die "chmod: $!";
+		my @problems = $S->can('mode_a_preflight')->(socket_path => "$dir/csf-ui.sock");
+		my $refused = (grep { /writable by its group or by other/ } @problems) ? 1 : 0;
+		is($refused, $expect, $name);
+		chmod(0700, $dir);
+	}
+	my $dir = tempdir(CLEANUP => 1);
+	chmod(0770, $dir) or die "chmod: $!";
+	my @problems = $S->can('mode_a_preflight')->(socket_path => "$dir/csf-ui.sock");
+	ok((grep { /mode 0770/ } @problems),
+		'F3: and the refusal names the mode it actually found, so the operator can see which bit to clear');
+	chmod(0700, $dir);
 }
 {
 	my $file = "$SOCK_DIR/a-file";

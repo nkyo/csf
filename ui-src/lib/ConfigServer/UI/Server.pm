@@ -585,11 +585,26 @@ sub preflight {
 #       one it cannot create a socket in, and (docs/WEBUI-RPC.md section
 #       2.1 makes the same argument for the helper's own socket
 #       directory) one where somebody else chooses where our socket lives;
-#     * it is not writable by other - a world-writable directory means any
-#       local user can unlink our socket and bind their own in its place,
-#       and the front server would then proxy the administrator's session
-#       to them. The mode of the socket itself cannot defend against that;
-#       only the directory can.
+#     * NEITHER the group write bit NOR the other write bit is set. This
+#       read 0002 alone until fix round 1 (F3), which accepted 0770 and
+#       0775 without a word - and the shipped socket is 0660 group-owned
+#       by a group that has at least one OTHER member in it by design
+#       (the front server's worker account; the installer puts it there).
+#       So a group-writable directory hands that member exactly what the
+#       other-write bit hands the world: unlink our socket, bind their own
+#       in its place, and the front server proxies the administrator's
+#       session - cookies and all - to a process running as somebody
+#       else, which answers as the UI over the administrator's real TLS.
+#       Demonstrated end to end by the round-1 review, not argued.
+#       docs/WEBUI-RPC.md section 2.1's template for the identical hazard
+#       on the helper's own socket directory already demands no group OR
+#       other write bit; only this copy of it was weaker. The comment
+#       above states the stake correctly and always did: "The mode of the
+#       socket itself cannot defend against that; only the directory can."
+#       The shipped 0750 csfui:csf-ui-sock still passes, which is the
+#       point - the group bit that matters for REACHING the socket is on
+#       the socket (0660), and the directory needs only to be traversable
+#       by that group, never writable by it.
 ###############################################################################
 sub mode_a_preflight {
 	my (%opt) = @_;
@@ -622,8 +637,8 @@ sub mode_a_preflight {
 	else {
 		push @problem, "the mode-A socket directory ($directory) is owned by uid $st[4], not by this process (uid $>); it cannot create its socket there"
 			unless $st[4] == $>;
-		push @problem, "the mode-A socket directory ($directory) is writable by other; any local user could replace the socket the front web server connects to"
-			if ($st[2] & 0002);
+		push @problem, sprintf("the mode-A socket directory (%s) is mode %04o, which is writable by its group or by other; a local user who can write there could replace the socket the front web server connects to, and be handed the administrator's session", $directory, $st[2] & 07777)
+			if ($st[2] & 0022);
 	}
 
 	return @problem;
