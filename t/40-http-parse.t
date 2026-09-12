@@ -40,7 +40,7 @@ use lib "$FindBin::Bin/..", "$FindBin::Bin/../ui-src/lib";
 use File::Temp qw(tempdir);
 use Socket ();
 use Time::HiRes ();
-use Test::More tests => 240;
+use Test::More tests => 249;
 
 require_ok('ConfigServer::UI::HTTP');
 require_ok('ConfigServer::UI::Server');
@@ -1466,12 +1466,20 @@ sub _connect_unix {
 	# own eval around dispatch() and turned into a 500 - so "did it die
 	# out here" is not the question. "Did the deadline fire, and did it
 	# fire on time" is.
+	#
+	# dispatch_timeout is set explicitly and short for the same reason
+	# handshake_timeout is in the R31 test above: since F1 the request
+	# budget has a dispatch term, and leaving it at its 40s default would
+	# make this test's "it fires on its own budget" assertion wait out the
+	# whole 10s hang and then some. The property under test is that the
+	# deadline exists and fires, not what it is sized to.
 	my $fired = 0;
 	my $server = $S->new(
-		app            => HangingApp->new,
-		mode           => 'a',
-		header_timeout => 0.1, body_timeout => 0.1, write_timeout => 0.1,
-		watchdog_exit  => sub { $fired++; die "mode A watchdog fired\n" },
+		app             => HangingApp->new,
+		mode            => 'a',
+		header_timeout  => 0.1, body_timeout => 0.1, write_timeout => 0.1,
+		dispatch_timeout => 0.2,
+		watchdog_exit   => sub { $fired++; die "mode A watchdog fired\n" },
 	);
 	my $t0 = Time::HiRes::time();
 	eval { $server->_serve_accepted($near, 'unix') };
@@ -1481,6 +1489,123 @@ sub _connect_unix {
 	cmp_ok($elapsed, '<', 5,
 		'and it fires on its OWN budget, not after a ten-second hang - nothing waits for dispatch() to finish');
 	close $far;
+}
+
+###############################################################################
+# FIX ROUND 1, F1: THE REQUEST BUDGET MUST PRICE dispatch().
+#
+# The budget armed over the request phase covered header_timeout +
+# body_timeout + write_timeout and nothing else, while dispatch() sat
+# inside it with no term of its own - which _serve_accepted()'s own
+# comment already admitted in so many words. Measured against the shipped
+# numbers: headers delivered over 14s (legal - HEADER_TIMEOUT is 15) plus
+# a dispatch() of 30s (three ConfigServer::UI::Client calls at that
+# module's own 10s default, which _route_ui_overview genuinely makes) had
+# the watchdog fire at 35.0s. watchdog_exit is POSIX::_exit(1), so the
+# administrator got no response at all - the exact spurious kill R36 was
+# raised to remove, reached through dispatch() instead of the handshake.
+#
+# Scaled down here rather than staged at 35s, because what has to be
+# proven is the arithmetic, not the constants: header+body+write is 0.45s,
+# dispatch() takes 1.2s, and the dispatch term is 3s. A budget without the
+# dispatch term is 0.45s and kills this request; with it the budget is
+# 3.45s and serves it. The response is read off the wire, so "not killed"
+# is proven by what the peer received rather than only by the watchdog
+# counter staying at zero.
+###############################################################################
+{
+	package SlowDispatchApp;
+	sub new { return bless {}, shift }
+	sub dispatch {
+		select(undef, undef, undef, 1.2); # longer than header+body+write, shorter than the dispatch term
+		return { status => 200, headers => [['Content-Type', 'text/plain']], body => 'served' };
+	}
+}
+{
+	my ($near, $far) = _pair();
+	syswrite($far, "GET /ui/overview HTTP/1.1\r\nHost: x\r\nX-Real-IP: 203.0.113.9\r\n\r\n");
+	my $fired = 0;
+	my $server = $S->new(
+		app              => SlowDispatchApp->new,
+		mode             => 'a',
+		header_timeout   => 0.2, body_timeout => 0.2, write_timeout => 0.05,
+		dispatch_timeout => 3,
+		watchdog_exit    => sub { $fired++; die "F1 watchdog fired\n" },
+	);
+
+	my $died = eval { $server->_serve_accepted($near, 'unix'); 1 } ? '' : $@;
+	is($fired, 0,
+		'F1 mode A: a route whose dispatch() takes longer than header+body+write is not killed - the budget has a dispatch term')
+		or diag("died with: $died");
+	local $/;
+	my $out = <$far>;
+	close $far;
+	like($out, qr{\AHTTP/1\.1 200 },
+		'F1 mode A: and the administrator actually receives the response, rather than POSIX::_exit(1) and nothing at all');
+}
+{
+	# The same arithmetic in mode B, which had the identical sum and would
+	# otherwise have kept the bug this fix removed from mode A. A blessed
+	# stand-in for IO::Socket::SSL, exactly as the R36 test above uses.
+	my ($near, $far) = _pair();
+	syswrite($far, "GET /ui/overview HTTP/1.1\r\nHost: x\r\n\r\n");
+	my $fired = 0;
+	my $server = $S->new(
+		app               => SlowDispatchApp->new,
+		handshake_timeout => 1,
+		header_timeout    => 0.2, body_timeout => 0.2, write_timeout => 0.05,
+		dispatch_timeout  => 3,
+		tls_wrap          => sub { bless $_[0], 'IO::Socket::SSL'; return $_[0] },
+		watchdog_exit     => sub { $fired++; die "F1 watchdog fired\n" },
+	);
+
+	my $died = eval { $server->_serve_accepted($near, '203.0.113.9'); 1 } ? '' : $@;
+	is($fired, 0,
+		'F1 mode B: the same route is not killed there either - both modes read one budget, not two copies of a sum')
+		or diag("died with: $died");
+	local $/;
+	my $out = <$far>;
+	close $far;
+	like($out, qr{\AHTTP/1\.1 200 }, 'F1 mode B: and its response reaches the wire too');
+}
+{
+	# And the term is a TERM, not the removal of the deadline: a dispatch()
+	# that outruns the whole budget is still killed. Without this, "fix F1"
+	# could be satisfied by deleting the alarm, which is the failure R31
+	# exists to prevent.
+	my ($near, $far) = _pair();
+	syswrite($far, "GET /ui/overview HTTP/1.1\r\nHost: x\r\nX-Real-IP: 203.0.113.9\r\n\r\n");
+	my $fired = 0;
+	my $server = $S->new(
+		app              => HangingApp->new, # sleeps 10s
+		mode             => 'a',
+		header_timeout   => 0.1, body_timeout => 0.1, write_timeout => 0.05,
+		dispatch_timeout => 0.3,
+		watchdog_exit    => sub { $fired++; die "F1 total-budget watchdog fired\n" },
+	);
+	my $t0 = Time::HiRes::time();
+	eval { $server->_serve_accepted($near, 'unix') };
+	my $elapsed = Time::HiRes::time() - $t0;
+	is($fired, 1,
+		'F1: a dispatch() that outruns even the dispatch term is still killed - the term prices the phase, it does not remove the deadline');
+	cmp_ok($elapsed, '<', 5, "F1: and within the budget it was given ($elapsed s), not the 10s the hang simulated");
+	close $far;
+}
+{
+	# The budget itself, read directly, because the two behavioural cases
+	# above can only ever bracket it. Every term of the sum is present and
+	# the function is the single source both modes arm from.
+	my $server = $S->new(app => FakeApp->new,
+		header_timeout => 1, body_timeout => 2, write_timeout => 4, dispatch_timeout => 8);
+	is($server->_request_budget, 15,
+		'F1: _request_budget() is header + body + write + dispatch, all four terms');
+	my $default = $S->new(app => FakeApp->new);
+	no warnings 'once'; # the two package globals below are read here and nowhere else in this file
+	is($default->{dispatch_timeout},
+		$ConfigServer::UI::Client::DEFAULT_TIMEOUT * $ConfigServer::UI::Server::MAX_HELPER_CALLS_PER_REQUEST,
+		"F1: and the default dispatch term is derived from ConfigServer::UI::Client's own per-call timeout, not copied from it");
+	cmp_ok($ConfigServer::UI::Server::MAX_HELPER_CALLS_PER_REQUEST, '>=', 3,
+		'F1: with room for the three sequential helper calls _route_ui_overview actually makes');
 }
 
 ###############################################################################

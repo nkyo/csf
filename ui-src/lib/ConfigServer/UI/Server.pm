@@ -120,8 +120,12 @@ use warnings;
 use Socket ();
 use POSIX ();
 use Time::HiRes ();
-use ConfigServer::UI::Proto ();
-use ConfigServer::UI::HTTP  ();
+use ConfigServer::UI::Proto  ();
+use ConfigServer::UI::HTTP   ();
+# For $DEFAULT_TIMEOUT only - the per-helper-call bound the request
+# budget's dispatch term is derived from (F1). This module never makes an
+# RPC call itself; ui-src/bin/csf-ui's App does, and already loads this.
+use ConfigServer::UI::Client ();
 
 our $VERSION = '1.00';
 
@@ -158,6 +162,61 @@ our $DEFAULT_ACCEPT_BACKOFF = 0.1;
 # than before this fix existed at all, when such a child held its slot for
 # the full combined budget rather than only this one.
 our $DEFAULT_HANDSHAKE_TIMEOUT = 10;
+
+###############################################################################
+# THE DISPATCH TERM OF THE REQUEST BUDGET (fix round 1, F1).
+#
+# _serve_accepted() arms ONE alarm over the whole request phase, and that
+# phase contains three things: HTTP.pm reading the request, the app's
+# dispatch(), and HTTP.pm writing the response. Until this constant
+# existed the budget was header_timeout + body_timeout + write_timeout and
+# nothing else - which prices the first and the third and leaves the
+# second at zero, while _serve_accepted()'s own comment already said in
+# so many words that dispatch() is inside the budget and has no deadline
+# of its own. The arithmetic and the comment disagreed, and the comment
+# was right.
+#
+# MEASURED, not argued. With the 35s budget that sum produced, a peer
+# that delivered its headers over 14s - legal, HEADER_TIMEOUT is 15 - and
+# a dispatch() that took 30s had the watchdog fire at 35.0s. watchdog_exit
+# is POSIX::_exit(1), so the administrator gets no response at all: not a
+# 500, not a 504, nothing. That is precisely the spurious kill R36 was
+# raised to remove, arriving through dispatch() rather than through the
+# handshake.
+#
+# 30s is not a pathological dispatch(). ui-src/bin/csf-ui's
+# _route_ui_overview() makes THREE sequential ConfigServer::UI::Client
+# calls (status, counts, reconcile), each bounded by that module's own
+# $DEFAULT_TIMEOUT of 10s and by nothing shorter, so a helper that is slow
+# rather than broken - a reconcile over a large rule set, an iptables
+# under load - reaches 30s without anything being wrong.
+#
+# DERIVED RATHER THAN PICKED, so that the two numbers it depends on cannot
+# drift away from it silently:
+#
+#   * $ConfigServer::UI::Client::DEFAULT_TIMEOUT is the per-call bound.
+#     Read from that module rather than copied, the same way
+#     header_timeout/body_timeout/write_timeout below are read from
+#     ConfigServer::UI::HTTP rather than restated here.
+#   * $MAX_HELPER_CALLS_PER_REQUEST is the worst-case number of SEQUENTIAL
+#     helper calls one route makes. Three today (_route_ui_overview; every
+#     other route makes one), and four here on purpose: a fourth call
+#     added to that route would otherwise make it unserviceable
+#     unconditionally whenever the helper is merely slow, which is the
+#     failure this whole block exists to stop being one commit away.
+#
+# WHAT THIS IS NOT. It is not a deadline over dispatch() - there is still
+# exactly one alarm over the request phase, and a route that hangs forever
+# is still killed, now at the sum below instead of at 35s. Giving
+# dispatch() a deadline of its own means per-phase clocks that are not the
+# total clock, which is a restructuring of the watchdog rather than a term
+# in it, and is not a thing to improvise in a fix round. The honest
+# statement of what this change does is: the budget now prices every
+# phase it covers, instead of two of the three.
+###############################################################################
+our $MAX_HELPER_CALLS_PER_REQUEST = 4;
+our $DEFAULT_DISPATCH_TIMEOUT =
+	$ConfigServer::UI::Client::DEFAULT_TIMEOUT * $MAX_HELPER_CALLS_PER_REQUEST;
 
 ###############################################################################
 # Mode A's transport constants. NONE of these is a ui.conf key, and none of
@@ -969,6 +1028,7 @@ sub new {
 		backlog           => defined $opt{backlog} ? $opt{backlog} : $DEFAULT_LISTEN_BACKLOG,
 		accept_backoff    => defined $opt{accept_backoff} ? $opt{accept_backoff} : $DEFAULT_ACCEPT_BACKOFF,
 		handshake_timeout => defined $opt{handshake_timeout} ? $opt{handshake_timeout} : $DEFAULT_HANDSHAKE_TIMEOUT,
+		dispatch_timeout  => defined $opt{dispatch_timeout}  ? $opt{dispatch_timeout}  : $DEFAULT_DISPATCH_TIMEOUT,
 		header_timeout    => defined $opt{header_timeout} ? $opt{header_timeout} : $ConfigServer::UI::HTTP::HEADER_TIMEOUT,
 		body_timeout      => defined $opt{body_timeout}   ? $opt{body_timeout}   : $ConfigServer::UI::HTTP::BODY_TIMEOUT,
 		write_timeout     => defined $opt{write_timeout}  ? $opt{write_timeout}  : $ConfigServer::UI::HTTP::WRITE_TIMEOUT,
@@ -1468,14 +1528,32 @@ sub _default_tls_wrap {
 # and running it would produce a TLS server speaking into a plain-HTTP
 # proxy connection - a hang, not an error.
 ###############################################################################
+# THE REQUEST PHASE'S BUDGET, IN ONE PLACE RATHER THAN TWO (F1).
+#
+# Both modes arm the same budget over the same three things, and until F1
+# both computed it from their own copy of the same sum - which is how mode
+# B kept the arithmetic mode A had just had corrected. One function, so a
+# term can only be added to both or to neither.
+#
+# Every term is priced, including dispatch() (see
+# $DEFAULT_DISPATCH_TIMEOUT above for why the sum without it killed a
+# legitimate request, measured). Read off $self, not the package globals,
+# so an injected short timeout in a test shortens the budget it is testing.
+sub _request_budget {
+	my ($self) = @_;
+	return $self->{header_timeout}
+		+ $self->{body_timeout}
+		+ $self->{write_timeout}
+		+ $self->{dispatch_timeout};
+}
+
 sub _serve_accepted {
 	my ($self, $connection, $peer_addr) = @_;
 
 	local $SIG{ALRM} = $self->{watchdog_exit};
 
 	if ($self->{mode} eq 'a') {
-		my $request_budget = $self->{header_timeout} + $self->{body_timeout} + $self->{write_timeout};
-		Time::HiRes::alarm($request_budget);
+		Time::HiRes::alarm($self->_request_budget);
 		$self->handle_connection($connection, $peer_addr);
 		Time::HiRes::alarm(0);
 		close $connection;
@@ -1502,8 +1580,7 @@ sub _serve_accepted {
 	# something that is not a blessed reference at all, and a method call
 	# on that would die instead of simply failing the check.
 	if ($tls_socket && UNIVERSAL::isa($tls_socket, 'IO::Socket::SSL')) {
-		my $request_budget = $self->{header_timeout} + $self->{body_timeout} + $self->{write_timeout};
-		Time::HiRes::alarm($request_budget); # a fresh budget for this phase alone (R36)
+		Time::HiRes::alarm($self->_request_budget); # a fresh budget for this phase alone (R36)
 		$self->handle_connection($tls_socket, $peer_addr);
 		Time::HiRes::alarm(0);
 		close $tls_socket;
