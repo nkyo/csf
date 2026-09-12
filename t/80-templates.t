@@ -43,7 +43,7 @@ use FindBin ();
 use lib "$FindBin::Bin/..", "$FindBin::Bin/../ui-src/lib";
 
 use File::Temp qw(tempdir tempfile);
-use Test::More tests => 207;
+use Test::More tests => 208;
 
 my $DIST = "$FindBin::Bin/../ui-src/dist";
 my $RENDERER = "$DIST/render-template.sh";
@@ -238,9 +238,25 @@ like($csf_ui, qr/^RuntimeDirectoryMode=0750$/m,
 #
 # So the module that now binds the socket
 # (ConfigServer::UI::Server::$DEFAULT_UNIX_SOCKET_PATH) is the single
-# authority and the other three are compared against it. A future edit
-# that moves the path in one place and not the others reddens here rather
-# than becoming a 502 on somebody's server.
+# authority, and what can be compared against it is compared against it.
+#
+# THAT IS TWO FILES, NOT FOUR, and this header used to claim four (fix
+# round 1, F12). The templates cannot carry the literal path at all -
+# they carry @@UI_SOCK@@ - so a test that renders $SOCKET_PATH into the
+# placeholder and then asserts the output contains $SOCKET_PATH is
+# asserting that a substitution substituted. Proven by moving
+# $DEFAULT_UNIX_SOCKET_PATH: only the installer's `sock=` and the unit's
+# RuntimeDirectory reddened; the three "proxies to that exact socket path"
+# cases stayed green, as they always will.
+#
+# What closes the loop for the templates is a different pair of facts, and
+# both are asserted below instead: the INSTALLER passes its own `sock=`
+# into the renderer as UI_SOCK (so the value the templates receive is the
+# one already compared against Server.pm), and each template puts whatever
+# it receives into the PROXY DIRECTIVE its own server uses rather than
+# into a comment (asserted with a sentinel path, so the assertion is about
+# the template's structure and cannot be satisfied by coincidence with the
+# real value).
 ###############################################################################
 require_ok('ConfigServer::UI::Server');
 # Each of these package variables is read exactly once here, which is
@@ -265,24 +281,38 @@ $socket_directory =~ s{/[^/]+\z}{};
 is($socket_directory, '/run/' . (defined $runtime_directory ? $runtime_directory : ''),
 	'and that RuntimeDirectory IS the directory Server.pm binds its socket in - nothing else creates it');
 
-# And the three templates: each must carry the path once rendered with
-# it, in the directive its own server uses to reach a unix socket. A
-# template that rendered the value into a comment and not into its proxy
-# directive would sail through the generic no-placeholder check above.
+# The installer's own `sock=` is what reaches the templates, and that is
+# the link that makes their placeholder equivalent to Server.pm's value.
+# Without this line the installer could agree with Server.pm about `sock=`
+# and then render something else entirely into the vhosts.
+like($installer, qr/"UI_SOCK=\$sock"/,
+	'install-webui.sh passes its own $sock into the template renderer as UI_SOCK - which is what makes the templates agree with Server.pm at all');
+
+# And each template must put whatever it receives into the PROXY DIRECTIVE
+# its own server uses to reach a unix socket, not into a comment (which
+# would sail through the generic no-placeholder check above). A SENTINEL
+# path, not $SOCKET_PATH: rendering the real value in and then asserting
+# the real value comes out is a tautology (F12), while a value that
+# appears nowhere in any template proves the placeholder actually feeds
+# that directive.
+my $SENTINEL = '/run/csf-ui-sentinel/only-here.sock';
 {
-	my (undef, $out) = render($TEMPLATE{nginx}, 'UI_PORT=8443', "UI_SOCK=$SOCKET_PATH",
+	my (undef, $out) = render($TEMPLATE{nginx}, 'UI_PORT=8443', "UI_SOCK=$SENTINEL",
 		'UI_ALLOW_INCLUDE=/etc/csf-ui/allow-nginx.conf');
-	like($out, qr{proxy_pass\s+http://unix:\Q$SOCKET_PATH\E:}, 'nginx proxies to that exact socket path');
+	like($out, qr{proxy_pass\s+http://unix:\Q$SENTINEL\E:},
+		'nginx\'s proxy_pass is fed by the @@UI_SOCK@@ placeholder - whatever the installer passes is where nginx proxies to');
 }
 {
-	my (undef, $out) = render($TEMPLATE{apache}, 'UI_PORT=8443', "UI_SOCK=$SOCKET_PATH",
+	my (undef, $out) = render($TEMPLATE{apache}, 'UI_PORT=8443', "UI_SOCK=$SENTINEL",
 		'UI_ALLOW_INCLUDE=/etc/csf-ui/allow-apache.conf');
-	like($out, qr{ProxyPass\s+"/"\s+"unix:\Q$SOCKET_PATH\E\|}, 'Apache proxies to that exact socket path');
+	like($out, qr{ProxyPass\s+"/"\s+"unix:\Q$SENTINEL\E\|},
+		"Apache's ProxyPass is fed by it too");
 }
 {
-	my (undef, $out) = render($TEMPLATE{litespeed}, 'UI_PORT=8443', "UI_SOCK=$SOCKET_PATH",
+	my (undef, $out) = render($TEMPLATE{litespeed}, 'UI_PORT=8443', "UI_SOCK=$SENTINEL",
 		'UI_ALLOW_INCLUDE=/etc/csf-ui/allow-litespeed.conf');
-	like($out, qr{address\s+UDS://\Q$SOCKET_PATH\E}, 'LiteSpeed proxies to that exact socket path');
+	like($out, qr{address\s+UDS://\Q$SENTINEL\E},
+		"and so is LiteSpeed's address UDS://");
 }
 
 # The socket's own mode is the other half of "the front server can reach

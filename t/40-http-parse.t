@@ -40,7 +40,7 @@ use lib "$FindBin::Bin/..", "$FindBin::Bin/../ui-src/lib";
 use File::Temp qw(tempdir);
 use Socket ();
 use Time::HiRes ();
-use Test::More tests => 303;
+use Test::More tests => 310;
 
 require_ok('ConfigServer::UI::HTTP');
 require_ok('ConfigServer::UI::Server');
@@ -1029,9 +1029,19 @@ sub _connect_unix {
 	unlink $path;
 }
 {
-	# The IPv4 fallthrough it used to take, shown for what it produced -
-	# so that a future edit that removes the unix case cannot pass by
-	# accident.
+	# THE CLAIM HERE USED TO BE FALSE (fix round 1, F13). It said this
+	# case existed "so that a future edit that removes the unix case
+	# cannot pass by accident" - but it passes AF_INET explicitly, so
+	# removing _peer_text()'s AF_UNIX return cannot redden it. The test
+	# that genuinely guards that return is the one immediately above,
+	# which hands _peer_text() a real accept()ed unix sockaddr with
+	# AF_UNIX, exactly as run() does.
+	#
+	# What this case actually shows, and is kept for, is the SHAPE of the
+	# original bug: a unix sockaddr read as an IPv4 one produces undef -
+	# not an exception, not a wrong address, just the undef run() then fed
+	# to the allowlist and closed on, with nothing logged anywhere. It is
+	# a record of the failure mode, not a guard on the fix.
 	my $unix_sockaddr = Socket::pack_sockaddr_un('');
 	is($S->can('_peer_text')->($unix_sockaddr, Socket::AF_INET()), undef,
 		'requirement 2: read as an IPv4 sockaddr, a unix one still produces undef - which is what run() used to close on');
@@ -1707,66 +1717,66 @@ sub _connect_unix {
 }
 
 ###############################################################################
-# Requirement 7 - HTTP.pm's limits are NOT relaxed behind a front server.
-# They are the defence against a local peer that got past the peercred
-# check, and a bound on what the front server re-emits. Each of these
-# drives the mode-A path specifically.
+# Requirement 7 - HTTP.pm's limits are NOT RELAXED BEHIND A FRONT SERVER.
+#
+# THE CLAIM THIS SECTION USED TO MAKE WAS FALSE (fix round 1, F11). It said
+# "each of these drives the mode-A path specifically", and four of its
+# cases - body cap, header count, method allowlist, request-line cap - did
+# not: all four fault inside read_request(), which runs BEFORE
+# handle_connection() reaches its mode branch at all. Proven by replacing
+# handle_connection()'s entire mode-A branch with the pre-change
+# one-liner: the X-Real-IP cases above redden, and those four stayed
+# green. They were duplicates of t/41-http-hostile.t wearing a mode-A
+# label, and they demonstrated nothing about requirement 7.
+#
+# What DOES demonstrate requirement 7 is the thing they were arranged not
+# to look at: the two modes must answer the same hostile input the same
+# way. "Not relaxed behind a front server" is a statement relating mode A
+# to mode B, and a case run in only one mode cannot make it. So each input
+# is driven through handle_connection() in BOTH modes and the statuses are
+# compared to each other as well as to the expected one - which is also
+# the only shape that would catch a future per-mode limit, the actual
+# hazard the requirement names.
+#
+# (There is deliberately no attempt to assert this at a finer grain.
+# HTTP.pm is shared, byte-identical, and has no mode-conditional limit
+# anywhere in it; there is no seam to test, and inventing one for a test
+# would be the opposite of what requirement 7 asks.)
 ###############################################################################
 {
-	my $too_big = $ConfigServer::UI::HTTP::MAX_BODY_BYTES + 1;
-	my ($near, $far) = _pair();
-	syswrite($far, "POST /api/deny HTTP/1.1\r\nHost: x\r\nX-Real-IP: 203.0.113.9\r\n"
-		. "Content-Length: $too_big\r\n\r\n");
-	my $app = FakeApp->new;
-	my $server = $S->new(app => $app, mode => 'a',
-		header_timeout => 2, body_timeout => 2, write_timeout => 2);
-	$server->handle_connection($near, 'unix');
-	close $near;
-	local $/;
-	my $out = <$far>;
-	close $far;
-	like($out, qr{\AHTTP/1\.1 413 }, 'requirement 7: the body cap still applies in mode A');
-	is(scalar(@{ $app->{calls} }), 0, 'and the oversized body is never read into memory to find out');
-}
-{
-	my ($near, $far) = _pair();
-	my $headers = join('', map { "X-Pad-$_: v\r\n" } 1 .. ($ConfigServer::UI::HTTP::MAX_HEADERS + 2));
-	syswrite($far, "GET / HTTP/1.1\r\nX-Real-IP: 203.0.113.9\r\n$headers\r\n");
-	my $app = FakeApp->new;
-	my $server = $S->new(app => $app, mode => 'a',
-		header_timeout => 2, body_timeout => 2, write_timeout => 2);
-	$server->handle_connection($near, 'unix');
-	close $near;
-	local $/;
-	my $out = <$far>;
-	close $far;
-	like($out, qr{\AHTTP/1\.1 431 }, 'requirement 7: the header count cap still applies in mode A');
-}
-{
-	my ($near, $far) = _pair();
-	syswrite($far, "DELETE / HTTP/1.1\r\nX-Real-IP: 203.0.113.9\r\n\r\n");
-	my $app = FakeApp->new;
-	my $server = $S->new(app => $app, mode => 'a',
-		header_timeout => 2, body_timeout => 2, write_timeout => 2);
-	$server->handle_connection($near, 'unix');
-	close $near;
-	local $/;
-	my $out = <$far>;
-	close $far;
-	like($out, qr{\AHTTP/1\.1 405 }, 'requirement 7: the method allowlist still applies in mode A');
-}
-{
-	my ($near, $far) = _pair();
-	syswrite($far, "GET " . ('/x' x 6000) . " HTTP/1.1\r\nX-Real-IP: 203.0.113.9\r\n\r\n");
-	my $app = FakeApp->new;
-	my $server = $S->new(app => $app, mode => 'a',
-		header_timeout => 2, body_timeout => 2, write_timeout => 2);
-	$server->handle_connection($near, 'unix');
-	close $near;
-	local $/;
-	my $out = <$far>;
-	close $far;
-	like($out, qr{\AHTTP/1\.1 414 }, 'requirement 7: the request-line cap still applies in mode A');
+	my $pad = join('', map { "X-Pad-$_: v\r\n" } 1 .. ($ConfigServer::UI::HTTP::MAX_HEADERS + 2));
+	my @case = (
+		[413, "POST /api/deny HTTP/1.1\r\nHost: x\r\nX-Real-IP: 203.0.113.9\r\n"
+			. "Content-Length: " . ($ConfigServer::UI::HTTP::MAX_BODY_BYTES + 1) . "\r\n\r\n",
+			'the body cap'],
+		[431, "GET / HTTP/1.1\r\nHost: x\r\nX-Real-IP: 203.0.113.9\r\n$pad\r\n", 'the header count cap'],
+		[405, "DELETE / HTTP/1.1\r\nHost: x\r\nX-Real-IP: 203.0.113.9\r\n\r\n", 'the method allowlist'],
+		[414, "GET " . ('/x' x 6000) . " HTTP/1.1\r\nHost: x\r\nX-Real-IP: 203.0.113.9\r\n\r\n",
+			'the request-line cap'],
+	);
+	for my $case (@case) {
+		my ($expected, $request, $what) = @$case;
+		my %status;
+		my %calls;
+		for my $mode (qw(a b)) {
+			my ($near, $far) = _pair();
+			syswrite($far, $request);
+			my $app = FakeApp->new;
+			my $server = $S->new(app => $app, mode => $mode,
+				header_timeout => 2, body_timeout => 2, write_timeout => 2);
+			$server->handle_connection($near, $mode eq 'a' ? 'unix' : '203.0.113.9');
+			close $near;
+			local $/;
+			my $out = <$far>;
+			close $far;
+			$status{$mode} = (defined $out && $out =~ m{\AHTTP/1\.1 (\d\d\d) }) ? $1 + 0 : undef;
+			$calls{$mode} = scalar(@{ $app->{calls} });
+		}
+		is($status{a}, $expected, "requirement 7: $what refuses with $expected in mode A");
+		is($status{b}, $status{a},
+			"requirement 7: and mode B answers $what identically - the limit is not relaxed behind a front server");
+		is($calls{a} + $calls{b}, 0, "requirement 7: and $what is enforced before dispatch() in either mode");
+	}
 }
 
 ###############################################################################
