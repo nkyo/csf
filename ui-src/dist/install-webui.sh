@@ -475,12 +475,51 @@ validate_ui_allow() {
 # (apache_enable_modules(), below), called only from setup_mode_a()
 # after the operator agrees.
 #
-# Prints the space-separated list of missing module names (empty string
-# if none) on stdout. Callers must not declare Mode A configured while
-# this is non-empty (R88).
+# Fix round 5 (task-9-review.md R97): "give apache_check_modules() a
+# third state: could not ask." `apache2ctl -M` (and its fallbacks) does
+# not report "modules are unknown" when Apache's config fails to parse -
+# it reports EVERY module as missing, indistinguishably from a host that
+# genuinely has none of them enabled. That is exactly the condition the
+# baseline in setup_mode_a() exists to tolerate (R94/R95), and until this
+# round nothing here could tell "definitely missing" apart from "the
+# instrument is blind right now" - review's own comparison:
+# "the same defect as the firewall-cmd --state fallthrough one task
+# over, where 'cannot reach the daemon' came back as a confident
+# iptables-nft." A pre-existing, unrelated Apache config error therefore
+# made this function claim ALL THREE modules were missing, forcing the
+# consent path into a decision it had no real basis for and permanently
+# blocking Apache's own self-heal - the two sub-findings review reproduced
+# alongside R96.
+#
+# Exit 0: the check succeeded (Apache's config parses far enough for its
+#         own module-listing command to run). Missing module names
+#         (space-separated, possibly empty) are on stdout.
+# Exit 1: COULD NOT ASK - the module-listing command itself failed, on
+#         every candidate binary tried. Nothing is printed on stdout.
+#         Callers MUST treat this as "unknown", never as "none missing"
+#         (which would silently skip a genuinely-needed module) or as
+#         "all missing" (which is what the blind instrument itself would
+#         have guessed, and exactly the wrong answer this exists to
+#         replace).
 ###############################################################################
 apache_check_modules() {
-	loaded=$( (apache2ctl -M 2>/dev/null || httpd -M 2>/dev/null || apachectl -M 2>/dev/null) )
+	if command -v apache2ctl >/dev/null 2>&1; then
+		loaded=$(apache2ctl -M 2>/dev/null)
+		check_rc=$?
+	elif command -v httpd >/dev/null 2>&1; then
+		loaded=$(httpd -M 2>/dev/null)
+		check_rc=$?
+	elif command -v apachectl >/dev/null 2>&1; then
+		loaded=$(apachectl -M 2>/dev/null)
+		check_rc=$?
+	else
+		return 1
+	fi
+
+	if [ "$check_rc" -ne 0 ]; then
+		return 1
+	fi
+
 	missing=""
 	for mod in ssl_module proxy_http_module headers_module; do
 		case "$loaded" in
@@ -489,6 +528,7 @@ apache_check_modules() {
 		esac
 	done
 	printf '%s' "$missing" | sed 's/^ //'
+	return 0
 }
 
 ###############################################################################
@@ -497,6 +537,19 @@ apache_check_modules() {
 # with the _module suffix already stripped (a2enmod's own naming) - the
 # caller builds this from apache_check_modules()'s output and asks the
 # operator before this function is ever reached.
+#
+# Fix round 5 (task-9-review.md R96): returns a2enmod's OWN exit status
+# (the implicit return value of this function's last command) rather
+# than leaving the caller to re-ask the same blind apache2ctl -M
+# instrument this round's R97 fix exists to stop trusting. Round 4's
+# version had the caller re-run apache_check_modules() after this to
+# "confirm" it worked - on a host whose config does not parse for an
+# unrelated reason, that re-check reported every module missing again,
+# `enabled_now` never got set, and setup_mode_a() printed "not enabling
+# Apache modules without confirmation" and returned - AFTER a2enmod had
+# already run and changed the host's exposure. Trusting a2enmod's own
+# exit code is both simpler and correct: it is not the blind instrument,
+# it is the tool doing the enabling.
 ###############################################################################
 apache_enable_modules() {
 	names=$1
@@ -519,6 +572,44 @@ apache_disable_modules() {
 	names=$1
 	command -v a2dismod >/dev/null 2>&1 || return 1
 	a2dismod $names >/dev/null 2>&1
+}
+
+###############################################################################
+# MODULES_RECORD - fix round 5 (task-9-review.md R98): "Everything up to
+# the consent prompt is now reversible by doing nothing... but from
+# a2enmod onward nothing ever reverts the enable, because the record is
+# a shell variable that no later run can reconstruct. A crash, a SIGKILL
+# or a Ctrl-C there leaves modules enabled forever with nothing knowing
+# they were ours. Persist what this run enabled BEFORE enabling it."
+#
+# record_modules_enabled() is called before apache_enable_modules(), not
+# after - the whole point is surviving a death between the two.
+# clear_modules_enabled_record() is called once this run reaches a
+# definite outcome of its own (success, or a rollback that already
+# disabled what this run enabled) - the file is not a permanent audit
+# log, only a dead-man's note for a run that never got to finish this
+# sentence itself. verify_install() (below) checks for a leftover file
+# from a run that died before clearing it.
+###############################################################################
+MODULES_RECORD=/var/lib/csf-ui/apache-modules-enabled-by-installer
+
+record_modules_enabled() {
+	names=$1
+	tmp="$MODULES_RECORD.new.$$"
+	{
+		echo "# Written by install-webui.sh immediately before running a2enmod, so a"
+		echo "# crash/SIGKILL/Ctrl-C between then and this run finishing has SOMETHING"
+		echo "# that still knows these modules were enabled by this installer, not by"
+		echo "# the operator or by anything else on this host."
+		echo "# If this file still exists and no csf-ui install is currently running,"
+		echo "# the run that wrote it died before reverting or confirming these -"
+		echo "# check whether $names should stay enabled, then remove this file."
+		echo "$names"
+	} > "$tmp" 2>/dev/null && mv "$tmp" "$MODULES_RECORD" 2>/dev/null
+}
+
+clear_modules_enabled_record() {
+	rm -f "$MODULES_RECORD" 2>/dev/null
 }
 
 ###############################################################################
@@ -576,20 +667,29 @@ front_configtest() {
 }
 
 ###############################################################################
-# front_disable_vhost FRONT OUT - the rollback half of setup_mode_a():
-# removes the vhost this run just wrote/enabled, so a failed validation
-# never leaves a broken or inert config active. LiteSpeed has no
-# enable/disable step to undo (install-webui.sh never touches its main
-# httpd_config.conf - see setup_mode_a()'s own comment), so only the file
-# itself is removed there.
+# front_disable_vhost FRONT OUT ALLOW_INCLUDE - the rollback half of
+# setup_mode_a(): removes the vhost this run just wrote/enabled, so a
+# failed validation never leaves a broken or inert config active.
+# LiteSpeed has no enable/disable step to undo (install-webui.sh never
+# touches its main httpd_config.conf - see setup_mode_a()'s own
+# comment), so only the files are removed there.
+#
+# Fix round 5 (task-9-review.md R99): "':917'/':919' overclaim. They say
+# 'nothing this run touched is still active' while
+# /etc/csf-ui/allow-$front.conf, written at ':865', survives
+# front_disable_vhost()." This used to remove only OUT (the vhost
+# itself), leaving write_allow_include()'s own file behind - round 3's
+# "removed the vhost" was true; round 4's stronger claim was not. Both
+# files this run wrote are now removed together.
 ###############################################################################
 front_disable_vhost() {
 	front=$1
 	out=$2
+	allow_include=$3
 	if [ "$front" = "apache" ] && command -v a2disconf >/dev/null 2>&1; then
 		a2disconf csf-ui >/dev/null 2>&1
 	fi
-	rm -f "$out"
+	rm -f "$out" "$allow_include"
 }
 
 ###############################################################################
@@ -646,40 +746,6 @@ setup_mode_b() {
 	fi
 }
 
-###############################################################################
-# setup_mode_a - behind a detected front web server. Renders that
-# server's vhost template, but declares it configured ONLY once the
-# front server's OWN validator (and, for Apache, an actual module check)
-# says it is real - never on the strength of this script's own
-# rendering having succeeded. Never enables csf-ui.service.
-#
-# WHY NOT ENABLE IT: this build's ConfigServer::UI::Server (Task 5) is,
-# by its own header comment, "The Mode B listener" - it refuses to start
-# at all for UI_MODE=a. Nothing anywhere in this tree yet listens on the
-# unix socket these templates proxy to; there is no frozen path for it in
-# docs/WEBUI-RPC.md S2.3 either. Enabling csf-ui.service here would start
-# a process that immediately exits with that exact refusal, on a timer
-# that keeps restarting it - a crash loop dressed up as "Mode A is on".
-#
-# WHY VALIDATE RATHER THAN TRUST OUR OWN RENDER (fix round 2,
-# task-9-review.md R87): this task's whole failure signature is "nothing
-# happens and nothing says so", and rendering a syntactically well-formed
-# file is not the same claim as "the front server will actually load
-# it". Three concrete ways they differ, all closed by the same fix:
-#   - Apache ships mod_ssl/mod_proxy_http/mod_headers DISABLED by default
-#     on Debian/Ubuntu - the vhost renders fine and is inert (R88).
-#   - csf-ui-cert.sh can fail (no openssl, disk full) and exits 0 either
-#     way (by design - a firewall install must not fail over it) - a
-#     vhost referencing a certificate that was never written is fatal to
-#     the ENTIRE front server, not just this one.
-#   - UI_ALLOW's shape is checked by validate_ui_allow() above, but a
-#     subtler malformed value (out-of-range octets, a mask past /32) is
-#     still possible and is exactly what a real parser exists to catch.
-# nginx and Apache both ship a validator whose only job is to answer this
-# question (`nginx -t`, `apache2ctl configtest`/`httpd -t`) - it is used
-# here rather than reproduced. When no validator can be found at all
-# (front server present but no test binary - unusual, but possible),
-# this refuses rather than assuming success, per R87's own instruction.
 ###############################################################################
 # setup_mode_a - behind a detected front web server. Renders that
 # server's vhost template, but declares it configured ONLY once the
@@ -824,9 +890,29 @@ setup_mode_a() {
 	# whatever apache_check_modules() reports at rollback time, which
 	# would also catch modules that were already enabled before this run
 	# touched anything and were never this run's to revert.
+	#
+	# Fix round 5 (task-9-review.md R97): apache_check_modules() can now
+	# say "could not ask" (its own check_rc, not the missing-list). A host
+	# whose Apache config does not parse for a reason this vhost has
+	# nothing to do with used to make this look identical to "every module
+	# is genuinely missing", forcing this consent prompt for the wrong
+	# reason and permanently blocking Apache's own self-heal (the baseline
+	# in STEP 1 exists precisely to tolerate that case). "Could not ask" now
+	# skips consent and enabling entirely - proceeding to STEP 4/5 below,
+	# where the real validator (not this blind instrument) has the final
+	# word either way.
 	modules_enabled_this_run=""
 	if [ "$front" = "apache" ]; then
 		still_missing=$(apache_check_modules)
+		check_rc=$?
+		if [ "$check_rc" -ne 0 ]; then
+			echo "csf-ui: could not determine which Apache modules are enabled (apache2ctl -M"
+			echo "csf-ui: and its fallbacks all failed) - this usually means Apache's own"
+			echo "csf-ui: configuration does not already parse, for a reason unrelated to this"
+			echo "csf-ui: vhost. Skipping the module check rather than guessing a wrong answer;"
+			echo "csf-ui: the configuration test in the next step decides this either way."
+			still_missing=""
+		fi
 		if [ -n "$still_missing" ]; then
 			enable_names=$(printf '%s' "$still_missing" | sed 's/_module//g')
 			echo "csf-ui: Apache module(s) not enabled: $still_missing"
@@ -842,10 +928,29 @@ setup_mode_a() {
 				read -r reply
 				case "$reply" in
 					[Yy]*)
-						apache_enable_modules "$enable_names"
-						modules_enabled_this_run=$enable_names
-						still_missing=$(apache_check_modules)
-						[ -z "$still_missing" ] && enabled_now=1
+						# Fix round 5 (task-9-review.md R98): persist what this
+						# run is ABOUT to enable BEFORE enabling it, so a crash
+						# between the two leaves something on disk that still
+						# knows these modules were this installer's doing.
+						record_modules_enabled "$enable_names"
+						# Fix round 5 (task-9-review.md R96): trust
+						# apache_enable_modules()'s OWN exit status (a2enmod's
+						# own exit status) rather than re-asking the same blind
+						# apache_check_modules() instrument R97 exists to stop
+						# trusting. The previous re-check reported every module
+						# missing again whenever Apache's config did not parse
+						# for an unrelated reason, so `enabled_now` never got
+						# set even though a2enmod had already succeeded and
+						# already changed the host's exposure - the code then
+						# fell into "not enabling" below and returned WITHOUT
+						# disabling what it had just enabled.
+						if apache_enable_modules "$enable_names"; then
+							modules_enabled_this_run=$enable_names
+							enabled_now=1
+						else
+							clear_modules_enabled_record
+							echo "csf-ui: a2enmod $enable_names failed - see its own output above"
+						fi
 						;;
 				esac
 			fi
@@ -887,9 +992,17 @@ setup_mode_a() {
 		# STEP 6 - ROLLBACK EVERYTHING THIS RUN CHANGED, then derive the
 		# message from what the baseline and this result actually
 		# established, rather than assuming the vhost is why.
-		front_disable_vhost "$front" "$out"
+		#
+		# Fix round 5 (task-9-review.md R99): front_disable_vhost() now also
+		# removes $allow_include (see its own comment) and
+		# clear_modules_enabled_record() retires the R98 durability record
+		# once apache_disable_modules() has actually reverted what it names -
+		# both needed before "nothing this run touched is still active"
+		# below is actually true.
+		front_disable_vhost "$front" "$out" "$allow_include"
 		if [ -n "$modules_enabled_this_run" ]; then
 			apache_disable_modules "$modules_enabled_this_run"
+			clear_modules_enabled_record
 		fi
 
 		what_changed="this vhost"
@@ -904,19 +1017,25 @@ setup_mode_a() {
 			echo "csf-ui: cannot tell whether this vhost is the cause of a problem that was"
 			echo "csf-ui: already there - fix the pre-existing failure above, then re-run."
 		else
+			# Fix round 5 (task-9-review.md R99): baseline_rc is guaranteed
+			# non-empty here - it is only ever empty for LiteSpeed, and
+			# LiteSpeed's own front_configtest() arm (R92) always returns 0,
+			# so this whole test_rc-!=0 branch can never be reached for
+			# LiteSpeed; the old empty-baseline_rc arm below was dead code.
+			# The old wording here also dangled - it said "it passed before,
+			# see above" - but a PASSING baseline prints nothing, so there
+			# was never anything shown above for it to point at.
 			echo "csf-ui: $front's own configuration test failed after adding $what_changed"
-			if [ -n "$baseline_rc" ]; then
-				echo "csf-ui: (it passed before - see above) - the WebUI vhost is NOT active:"
-			else
-				echo "csf-ui: - the WebUI vhost is NOT active:"
-			fi
+			echo "csf-ui: (it passed before this run made any changes) - the WebUI vhost is NOT active:"
 			echo "$test_output" | sed 's/^/csf-ui:   /'
 		fi
 		if [ -n "$modules_enabled_this_run" ]; then
-			echo "csf-ui: removed the vhost and disabled the module(s) this run enabled"
-			echo "csf-ui: ($modules_enabled_this_run) - nothing this run touched is still active."
+			echo "csf-ui: removed the vhost, its allow-include file, and disabled the module(s)"
+			echo "csf-ui: this run enabled ($modules_enabled_this_run) - nothing this run touched"
+			echo "csf-ui: is still active."
 		else
-			echo "csf-ui: removed the vhost - nothing this run touched is still active."
+			echo "csf-ui: removed the vhost and its allow-include file - nothing this run"
+			echo "csf-ui: touched is still active."
 		fi
 		echo "csf-ui: left the WebUI unconfigured. Fix the problem above and re-run."
 		return 1
@@ -930,6 +1049,7 @@ setup_mode_a() {
 
 	write_ui_conf a "$port" "$allow"
 	grant_socket_group "$front"
+	clear_modules_enabled_record
 
 	echo "csf-ui: $front vhost written to $out and $verified_note."
 	if [ "$front" = "litespeed" ]; then
@@ -1193,6 +1313,20 @@ verify_install() {
 		fi
 	else
 		echo "csf-ui: *VERIFY FAILED* system account 'csfui' does not exist"
+		problems=$((problems + 1))
+	fi
+
+	# Fix round 5 (task-9-review.md R98): a leftover MODULES_RECORD means a
+	# previous run died between recording what it was about to enable and
+	# either confirming or reverting it (see record_modules_enabled()'s own
+	# comment) - surfaced here rather than left for someone to discover by
+	# accident.
+	if [ -f "$MODULES_RECORD" ]; then
+		echo "csf-ui: *VERIFY FAILED* $MODULES_RECORD exists - a previous WebUI install run"
+		echo "csf-ui:   was interrupted after enabling Apache module(s) but before this run"
+		echo "csf-ui:   confirmed or reverted them. Contents:"
+		sed 's/^/csf-ui:     /' "$MODULES_RECORD" 2>/dev/null
+		echo "csf-ui:   decide whether these modules should stay enabled, then remove this file."
 		problems=$((problems + 1))
 	fi
 

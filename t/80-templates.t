@@ -43,7 +43,7 @@ use FindBin ();
 use lib "$FindBin::Bin/..", "$FindBin::Bin/../ui-src/lib";
 
 use File::Temp qw(tempdir tempfile);
-use Test::More tests => 174;
+use Test::More tests => 198;
 
 my $DIST = "$FindBin::Bin/../ui-src/dist";
 my $RENDERER = "$DIST/render-template.sh";
@@ -634,10 +634,10 @@ for my $installer (@SH_FILES) {
 	like($install_webui, qr/modules_enabled_this_run=\$enable_names/,
 		'install-webui.sh: setup_mode_a() records exactly which modules THIS RUN enabled, not a name recomputed later');
 	like($install_webui,
-		qr{if \[ "\$test_rc" -ne 0 \]; then[\s\S]*?front_disable_vhost "\$front" "\$out"
+		qr{if \[ "\$test_rc" -ne 0 \]; then[\s\S]*?front_disable_vhost "\$front" "\$out" "\$allow_include"
 		if \[ -n "\$modules_enabled_this_run" \]; then
 			apache_disable_modules "\$modules_enabled_this_run"}s,
-		'install-webui.sh: a failed final validation reverts BOTH the vhost and any module this run enabled (R95)');
+		'install-webui.sh: a failed final validation reverts BOTH the vhost (and its allow-include file, R99) and any module this run enabled (R95)');
 
 	# 5. The failure message must be derived from what the baseline
 	# actually established, not assume the vhost (or the module-enable)
@@ -649,6 +649,114 @@ for my $installer (@SH_FILES) {
 		'install-webui.sh: the failure message names the module-enable specifically when it happened (R95 - no more blaming only "this vhost")');
 	like($install_webui, qr/cannot tell whether this vhost is the cause of a problem that was/,
 		"install-webui.sh: a failure on top of an already-broken baseline says the attribution is uncertain, not that this vhost caused it (R95)");
+
+	# Fix round 5 (task-9-review.md R96/R97/R98/R99): "the re-sequencing
+	# is the right shape... but moving the consent gate in front of the
+	# write put a BLIND INSTRUMENT there" - apache2ctl -M reports every
+	# module missing whenever Apache's config does not parse, for a
+	# reason the vhost has nothing to do with, and this used to be
+	# indistinguishable from "genuinely missing". apache_check_modules()
+	# now has a third state - "could not ask" - and setup_mode_a() must
+	# never (a) blindly re-ask it after enabling (R96), (b) treat "could
+	# not ask" as either "none missing" or "all missing" (R97), (c) lose
+	# track of what it enabled if it dies before finishing (R98), or (d)
+	# claim more got cleaned up on rollback than actually did (R99).
+	{
+		$install_webui =~ /apache_check_modules\(\) \{([\s\S]*?)\n\}/
+			or die "could not extract apache_check_modules() body";
+		my $fn_body = $1;
+		my $rc_captures = () = $fn_body =~ /check_rc=\$\?/g;
+		is($rc_captures, 3,
+			'install-webui.sh: apache_check_modules() captures the REAL exit status of each candidate binary it tries (R97)');
+		like($fn_body, qr/if \[ "\$check_rc" -ne 0 \]; then\n\t\treturn 1\n\tfi/,
+			'install-webui.sh: apache_check_modules() has a distinct "could not ask" return, separate from its missing-list output (R97)');
+		unlike($fn_body, qr/apache2ctl -M 2>\/dev\/null \|\| httpd -M/,
+			'install-webui.sh: apache_check_modules() no longer uses the (A || B || C) subshell that discarded which command actually ran, or its real exit code (R97)');
+	}
+
+	# R96: setup_mode_a() must trust apache_enable_modules()'s OWN exit
+	# status - the tool that just did the enabling - not re-ask the same
+	# blind instrument R97 exists to stop trusting. Counted, not just
+	# matched: a second call anywhere in this function is the exact
+	# regression (the re-check that let a2enmod succeed while the
+	# installer printed "not enabling Apache modules without
+	# confirmation" and returned without disabling anything it had just
+	# enabled).
+	{
+		$install_webui =~ /\nsetup_mode_a\(\) \{([\s\S]*?)\n\}\n/
+			or die "could not extract setup_mode_a() body";
+		my $fn_body = $1;
+		my $call_count = () = $fn_body =~ /apache_check_modules\)/g;
+		is($call_count, 1,
+			'install-webui.sh: setup_mode_a() calls apache_check_modules() exactly once - no post-enable re-check (R96)');
+		like($fn_body, qr/if apache_enable_modules "\$enable_names"; then\n\t+modules_enabled_this_run=\$enable_names\n\t+enabled_now=1/,
+			q{install-webui.sh: enabled_now is set from apache_enable_modules()'s own exit status, not a re-check (R96)});
+		unlike($fn_body, qr/still_missing=\$\(apache_check_modules\)\n\t+\[ -z "\$still_missing" \] && enabled_now=1/,
+			'install-webui.sh: the old blind re-check ("enabled_now" gated on asking apache_check_modules() again) is gone (R96)');
+	}
+
+	# R97 (caller half): "could not ask" must be treated as "skip the
+	# consent/enable step entirely", never silently coerced into "none
+	# missing" (which would leave a genuinely-missing module unnoticed
+	# and never explained) - the explanatory message is what makes the
+	# difference between the two visible to whoever is reading the
+	# installer's output.
+	like($install_webui, qr/still_missing=\$\(apache_check_modules\)\n\t\tcheck_rc=\$\?\n\t\tif \[ "\$check_rc" -ne 0 \]; then/,
+		q{install-webui.sh: setup_mode_a() captures apache_check_modules()'s own exit status immediately (R97)});
+	like($install_webui, qr/could not determine which Apache modules are enabled/,
+		'install-webui.sh: a "could not ask" result says so, distinctly from "none are missing" (R97)');
+	like($install_webui,
+		qr{if \[ "\$check_rc" -ne 0 \]; then[\s\S]*?still_missing=""\n\t\tfi},
+		'install-webui.sh: "could not ask" clears still_missing so consent/enable is skipped, rather than guessed at (R97)');
+
+	# R98: what this run is ABOUT to enable must be persisted BEFORE
+	# a2enmod runs, not only held in a shell variable that a crash,
+	# SIGKILL or Ctrl-C between the two would take down with it.
+	like($install_webui, qr/^record_modules_enabled\s*\(\)/m,
+		'install-webui.sh: a record_modules_enabled() function exists (R98)');
+	like($install_webui, qr/^clear_modules_enabled_record\s*\(\)/m,
+		'install-webui.sh: a clear_modules_enabled_record() function exists (R98)');
+	like($install_webui, qr/^MODULES_RECORD=\/var\/lib\/csf-ui\//m,
+		'install-webui.sh: the R98 durability record lives under /var/lib/csf-ui, not a shell variable alone');
+	like($install_webui,
+		qr{record_modules_enabled "\$enable_names"[\s\S]*?\n\t+if apache_enable_modules "\$enable_names"; then},
+		'install-webui.sh: record_modules_enabled() runs BEFORE apache_enable_modules() - the ordering R98 exists for');
+	like($install_webui,
+		qr{apache_disable_modules "\$modules_enabled_this_run"\n\t\t\tclear_modules_enabled_record},
+		'install-webui.sh: a rollback that disables modules also retires the R98 durability record for them');
+	like($install_webui,
+		qr{grant_socket_group "\$front"\n\tclear_modules_enabled_record},
+		'install-webui.sh: a successful run also retires the R98 durability record - it is not a permanent audit log');
+	{
+		$install_webui =~ /\nverify_install\(\) \{([\s\S]*?)\n\}\n/s
+			or die "could not extract verify_install() body";
+		my $fn_body = $1;
+		like($fn_body, qr/if \[ -f "\$MODULES_RECORD" \]; then/,
+			'install-webui.sh: verify_install() surfaces a leftover R98 record from a run that died before clearing it');
+	}
+
+	# R99: front_disable_vhost() must remove BOTH files this run wrote,
+	# or "nothing this run touched is still active" is not actually true
+	# - write_allow_include()'s own $allow_include survived it before.
+	like($install_webui, qr/^\tallow_include=\$3$/m,
+		'install-webui.sh: front_disable_vhost() takes allow_include as a third parameter (R99)');
+	like($install_webui, qr/rm -f "\$out" "\$allow_include"/,
+		'install-webui.sh: front_disable_vhost() removes both the vhost and the allow-include file (R99)');
+	like($install_webui, qr/removed the vhost, its allow-include file, and disabled the module\(s\)/,
+		'install-webui.sh: the module-rollback message now says the allow-include file was removed too (R99)');
+	like($install_webui, qr/removed the vhost and its allow-include file - nothing this run/,
+		'install-webui.sh: the no-modules rollback message now says the allow-include file was removed too (R99)');
+	unlike($install_webui, qr/\(it passed before - see above\)/,
+		'install-webui.sh: the dangling "see above" reference is gone - a passing baseline prints nothing to point at (R99)');
+	unlike($install_webui, qr/echo "csf-ui: - the WebUI vhost is NOT active:"/,
+		'install-webui.sh: the dead empty-baseline_rc branch (unreachable - LiteSpeed always returns 0 from front_configtest) is gone (R99)');
+	{
+		my $header_count = () = $install_webui =~ /WHY VALIDATE RATHER THAN TRUST OUR OWN RENDER/g;
+		is($header_count, 1,
+			q{install-webui.sh: setup_mode_a()'s comment header is no longer duplicated (R99)});
+	}
+	unlike($install_webui, qr/per R87's own instruction/,
+		'install-webui.sh: the stale pre-R92 comment claim (removed with the duplicate header) is gone (R99)');
 
 	# R89: /usr/local/csf must not be a helper ReadWritePaths entry -
 	# nothing in S5 writes there, and it is where csfpre.sh/csfpost.sh
