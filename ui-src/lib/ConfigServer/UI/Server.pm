@@ -392,7 +392,18 @@ our $MAX_PASSWD_SCAN = 20000;
 # THE THIRD RETURN VALUE EXISTS BECAUSE A FILE CAN BE WRONG AND STILL SAY
 # WHICH MODE IT IS (fix round 1, F10). It is UI_MODE exactly as the file
 # wrote it when the file wrote it validly ("a" or "b"), and undef
-# otherwise - including when UI_MODE is absent, misspelled, or set twice.
+# otherwise - which means UI_MODE absent, or present with any value that
+# is not exactly "a" or "b".
+#
+# A DUPLICATED UI_MODE IS NOT ONE OF THOSE CASES, and this sentence used
+# to claim it was (fix round 2). The duplicate is its own startup problem
+# and the file is refused either way - but $mode_as_written holds the
+# FIRST of the two values, because the duplicate check below leaves
+# $raw{UI_MODE} at the first assignment, and this value is read from
+# %raw. Measured: "a" then "b" yields mode-A preconditions and no TLS
+# library demand; "b" then "a" yields mode-B's. The inline comment at the
+# assignment said this correctly all along, and the two contradicted each
+# other.
 # It is NOT a fourth copy of the mode: %conf's UI_MODE remains the only
 # value anything acts on when the file is sound, and this one exists only
 # so preflight() can pick the right set of PRECONDITIONS to report
@@ -641,7 +652,11 @@ sub preflight {
 	push @problem, 'this process must not run as root; it is the unprivileged half of the WebUI split and must run as the unprivileged web-tier user'
 		if $> == 0;
 
-	my ($conf, $problems, $mode_as_written) = read_ui_conf($ui_conf_path);
+	# $conf is deliberately not bound: preflight() reports problems and
+	# picks which set of PRECONDITIONS to report them with, and the mode
+	# for that comes from $mode_as_written. See the ternary below for why
+	# the arm that used to read $conf->{UI_MODE} could never run.
+	my (undef, $problems, $mode_as_written) = read_ui_conf($ui_conf_path);
 	push @problem, @$problems if @$problems;
 
 	# WHICH MODE'S PRECONDITIONS TO REPORT ALONGSIDE THE CONFIG PROBLEMS.
@@ -663,9 +678,18 @@ sub preflight {
 	# missing or misspelled UI_MODE - because that is the mode this file
 	# had when it was the only one, and because in that case neither set
 	# of preconditions is more right than the other.
-	my $mode = defined $mode_as_written ? $mode_as_written
-		: (!@$problems && $conf)        ? $conf->{UI_MODE}
-		:                                 'b';
+	# TWO ARMS, NOT THREE. There used to be a middle one -
+	# `(!@$problems && $conf) ? $conf->{UI_MODE}` - and it was DEAD CODE
+	# (fix round 2): $mode_as_written is undef only when UI_MODE was
+	# absent or was not exactly "a"/"b", and read_ui_conf() pushes a
+	# problem for every one of those cases, so @$problems can never be
+	# empty at the moment that arm would be consulted. Proven by
+	# replacing it with `die "UNREACHABLE"` and getting a full green run.
+	# Removed rather than left looking load-bearing: an arm that cannot
+	# run is an arm no reader can check, and it would have gone on
+	# reassuring people that the good-file case was handled here when the
+	# first arm is what handles it.
+	my $mode = defined $mode_as_written ? $mode_as_written : 'b';
 
 	if ($mode eq 'b') {
 		# The one dependency this task adds, and the one mode B refuses to
@@ -940,12 +964,29 @@ sub peercred {
 #     mode admits it; and a process already running as this uid holds the
 #     session store and the rate-limit state, so refusing it would protect
 #     nothing it could not simply take.
-#   2. the peer's PRIMARY gid is the socket's gid. This is the case the
-#     member list cannot see: getgrgid()'s member list names only
-#     supplementary members, so an account created with the socket group
-#     as its primary group appears nowhere in it - while the kernel
-#     admits it on exactly that group bit. Checked per connection from
-#     the credentials themselves, so it costs no NSS lookup at all.
+#   2. the peer's gid, as SO_PEERCRED reports it, is the socket's gid.
+#     The case it exists FOR is the primary-gid account, which the member
+#     list cannot see: getgrgid()'s member list names only supplementary
+#     members, so an account created with the socket group as its primary
+#     group appears nowhere in it - while the kernel admits it on exactly
+#     that group bit. Checked per connection from the credentials
+#     themselves, so it costs no NSS lookup at all.
+#
+#     WHAT IT ADMITS IS WIDER THAN THAT, and saying only "primary gid"
+#     understates it (fix round 2). SO_PEERCRED reports the peer's
+#     EFFECTIVE gid, not its primary one, so this way admits ANY account
+#     whose egid equals the socket's gid at the moment it connected -
+#     which every member of that group can arrange for itself with one
+#     setegid(), and which root can arrange whatever its groups are.
+#     Measured: peer_uid_allowed(3003, 4242) is 1 for an account that is
+#     not in the group at all, and peer_uid_allowed(0, 4242) is 1. The
+#     root half of this is already stated in CHANGES.md; this is the
+#     general form of it. It is kept anyway, for the reason F4 resolved
+#     it on: the alternative refuses a legitimate primary-gid front
+#     server and tells its operator to add the account to a group it is
+#     already in. The accounts it widens to are ones that can reach the
+#     socket through the group bit in the first place, so the set is
+#     bounded by the same group the install designated.
 #   3. the peer's uid is in the socket group's member list, resolved once
 #     at startup (section 2.2 resolves its own uid once at startup for
 #     the same reason: an NSS lookup per connection is a dependency on a
@@ -1495,6 +1536,22 @@ sub _sockaddr_family {
 #    at all until listen() - so the window is fail-closed on both counts
 #    rather than being a moment when the wrong peers could get in.
 #
+#    IT IS NOT FAIL-CLOSED AGAINST A SECOND DAEMON, though, and that is
+#    worth naming here rather than only in a review (fix round 2, I3).
+#    The stale-socket probe in _socket_is_live() answers "is anybody
+#    listening", and between the bind() above and this listen() the
+#    answer for THIS socket is no - so a second daemon starting inside
+#    that window reads our socket as stale, unlinks it and binds its own,
+#    and both processes survive: F14's failure, through the window F14's
+#    own fix opens. The SEQUENTIAL case - the one that actually happens,
+#    a second start against an already-running daemon - is closed, and
+#    that is what F14 claimed. Closing this one means publishing the
+#    socket atomically: bind() at a temporary path in the same directory,
+#    chmod and listen() there, then rename() over the final path, so the
+#    path never names a socket that is not yet listening. That is a
+#    restructuring of this function rather than a term in it, and is not
+#    a thing to improvise in a fix round; recorded, not done.
+#
 # Returns the listener and the socket's own gid, which is what the kernel
 # checks the 0660 group bit against and therefore what unix_peer_uids()
 # must derive the accepted set from - not the directory's gid, and not
@@ -1607,10 +1664,19 @@ sub _unlink_stale_socket {
 }
 
 # 1 = something is listening, 0 = nothing is, undef = could not tell (and
-# $! is left set for the caller's message). socket_is_live is injectable
-# above for the same reason self_uid is: the "could not tell" arm needs a
-# connect() that fails with something other than ECONNREFUSED, which no
-# test can arrange on a path it owns.
+# $! is left set for the caller's message).
+#
+# socket_is_live is injectable above for the same reason self_uid is: it
+# lets a test drive the DECISION the probe feeds without depending on
+# what the host's kernel does. It is NOT because the "could not tell" arm
+# is unreachable from a test - this comment used to say "which no test can
+# arrange on a path it owns", and that is false (fix round 2). chmod 0000
+# on a socket this process owns makes connect() fail with EACCES, which is
+# neither ECONNREFUSED nor ENOENT nor EAGAIN/EINPROGRESS, so it lands in
+# exactly this arm - and t/40-http-parse.t now does that, against a real
+# socket, in four lines. The refusal it produces is a startup refusal that
+# did not exist before fix round 1, so an unreached arm there was an
+# unproven refusal.
 sub _socket_is_live {
 	my ($path) = @_;
 	socket(my $probe, Socket::PF_UNIX(), Socket::SOCK_STREAM(), 0) or return undef;
@@ -1773,10 +1839,25 @@ sub _no_local_peer_message {
 
 	my $gid = $report->{gid};
 	unless ($report->{group_found}) {
-		return $lead
+		my $text = $lead
 			. "gid $gid owns the socket, but no group with that gid exists on this host, so its"
 			. ' membership could not be read at all. Create that group, or correct'
 			. " csf-ui.service's Group=, and add the front web server's worker account to it.";
+		# AND THE TRUNCATION NOTICE BELONGS HERE TOO (fix round 2). This
+		# branch used to return before reaching it, so an operator whose
+		# passwd scan stopped at its bound on THIS path was told to create
+		# a group while an account holding that gid as its primary group
+		# may well exist past the bound - which is F9's defect exactly,
+		# left in one of the four arms F8 split the message into. A gid
+		# with no group entry is precisely a host where the primary-gid
+		# account is the only way in, so it is the arm where the
+		# distinction matters most.
+		$text .= " The search for an account with gid $gid as its PRIMARY group also stopped"
+			. " after the first $MAX_PASSWD_SCAN entries of the local account database without"
+			. ' reaching the end, so such an account may exist and simply was not found.'
+			. " Check with `getent passwd | awk -F: '\$4 == $gid'` before changing anything."
+			if $report->{scan_truncated};
+		return $text;
 	}
 
 	my $name = defined $report->{group_name} ? $report->{group_name} : '(unnamed)';
@@ -1837,9 +1918,22 @@ sub _no_local_peer_message {
 #   * it does not raise max_children. The cap is the defence, not the
 #     defect - without it the same four silent connections become as many
 #     children as the host has processes.
-#   * it does not shorten the slot hold time. That is HTTP.pm's absolute
-#     header deadline, armed before the first read, and requirement 7
-#     froze HTTP.pm.
+#   * it does not shorten the slot hold time. THAT IS NO LONGER
+#     HTTP.pm's absolute header deadline, and this bullet said it was
+#     (fix round 2). It was true when written; F1 made it false in the
+#     same round, because the binding constraint on how long one
+#     connection can hold a slot is now _serve_accepted()'s REQUEST
+#     BUDGET - one alarm over reading, dispatch() and writing together -
+#     and HTTP.pm's own header deadline is only the first term of it.
+#     Measured worst case for a single connection: 35.00s at 261221c,
+#     58.03s at e20ea61, against an arithmetic ceiling of
+#     _request_budget() = 75s. So a peer that holds a slot holds it for
+#     longer than it used to, and max_children is the only thing bounding
+#     how many can do it at once. Capping that is a design decision about
+#     the watchdog rather than a term in it - the same reasoning F1 gave
+#     for not giving dispatch() a deadline of its own - and is parked
+#     deliberately. What this bullet must not do is go on claiming a
+#     shorter ceiling than the code has.
 ###############################################################################
 sub _log_drop {
 	my ($self, $kind, $why) = @_;

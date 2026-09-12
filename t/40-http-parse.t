@@ -41,7 +41,7 @@ use File::Temp qw(tempdir);
 use Fcntl ();
 use Socket ();
 use Time::HiRes ();
-use Test::More tests => 328;
+use Test::More tests => 339;
 
 require_ok('ConfigServer::UI::HTTP');
 require_ok('ConfigServer::UI::Server');
@@ -1137,9 +1137,30 @@ sub _connect_unix {
 	unlink $path;
 }
 {
-	# The "cannot tell" arm, which fails closed. No test can make
-	# connect() fail with anything but ECONNREFUSED on a path this process
-	# owns, so the probe is injected - the decision it feeds is the guard.
+	# THE "CANNOT TELL" ARM AGAINST A REAL SOCKET (fix round 2). The
+	# comment on _socket_is_live() used to say this arm "needs a connect()
+	# that fails with something other than ECONNREFUSED, which no test can
+	# arrange on a path it owns" - and that is false: chmod 0000 on a
+	# socket this process owns makes connect() fail with EACCES, which is
+	# none of the four errnos the probe classifies, so it lands here. The
+	# refusal this feeds is a STARTUP refusal that did not exist before
+	# fix round 1, and an arm no test reaches is an unproven refusal.
+	my $path = _sock_path();
+	my ($listener) = $S->can('_open_unix_listener')->($path);
+	close $listener;                      # nothing listening: the stale case
+	chmod(0000, $path) or die "chmod: $!"; # ...but now unreachable to ask
+	is($S->can('_socket_is_live')->($path), undef,
+		'F14: connect() failing with something other than ECONNREFUSED is "could not tell", not "stale" - EACCES on a socket this process owns reaches that arm for real');
+	my $eaccess_error = _dies(sub { $S->can('_unlink_stale_socket')->($path) });
+	like($eaccess_error, qr/could not determine whether anything is listening/,
+		'F14: and the refusal that fails closed is reached over a real socket, not only over an injected probe');
+	ok(-S $path, 'F14: leaving it in place, because guessing wrong here orphans a live daemon');
+	chmod(0600, $path);
+	unlink $path;
+}
+{
+	# The same arm through the INJECTED probe, which is what lets a test
+	# drive the decision without depending on what the host's kernel does.
 	my $path = _sock_path();
 	my ($listener) = $S->can('_open_unix_listener')->($path);
 	close $listener;
@@ -1682,6 +1703,27 @@ sub _connect_unix {
 	like($no_group, qr/no group with that gid exists/,
 		'F8: a gid with no group behind it is its own cause, not "the group has no other member"');
 	like($no_group, qr/Group=/, 'F8: and points at the unit setting that decides it');
+	unlike($no_group, qr/stopped after/,
+		'F8/F9: and does not mention a truncated search when the search reached the end');
+
+	# THE SAME ARM WITH A TRUNCATED SCAN (fix round 2). This arm returned
+	# BEFORE the truncation notice, so an operator whose passwd scan
+	# stopped at its bound on this path was told to CREATE a group while
+	# an account holding that gid as its primary group may exist past the
+	# bound - F9's defect, surviving in one of the four arms F8 split the
+	# message into. A gid with no group entry is exactly the host where
+	# the primary-gid account is the only way in, so it is the arm where
+	# the distinction matters most.
+	my $no_group_truncated = $server->_no_local_peer_message({
+		gid => 4242, group_found => 0, group_name => undef,
+		members_named => 0, scan_ran => 1, scan_truncated => 1,
+	});
+	like($no_group_truncated, qr/no group with that gid exists/,
+		'F8: a gid with no group behind it still names that as the cause when the scan also truncated');
+	like($no_group_truncated, qr/stopped after/,
+		'F9: AND says the primary-group search stopped early, instead of telling the operator to create a group while such an account may exist past the bound');
+	like($no_group_truncated, qr/getent passwd/,
+		'F9: naming the command that would answer it, on this arm too');
 
 	my $no_gid = $server->_no_local_peer_message({
 		gid => undef, group_found => 0, group_name => undef,
@@ -1693,6 +1735,45 @@ sub _connect_unix {
 	my $injected = $server->_no_local_peer_message({});
 	like($injected, qr/supplied directly rather than derived/,
 		'F8: and a set handed to this process says so, rather than describing a group nothing consulted');
+}
+
+###############################################################################
+# _log_drop()'s RATE LIMIT, which had no reddening test at all (fix round
+# 2).
+#
+# t/42-listen-loop.t asserts the TEXT "at most one line per 60s" appears in
+# the line. Nothing asserted that it LIMITS. That is the guard whose whole
+# purpose is to stop the log becoming the denial - _log_drop()'s own header
+# prices it against "a peer reconnecting as fast as the kernel allows" -
+# so "the sentence is present" was the weakest possible check of it, and a
+# removed window would have left every test in the suite green while a
+# local peer wrote into this process's journal without bound.
+#
+# A real interval and a real wait, not a poke at $self->{drop_logged}:
+# what is being tested is the comparison against the clock.
+###############################################################################
+{
+	my $server = $S->new(app => FakeApp->new, mode => 'a', drop_log_interval => 0.3);
+	my $why = 'all 1 connection slots are in use';
+
+	my $window = _capture_stderr(sub { $server->_log_drop('busy', $why) for 1 .. 3 });
+	my $lines = () = $window =~ /connection slots are in use/g;
+	is($lines, 1,
+		'F2: three drops inside one window put exactly ONE line on stderr - the window bounds the volume, not the sentence saying it does');
+
+	Time::HiRes::sleep(0.35); # the window elapses, by the clock the guard reads
+	my $next = _capture_stderr(sub { $server->_log_drop('busy', $why) });
+	like($next, qr/\(3 such connection\(s\) since the last line of this kind/,
+		'F2: and the next line carries how many the window suppressed - itself plus the two it swallowed - so the scale is in the log and not only the fact');
+	like($next, qr/at most one line per 0\.3s/,
+		'F2: and states the interval it is actually using, which is the one it was given');
+
+	# A DIFFERENT KIND keeps its own window: the fork()-failure drop must
+	# not be silenced by a busy minute, which is what one shared clock
+	# would do.
+	my $other = _capture_stderr(sub { $server->_log_drop('fork', 'fork() failed') });
+	like($other, qr/fork\(\) failed/,
+		'F2: and each KIND of drop is rate-limited on its own clock - a busy minute must not silence the fork() failure');
 }
 
 ###############################################################################

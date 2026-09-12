@@ -323,9 +323,15 @@ sub _log {
 	like($log, qr/at most one line per 60s/, 'F2: and says the line is rate-limited, so its absence is not proof of health');
 
 	close $holder;
-	# The slot is freed when the held connection's child exits, or - as
-	# here, where no child was ever forked for it - as soon as the request
-	# that was holding it completes. Either way the cap must LIFT.
+	# The slot is freed when the HOLDER's child exits. The holder was
+	# admitted and forked for like any other connection - the cap check
+	# precedes fork(), so the first connection can never be the one it
+	# refuses, and the holder occupying the only slot is exactly why the
+	# cap fired on the request above. (This comment used to say "as here,
+	# where no child was ever forked for it", which described the dropped
+	# request, not the holder - fix round 2. The assertion below always
+	# passed for the right reason; only the comment was wrong.) Either
+	# way the cap must LIFT.
 	my $recovered = '';
 	my $deadline = Time::HiRes::time() + 8;
 	while (Time::HiRes::time() < $deadline) {
