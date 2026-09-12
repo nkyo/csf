@@ -40,7 +40,7 @@ use lib "$FindBin::Bin/..", "$FindBin::Bin/../ui-src/lib";
 use File::Temp qw(tempdir);
 use Socket ();
 use Time::HiRes ();
-use Test::More tests => 294;
+use Test::More tests => 303;
 
 require_ok('ConfigServer::UI::HTTP');
 require_ok('ConfigServer::UI::Server');
@@ -1190,6 +1190,56 @@ sub _connect_unix {
 }
 
 ###############################################################################
+# THE SOCKET-MODE READ-BACK (_open_unix_listener step 3), which requirement
+# 1's own claim singles out and which nothing tested.
+#
+# The hazard the check exists for is a chmod() that returns success on a
+# filesystem that did not honour it: the socket then exists at a mode the
+# front server cannot reach, the unit is "active", and every proxied
+# request is a 502 with nothing in any log of ours. That filesystem is not
+# available here - but the same disagreement is, and for real rather than
+# by mocking chmod: ask for a mode with a bit ABOVE 07777 set. chmod()
+# succeeds (measured: it returns 1) and the kernel masks the bit off, so
+# the mode read back off the bound socket genuinely differs from the mode
+# that was asked for, which is precisely the condition under test.
+###############################################################################
+{
+	my $path = _sock_path();
+	my $error = _dies(sub {
+		no warnings 'once'; # read by Server.pm, set only here
+		local $ConfigServer::UI::Server::UNIX_SOCKET_MODE = 010660;
+		$S->can('_open_unix_listener')->($path);
+	});
+	like($error, qr/after chmod/,
+		'the mode is read back off the bound socket and a disagreement is fatal - a chmod() that "succeeded" without taking effect is not trusted');
+	like($error, qr/front web server could not reach it/,
+		'and the message says what the consequence would have been, which is the silent 502 this check exists to prevent');
+	ok(!-e $path,
+		'and the socket is removed rather than left listening at a mode nothing can connect to');
+}
+{
+	# The narrowed umask is RESTORED, on the success path and on a failure
+	# path. The narrowing itself - that the socket is stricter than
+	# intended between bind() and chmod(), never looser - is not
+	# observable from inside this process (chmod() runs immediately after
+	# and the end state is identical either way), and is recorded as an
+	# exception in CHANGES.md rather than left to look verified. This is
+	# the half that is observable, and it matters on its own: a umask left
+	# at 0177 would follow this process into every file it creates
+	# afterwards.
+	my $previous = umask(0022);
+	my $path = _sock_path();
+	my ($listener) = $S->can('_open_unix_listener')->($path);
+	is(umask(), 0022, 'the umask narrowed around bind() is restored afterwards, not left on the process');
+	close $listener;
+	unlink $path;
+
+	_dies(sub { $S->can('_open_unix_listener')->('/nonexistent-csf-ui-dir/csf-ui.sock') });
+	is(umask(), 0022, 'and restored on the bind() failure path too, where the die happens after the narrowing');
+	umask(defined $previous ? $previous : 0022);
+}
+
+###############################################################################
 # peercred() - requirement 5. Real credentials off real sockets.
 ###############################################################################
 {
@@ -1902,6 +1952,72 @@ sub _connect_unix {
 		"F1: and the default dispatch term is derived from ConfigServer::UI::Client's own per-call timeout, not copied from it");
 	cmp_ok($ConfigServer::UI::Server::MAX_HELPER_CALLS_PER_REQUEST, '>=', 3,
 		'F1: with room for the three sequential helper calls _route_ui_overview actually makes');
+}
+
+###############################################################################
+# THE MODE-B REQUEST-PHASE WATCHDOG ARM - R31/R36's own central guard,
+# which had no test at all.
+#
+# Round 1 added the mode-A twin (above) and not this one. Measured by the
+# review: with the arm, a child whose dispatch() hangs for 40s dies at
+# 35.4s; without it, at 40.5s - it simply waits the hang out, which is
+# R31's failure mode exactly ($DEFAULT_MAX_CHILDREN such children deny the
+# UI, and waitpid() never reaps any because none of them ever exit).
+#
+# Scaled here: dispatch() hangs for 10s against a budget of 0.45s, and the
+# assertion is both that the deadline fired and that it fired on its own
+# budget rather than after the hang.
+###############################################################################
+{
+	my ($near, $far) = _pair();
+	syswrite($far, "GET /api/status HTTP/1.1\r\nHost: x\r\n\r\n");
+	my $fired = 0;
+	my $server = $S->new(
+		app               => HangingApp->new, # sleeps 10s inside dispatch()
+		handshake_timeout => 1,
+		header_timeout    => 0.1, body_timeout => 0.1, write_timeout => 0.05,
+		dispatch_timeout  => 0.2,
+		tls_wrap          => sub { bless $_[0], 'IO::Socket::SSL'; return $_[0] },
+		watchdog_exit     => sub { $fired++; die "mode B request watchdog fired\n" },
+	);
+	my $t0 = Time::HiRes::time();
+	eval { $server->_serve_accepted($near, '203.0.113.9') };
+	my $elapsed = Time::HiRes::time() - $t0;
+	is($fired, 1,
+		'R31/R36: a mode-B child stuck in dispatch() has the request budget fire on it - the arm nothing tested until now');
+	cmp_ok($elapsed, '<', 5,
+		"R31/R36: and on its own budget ($elapsed s), not after the ten-second hang it would otherwise wait out");
+	close $far;
+}
+{
+	# The alarm(0) CANCELS, in both modes, after a request that completed
+	# normally. Without them a child that finishes fast carries a live
+	# deadline into whatever it does next - which today is POSIX::_exit(0)
+	# and so harmless, and tomorrow is whatever Task 9's entry point adds,
+	# exactly the way R37's leak was inert until it was not. alarm(0)'s
+	# own return value is the assertion: it reports the seconds remaining
+	# on any pending alarm, so this is a direct read rather than an
+	# inference from timing.
+	my ($near, $far) = _pair();
+	syswrite($far, "GET /api/status HTTP/1.1\r\nHost: x\r\nX-Real-IP: 203.0.113.9\r\n\r\n");
+	my $server = $S->new(app => FakeApp->new, mode => 'a',
+		header_timeout => 5, body_timeout => 5, write_timeout => 5, dispatch_timeout => 5);
+	$server->_serve_accepted($near, 'unix');
+	my $remaining = Time::HiRes::alarm(0);
+	is($remaining, 0, 'mode A cancels the request budget when the request is done, rather than leaving it armed');
+	close $far;
+}
+{
+	my ($near, $far) = _pair();
+	syswrite($far, "GET /api/status HTTP/1.1\r\nHost: x\r\n\r\n");
+	my $server = $S->new(app => FakeApp->new,
+		handshake_timeout => 5,
+		header_timeout => 5, body_timeout => 5, write_timeout => 5, dispatch_timeout => 5,
+		tls_wrap => sub { bless $_[0], 'IO::Socket::SSL'; return $_[0] });
+	$server->_serve_accepted($near, '203.0.113.9');
+	my $remaining = Time::HiRes::alarm(0);
+	is($remaining, 0, 'and so does mode B - neither budget outlives the phase it was armed for');
+	close $far;
 }
 
 ###############################################################################
