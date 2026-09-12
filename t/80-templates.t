@@ -43,7 +43,7 @@ use FindBin ();
 use lib "$FindBin::Bin/..", "$FindBin::Bin/../ui-src/lib";
 
 use File::Temp qw(tempdir tempfile);
-use Test::More tests => 164;
+use Test::More tests => 174;
 
 my $DIST = "$FindBin::Bin/../ui-src/dist";
 my $RENDERER = "$DIST/render-template.sh";
@@ -482,7 +482,7 @@ for my $installer (@SH_FILES) {
 		'install-webui.sh: a front_configtest() function exists');
 	like($install_webui, qr/return 2/,
 		'install-webui.sh: front_configtest() has a distinct "no validator found" return, not silent success');
-	like($install_webui, qr{test_rc=\$\?\n\tif \[ "\$test_rc" -ne 0 \]; then},
+	like($install_webui, qr{test_rc=\$\?\n\n?\tif \[ "\$test_rc" -ne 0 \]; then},
 		'install-webui.sh: setup_mode_a() actually GATES on front_configtest()\'s exit status, not just calls it');
 	like($install_webui, qr/front_disable_vhost/,
 		'install-webui.sh: a rollback path (front_disable_vhost) exists for a failed validation');
@@ -570,13 +570,85 @@ for my $installer (@SH_FILES) {
 	# pre-existing rather than blamed on the vhost this run adds.
 	like($install_webui, qr/baseline_rc=\$\?/,
 		'install-webui.sh: setup_mode_a() captures a baseline configtest result before writing anything (R94)');
-	like($install_webui, qr/EXISTING configuration already fails its own test/,
+	like($install_webui, qr/configuration ALREADY failed its own test before this run/,
 		'install-webui.sh: a pre-existing failure is reported as pre-existing, not as this vhost\'s fault (R94)');
 	# The baseline capture must come BEFORE the certificate check and
 	# the render - not merely exist somewhere in the function.
 	like($install_webui,
 		qr{baseline_output=\$\(front_configtest "\$front"\)[\s\S]*?\[ ! -s /etc/csf-ui/ssl/cert\.pem \][\s\S]*?render-template\.sh}s,
 		'install-webui.sh: the baseline test runs before the certificate check and before rendering, not after (R94)');
+
+	# R95: three findings, all about ordering, fixed as one re-sequence:
+	# baseline, consent, enable, write, validate, then a rollback that
+	# reverts everything this run changed.
+	# 1. A real (non-2) baseline failure must NOT return immediately - it
+	# has to be carried forward so this run's own write (which can repair
+	# exactly what the baseline found broken, e.g. our own missing
+	# allow-include) gets a chance to fix it before anything is judged.
+	# Only the STRUCTURAL case - no validator binary at all (rc 2), which
+	# nothing this run does can ever change - exits immediately.
+	{
+		# Extracted and counted directly, not matched against a guessed
+		# whitespace shape with unlike() - the fragile version of this
+		# check (a hand-written unlike() regex trying to describe the
+		# WRONG code) stayed green when the guard-removal test below
+		# actually reintroduced "return 1 on any non-zero baseline",
+		# because the regex's assumed indentation did not match what the
+		# reverted code actually looked like. A precise extraction cannot
+		# have that failure mode: it counts `return 1` inside the
+		# baseline block directly, whatever the surrounding whitespace.
+		$install_webui =~ /if \[ "\$front" != "litespeed" \]; then\n(.*?)\n\tfi\n/s
+			or die "could not extract the baseline block from setup_mode_a()";
+		my $baseline_block = $1;
+		my $return_count = () = $baseline_block =~ /return 1/g;
+		is($return_count, 1,
+			'install-webui.sh: the baseline block returns 1 exactly once (only the rc-2 structural case), not on every non-zero result (R95)');
+		like($baseline_block, qr/if \[ "\$baseline_rc" -eq 2 \]; then\n\t\t\techo "\$baseline_output"[\s\S]*?return 1/,
+			'install-webui.sh: that one return is specifically gated on baseline_rc -eq 2, with the baseline output printed first (R95)');
+	}
+	like($install_webui, qr/if \[ "\$baseline_rc" -eq 2 \]; then/,
+		'install-webui.sh: only the structural "no validator at all" baseline result (rc 2) is still an immediate refusal (R95)');
+
+	# 2. $baseline_output must not be discarded on that one remaining
+	# immediate-refusal path - review's own words: "A refusal with no
+	# reason, in the round whose entire subject was making refusals
+	# honest."
+	like($install_webui,
+		qr{if \[ "\$baseline_rc" -eq 2 \]; then
+			echo "\$baseline_output"},
+		'install-webui.sh: the rc-2 baseline refusal prints $baseline_output, not just "leaving the WebUI unconfigured" (R95)');
+
+	# 3. Consent and enable (Apache modules) must happen BEFORE write -
+	# the whole point of the re-sequence - not after, which is what let
+	# fix round 3's version leave a half-written vhost around while
+	# asking, and made a module-enable failure look like a vhost failure.
+	like($install_webui,
+		qr{if \[ "\$front" = "apache" \]; then\n\t\tstill_missing=\$\(apache_check_modules\)[\s\S]*?\n\tfi\n[\s\S]*?\n\twrite_allow_include "\$front" "\$allow" "\$allow_include"}s,
+		'install-webui.sh: Apache module consent/enable (STEP 2/3) runs before write_allow_include (STEP 4), not after (R95)');
+
+	# 4. Modules THIS RUN enabled must be tracked separately from
+	# whatever apache_check_modules() reports later, and reverted on a
+	# failed final validation - not left active with nothing said.
+	like($install_webui, qr/^apache_disable_modules\s*\(\)/m,
+		'install-webui.sh: an apache_disable_modules() function exists (R95 - the rollback half apache_enable_modules() was missing)');
+	like($install_webui, qr/modules_enabled_this_run=\$enable_names/,
+		'install-webui.sh: setup_mode_a() records exactly which modules THIS RUN enabled, not a name recomputed later');
+	like($install_webui,
+		qr{if \[ "\$test_rc" -ne 0 \]; then[\s\S]*?front_disable_vhost "\$front" "\$out"
+		if \[ -n "\$modules_enabled_this_run" \]; then
+			apache_disable_modules "\$modules_enabled_this_run"}s,
+		'install-webui.sh: a failed final validation reverts BOTH the vhost and any module this run enabled (R95)');
+
+	# 5. The failure message must be derived from what the baseline
+	# actually established, not assume the vhost (or the module-enable)
+	# is the cause when the config was already broken - and must name
+	# the module-enable specifically when it happened, so a failure the
+	# ENABLE caused is not misattributed to "this vhost" alone (the exact
+	# regression R95 found arriving through R93's own fix).
+	like($install_webui, qr/what_changed="this vhost and enabling module\(s\) \$modules_enabled_this_run"/,
+		'install-webui.sh: the failure message names the module-enable specifically when it happened (R95 - no more blaming only "this vhost")');
+	like($install_webui, qr/cannot tell whether this vhost is the cause of a problem that was/,
+		"install-webui.sh: a failure on top of an already-broken baseline says the attribution is uncertain, not that this vhost caused it (R95)");
 
 	# R89: /usr/local/csf must not be a helper ReadWritePaths entry -
 	# nothing in S5 writes there, and it is where csfpre.sh/csfpost.sh

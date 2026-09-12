@@ -37,6 +37,22 @@ line is added below the original notice; the original stays intact.
 
 ### Unreleased
 
+#### Task 9 fix round 4 — three findings that were one ordering mistake, fixed as a sequence instead of three patches
+
+**2026-09-12** — R95, addressed by re-sequencing `setup_mode_a()` rather than patching each symptom separately. 2723 tests (was 2713).
+
+Fix round 3 introduced a baseline test, a consent prompt, and a module-enable step, each individually correct, but their ORDER produced three faces of one mistake:
+
+- **A missing file THIS RUN would have recreated permanently blocked every future re-run.** The baseline ran before `write_allow_include`, so if `/etc/csf-ui/allow-$front.conf` went missing while the vhost referencing it was still in place, `nginx -t` failed on our own `include` and the baseline refusal returned *without* writing the file that would have repaired it - a re-run that used to heal the installation could never succeed again.
+- **A refusal with no reason.** The baseline-failure branch discarded `$baseline_output` - the one place that names the actual cause, including "no configuration validator found" - and printed only "leaving the WebUI unconfigured", in the round whose entire subject was making refusals honest.
+- **Enabled modules were never reverted, and the ordering caused misattribution.** A module the consent prompt enabled was never disabled on a later failure, leaving `Listen 443` active with nothing configured and nothing said. And because enabling happened *after* the baseline, a failure the module-enable itself caused (activating a previously-dormant `<IfModule>`-guarded reference elsewhere on the box) was reported as "failed after adding this vhost (it passed before)" - blaming the vhost for what enabling the module did, precisely the misattribution the baseline exists to prevent, arriving through the consent prompt's own fix instead.
+
+`setup_mode_a()` is now one sequence: validate input, determine the target, **baseline** (measured, not gated - only the structural "no validator at all" result short-circuits, since nothing this run does can ever change that), check the certificate, **consent** and **enable** any missing Apache module (tracking exactly which ones THIS run enabled), **write**, **validate**, and - only on a final failure - **roll back everything this run changed**: the vhost AND any module it enabled, with a message derived from comparing the baseline and final results rather than assuming which step was at fault.
+
+Verified for real, end to end, against freshly-installed `nginx`/`apache2`: a vhost written successfully, its own allow-include file then deleted to simulate loss between runs, and a re-run that **self-healed** instead of refusing permanently; and the exact misattribution scenario - a dormant `<IfModule ssl_module>` reference elsewhere that only breaks once `mod_ssl` is enabled by consent - correctly reported as failing "after adding this vhost **and enabling module(s) ssl proxy_http headers**", with both the vhost and the three modules reverted.
+
+The guard-removal method caught its own class of mistake a third time this task: a hand-written `unlike()` regex describing the *wrong* code's expected shape stayed green when that wrong code was actually reintroduced, because the regex's assumed whitespace didn't match what the reverted code looked like. Replaced with a precise extraction-and-count check that cannot have that failure mode. Two further ordering assertions (module consent before write; the final rollback path) were also found to be checking comment text or the wrong span on first write, and were corrected the same way before being trusted.
+
 #### Task 9 fix round 3 — a kernel-hardening trade that helped nothing, a validator with no arm for a supported platform, and an installer that silently opened a port
 
 **2026-09-12** — R91-R94, all addressed. 2713 tests (was 2702).

@@ -505,6 +505,23 @@ apache_enable_modules() {
 }
 
 ###############################################################################
+# apache_disable_modules NAMES - fix round 4 (task-9-review.md R95): the
+# other half apache_enable_modules() was missing. "Modules enabled by the
+# new consent prompt are never reverted... A failed Mode A leaves Listen
+# 443 active with nothing configured and nothing said." Called only from
+# setup_mode_a()'s rollback path, and only with the exact names THIS RUN
+# enabled (tracked in $modules_enabled_this_run, not re-derived from
+# whatever apache_check_modules() reports at rollback time) - modules
+# that were already enabled before this run touched anything are never
+# named here and never disabled.
+###############################################################################
+apache_disable_modules() {
+	names=$1
+	command -v a2dismod >/dev/null 2>&1 || return 1
+	a2dismod $names >/dev/null 2>&1
+}
+
+###############################################################################
 # front_configtest FRONT - runs FRONT's own configuration validator
 # against the ACTIVE config (ours included, once written) and returns its
 # exit status, with combined stdout+stderr already printed by the caller
@@ -664,6 +681,73 @@ setup_mode_b() {
 # (front server present but no test binary - unusual, but possible),
 # this refuses rather than assuming success, per R87's own instruction.
 ###############################################################################
+# setup_mode_a - behind a detected front web server. Renders that
+# server's vhost template, but declares it configured ONLY once the
+# front server's OWN validator (and, for Apache, an actual module check)
+# says it is real - never on the strength of this script's own
+# rendering having succeeded. Never enables csf-ui.service.
+#
+# WHY NOT ENABLE IT: this build's ConfigServer::UI::Server (Task 5) is,
+# by its own header comment, "The Mode B listener" - it refuses to start
+# at all for UI_MODE=a. Nothing anywhere in this tree yet listens on the
+# unix socket these templates proxy to; there is no frozen path for it in
+# docs/WEBUI-RPC.md S2.3 either. Enabling csf-ui.service here would start
+# a process that immediately exits with that exact refusal, on a timer
+# that keeps restarting it - a crash loop dressed up as "Mode A is on".
+#
+# WHY VALIDATE RATHER THAN TRUST OUR OWN RENDER (fix round 2,
+# task-9-review.md R87): this task's whole failure signature is "nothing
+# happens and nothing says so", and rendering a syntactically well-formed
+# file is not the same claim as "the front server will actually load
+# it". Three concrete ways they differ, all closed by the same fix:
+#   - Apache ships mod_ssl/mod_proxy_http/mod_headers DISABLED by default
+#     on Debian/Ubuntu - the vhost renders fine and is inert (R88).
+#   - csf-ui-cert.sh can fail (no openssl, disk full) and exits 0 either
+#     way (by design - a firewall install must not fail over it) - a
+#     vhost referencing a certificate that was never written is fatal to
+#     the ENTIRE front server, not just this one.
+#   - UI_ALLOW's shape is checked by validate_ui_allow() above, but a
+#     subtler malformed value (out-of-range octets, a mask past /32) is
+#     still possible and is exactly what a real parser exists to catch.
+# nginx and Apache both ship a validator whose only job is to answer this
+# question (`nginx -t`, `apache2ctl configtest`/`httpd -t`) - it is used
+# here rather than reproduced.
+#
+# THE SEQUENCE (fix round 4, task-9-review.md R95, replacing three
+# separate patches with one ordering): validate input, determine the
+# target path, BASELINE (measure - do not yet judge), check the
+# certificate, ask CONSENT and ENABLE any missing Apache module, WRITE
+# the vhost, VALIDATE the result, and only THEN decide - rolling back
+# EVERYTHING this run changed (the vhost AND any module it enabled) if
+# the final validation fails, and deriving every message from what the
+# baseline and final results actually established rather than from
+# which step happened to run last. R95 found three faces of the same
+# ordering mistake in the previous round's separate baseline/consent/
+# write steps:
+#   1. the baseline ran before write_allow_include, so a MISSING FILE
+#      THIS RUN WOULD HAVE RECREATED (e.g. our own allow-include lost
+#      between runs) permanently blocked every future re-run instead of
+#      being healed by it;
+#   2. the baseline-failure branch printed only "leaving the WebUI
+#      unconfigured", discarding $baseline_output - the one place in
+#      this file that names the actual reason, in the round whose
+#      entire subject was making refusals honest;
+#   3. a module enabled by the R93 consent prompt was never reverted on
+#      a later failure, and because enabling happened AFTER the
+#      baseline, a failure the module-enable itself caused (activating
+#      stale <IfModule>-guarded config elsewhere on the box) was
+#      reported as "failed after adding this vhost (it passed before)"
+#      - blaming the vhost for what the module-enable did, the exact
+#      misattribution R94 exists to prevent, arriving through R93's own
+#      fix instead.
+# The fix below is not gating on the baseline result (except the one
+# baseline outcome that WRITING can never change - no validator binary
+# at all) - it is treated purely as a MEASUREMENT, carried forward to
+# be compared against the result AFTER this run's own changes, so a
+# baseline failure that this run's own write repairs succeeds instead
+# of being blocked, and a baseline failure that persists is reported
+# with both readings rather than one discarded.
+###############################################################################
 setup_mode_a() {
 	front=$1
 	port=$2
@@ -702,27 +786,25 @@ setup_mode_a() {
 			;;
 	esac
 
-	# Fix round 3 (task-9-review.md R94): a BASELINE test, before this
-	# script writes anything at all. Without it, a pre-existing, wholly
-	# unrelated problem elsewhere in $front's config makes the POST-write
-	# test fail, this script deletes the vhost it just wrote (which was
-	# fine), and reports the failure as its own - a false diagnosis in
-	# exactly the direction that wastes the most time. LiteSpeed has no
-	# validator to baseline (R92, below) - there is nothing to compare
-	# against, so this is skipped there, not attempted and ignored.
+	# STEP 1 - BASELINE. Measured, not judged: LiteSpeed has no validator
+	# to measure at all (front_configtest()'s own litespeed arm, R92),
+	# so baseline_rc stays empty there and every comparison below treats
+	# empty as "no baseline exists" rather than as pass or fail. A
+	# missing-validator baseline (rc 2) IS still a same-outcome refusal
+	# here, because it is the one baseline result nothing this run does
+	# can ever change - there is no point asking for module consent or
+	# writing a vhost this can never confirm. Every OTHER baseline
+	# result, including a real failure, is carried forward instead of
+	# acted on immediately (fix round 4's whole point): this run's own
+	# write might repair exactly what the baseline found broken.
+	baseline_rc=""
+	baseline_output=""
 	if [ "$front" != "litespeed" ]; then
 		baseline_output=$(front_configtest "$front")
 		baseline_rc=$?
 		if [ "$baseline_rc" -eq 2 ]; then
-			echo "csf-ui: leaving the WebUI unconfigured."
-			return 1
-		fi
-		if [ "$baseline_rc" -ne 0 ]; then
-			echo "csf-ui: $front's EXISTING configuration already fails its own test - before"
-			echo "csf-ui: this installer changed anything:"
 			echo "$baseline_output" | sed 's/^/csf-ui:   /'
-			echo "csf-ui: fix that first. Refusing to add a vhost on top of a config that was"
-			echo "csf-ui: already broken, and refusing to blame this installer for it."
+			echo "csf-ui: leaving the WebUI unconfigured."
 			return 1
 		fi
 	fi
@@ -734,34 +816,15 @@ setup_mode_a() {
 		return 1
 	fi
 
-	write_allow_include "$front" "$allow" "$allow_include"
-
-	mkdir -p "$(dirname "$out")" 2>/dev/null
-	if ! sh "$DIST_DIR/render-template.sh" "$DIST_DIR/$tpl" "$out" \
-		"UI_PORT=$port" "UI_SOCK=$sock" "UI_ALLOW_INCLUDE=$allow_include"; then
-		echo "csf-ui: could not render the $front vhost - leaving the WebUI unconfigured"
-		return 1
-	fi
-
-	if [ "$front" = "apache" ] && command -v a2enconf >/dev/null 2>&1; then
-		a2enconf csf-ui >/dev/null 2>&1
-	fi
-
-	# Fix round 2 (R88): a missing module makes the <IfModule>-guarded
-	# vhost a silent no-op that configtest below will call "Syntax OK" -
-	# that guard is precisely what stops it being a config-breaking
-	# error, and precisely why it cannot also be asked whether the vhost
-	# actually does anything. Checked directly instead.
-	#
-	# Fix round 3 (R93): enabling a module is no longer silent or
-	# automatic. apache_check_modules() (renamed from
-	# apache_missing_modules(), now a pure check) used to run `a2enmod`
-	# itself, unannounced - enabling mod_ssl activates `Listen 443`
-	# through Debian's own ports.conf regardless of anything this vhost
-	# does, which changes the operator's server exposure without telling
-	# them. This asks first; a "no" or an unavailable a2enmod (RHEL-
-	# family) prints the exact command and refuses, rather than guessing
-	# what the operator would have wanted.
+	# STEP 2 - CONSENT, STEP 3 - ENABLE (Apache only). Fix round 3 (R93):
+	# enabling a module is never silent or automatic - apache_check_modules()
+	# is a pure check; apache_enable_modules() is the only place a2enmod
+	# is invoked, and only after this asks. $modules_enabled_this_run
+	# records EXACTLY what this run enabled (fix round 4, R95) - not
+	# whatever apache_check_modules() reports at rollback time, which
+	# would also catch modules that were already enabled before this run
+	# touched anything and were never this run's to revert.
+	modules_enabled_this_run=""
 	if [ "$front" = "apache" ]; then
 		still_missing=$(apache_check_modules)
 		if [ -n "$still_missing" ]; then
@@ -780,6 +843,7 @@ setup_mode_a() {
 				case "$reply" in
 					[Yy]*)
 						apache_enable_modules "$enable_names"
+						modules_enabled_this_run=$enable_names
 						still_missing=$(apache_check_modules)
 						[ -z "$still_missing" ] && enabled_now=1
 						;;
@@ -789,39 +853,75 @@ setup_mode_a() {
 				echo "csf-ui: not enabling Apache modules without confirmation. Run this yourself"
 				echo "csf-ui: when ready, then re-run this installer or run csf-ui-setup:"
 				echo "csf-ui:   a2enmod $enable_names && systemctl reload apache2"
-				front_disable_vhost "$front" "$out"
 				return 1
 			fi
 		fi
 	fi
 
-	# Fix round 2 (R87), fix round 3 (R92): the front server's OWN
-	# validator, run against the file just written IN PLACE (and, for
-	# Apache, enabled) - not a private copy - because only the active
-	# tree tells the truth about whether the whole config (ours plus
-	# whatever else the host already has) is actually valid. The baseline
-	# above already confirmed $front's config was clean before this run
-	# (nginx/Apache only - see the baseline comment above for why
-	# LiteSpeed has none), so a failure here is attributable to this
-	# vhost, not blamed on it by assumption.
-	#
-	# front_configtest() itself now has an explicit litespeed arm (R92)
-	# that always returns 0 - not because anything was checked, but
-	# because "no validator" is LiteSpeed's permanent, expected state
-	# rather than nginx/Apache's anomalous one, so this call never
-	# refuses Mode A for it; the manual-verification steps below are how
-	# that gap actually gets closed, per platform, rather than by
-	# guessing at a test that does not exist.
-	test_output=$(front_configtest "$front")
-	test_rc=$?
-	if [ "$test_rc" -ne 0 ]; then
-		echo "csf-ui: $front's own configuration test failed after adding this vhost"
-		echo "csf-ui: (it passed before - see above) - the WebUI vhost is NOT active:"
-		echo "$test_output" | sed 's/^/csf-ui:   /'
-		front_disable_vhost "$front" "$out"
-		echo "csf-ui: removed the vhost and left the WebUI unconfigured. Fix the problem above and re-run."
+	# STEP 4 - WRITE. Recreates $allow_include unconditionally - this is
+	# what makes the baseline above a measurement rather than a gate: if
+	# it was THIS file missing that failed the baseline, this line is
+	# already the fix, and the validation below will say so by passing.
+	write_allow_include "$front" "$allow" "$allow_include"
+
+	mkdir -p "$(dirname "$out")" 2>/dev/null
+	if ! sh "$DIST_DIR/render-template.sh" "$DIST_DIR/$tpl" "$out" \
+		"UI_PORT=$port" "UI_SOCK=$sock" "UI_ALLOW_INCLUDE=$allow_include"; then
+		echo "csf-ui: could not render the $front vhost - leaving the WebUI unconfigured"
 		return 1
 	fi
+
+	if [ "$front" = "apache" ] && command -v a2enconf >/dev/null 2>&1; then
+		a2enconf csf-ui >/dev/null 2>&1
+	fi
+
+	# STEP 5 - VALIDATE. front_configtest()'s own litespeed arm (R92)
+	# always returns 0 here - not because anything was checked, but
+	# because "no validator" is LiteSpeed's permanent, expected state
+	# rather than nginx/Apache's anomalous one; the manual-verification
+	# steps below are how that gap actually gets closed.
+	test_output=$(front_configtest "$front")
+	test_rc=$?
+
+	if [ "$test_rc" -ne 0 ]; then
+		# STEP 6 - ROLLBACK EVERYTHING THIS RUN CHANGED, then derive the
+		# message from what the baseline and this result actually
+		# established, rather than assuming the vhost is why.
+		front_disable_vhost "$front" "$out"
+		if [ -n "$modules_enabled_this_run" ]; then
+			apache_disable_modules "$modules_enabled_this_run"
+		fi
+
+		what_changed="this vhost"
+		[ -n "$modules_enabled_this_run" ] && what_changed="this vhost and enabling module(s) $modules_enabled_this_run"
+
+		if [ -n "$baseline_rc" ] && [ "$baseline_rc" -ne 0 ]; then
+			echo "csf-ui: $front's configuration ALREADY failed its own test before this run"
+			echo "csf-ui: changed anything:"
+			echo "$baseline_output" | sed 's/^/csf-ui:   /'
+			echo "csf-ui: and STILL fails after adding $what_changed:"
+			echo "$test_output" | sed 's/^/csf-ui:   /'
+			echo "csf-ui: cannot tell whether this vhost is the cause of a problem that was"
+			echo "csf-ui: already there - fix the pre-existing failure above, then re-run."
+		else
+			echo "csf-ui: $front's own configuration test failed after adding $what_changed"
+			if [ -n "$baseline_rc" ]; then
+				echo "csf-ui: (it passed before - see above) - the WebUI vhost is NOT active:"
+			else
+				echo "csf-ui: - the WebUI vhost is NOT active:"
+			fi
+			echo "$test_output" | sed 's/^/csf-ui:   /'
+		fi
+		if [ -n "$modules_enabled_this_run" ]; then
+			echo "csf-ui: removed the vhost and disabled the module(s) this run enabled"
+			echo "csf-ui: ($modules_enabled_this_run) - nothing this run touched is still active."
+		else
+			echo "csf-ui: removed the vhost - nothing this run touched is still active."
+		fi
+		echo "csf-ui: left the WebUI unconfigured. Fix the problem above and re-run."
+		return 1
+	fi
+
 	if [ "$front" = "litespeed" ]; then
 		verified_note="NOT automatically verified - see the manual step below"
 	else
