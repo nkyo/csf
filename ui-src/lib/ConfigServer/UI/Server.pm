@@ -761,16 +761,38 @@ sub _netmask {
 # Callers must treat the empty list as a refusal, not as "unknown".
 #
 # MEASURED, so the next reader knows which of these four early returns
-# are load-bearing and which are not. Only ONE is reachable on this
-# platform: a filehandle that is not a socket, where getsockopt returns
-# undef. The other three are defensive and no test can enter them here -
-# `defined $socket` is redundant because getsockopt on undef returns undef
-# too and the next line catches it; and the length and count checks
-# cannot fire at all where SO_PEERCRED genuinely returns the twelve bytes
-# section 2.2 states as verified fact. They are kept because the cost of
-# a wrong answer here is the entire mode-A identity check, and because
-# unpack() on a short string does not fail - it pads with undef, which is
-# exactly the "partial answer" a caller would then read as a uid.
+# are load-bearing and which are not - and the two REASONS this comment
+# used to give were both simply false, which matters more than the
+# conclusion because a later editor would have acted on them (fix round 1,
+# F7). The conclusion is unchanged: only ONE of the four is reachable on
+# this platform, a filehandle that is not a socket, where getsockopt
+# returns undef. All four are kept, because the cost of a wrong answer
+# here is the entire mode-A identity check. The corrections:
+#
+#   * `defined $socket` was called redundant "because getsockopt on undef
+#     returns undef too and the next line catches it". Measured: it does
+#     not return anything - `getsockopt(undef, ...)` DIES ("Bad symbol for
+#     filehandle"). The check is redundant only because of the eval around
+#     the getsockopt below, which that sentence never mentioned, and which
+#     is there for a different reason. Remove `defined $socket` and this
+#     function returns () from inside the eval instead of from the guard;
+#     remove the EVAL and it dies. Neither is a thing to do by accident.
+#
+#   * unpack() on a short string was said to "pad with undef, which is
+#     exactly the partial answer a caller would then read as a uid".
+#     Measured: it does neither. unpack('iii', <2 bytes>) returns a
+#     0-element list; unpack('iii', <8 bytes>) returns a 2-element list.
+#     It TRUNCATES - it never produces an undef element - which is why
+#     the guard that catches a short option is the `@credential == 3`
+#     count, not a `defined` test on the elements. The separate `defined
+#     $credential[1]` check below is therefore belt-and-braces over a case
+#     unpack cannot produce, and is kept as such rather than as the thing
+#     that catches truncation.
+#
+# The 12-byte and 3-value checks remain genuinely unreachable on Linux,
+# which is the only platform with SO_PEERCRED, so no test enters them -
+# and that is recorded as an exception in CHANGES.md rather than left to
+# look verified.
 ###############################################################################
 sub peercred {
 	my ($socket) = @_;

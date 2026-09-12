@@ -40,7 +40,7 @@ use lib "$FindBin::Bin/..", "$FindBin::Bin/../ui-src/lib";
 use File::Temp qw(tempdir);
 use Socket ();
 use Time::HiRes ();
-use Test::More tests => 287;
+use Test::More tests => 294;
 
 require_ok('ConfigServer::UI::HTTP');
 require_ok('ConfigServer::UI::Server');
@@ -1201,13 +1201,66 @@ sub _connect_unix {
 	close $near; close $far;
 }
 {
-	my @credential = $S->can('peercred')->(undef);
+	# Two guards, provable only as a PAIR (fix round 1, F7): `defined
+	# $socket` is what stops getsockopt() being handed undef - which DIES
+	# rather than returning undef, measured below - and the eval around
+	# getsockopt() is what would catch it if that guard went. Remove
+	# either one alone and this still passes; remove both and peercred()
+	# dies here instead of refusing. The eval is what makes the die
+	# visible as a failure rather than as an aborted file with no "not ok"
+	# line at all.
+	my @credential;
+	my $died = _dies(sub { @credential = $S->can('peercred')->(undef) });
+	is($died, '', 'peercred on nothing refuses rather than dying - the guard and the eval, together');
 	is(scalar(@credential), 0, 'peercred on nothing is the empty list, never a partial answer');
 }
 {
 	my $fh = _handle("some bytes");
 	my @credential = $S->can('peercred')->($fh);
 	is(scalar(@credential), 0, 'peercred on a filehandle that is not a socket is the empty list too');
+}
+{
+	# FIX ROUND 1, F7: THE TWO REASONS peercred()'s COMMENT GAVE WERE
+	# FALSE, and a later editor would have acted on them. Both are now
+	# measured here rather than asserted in prose, because the shape of
+	# the guards depends on which is true.
+	#
+	# unpack() TRUNCATES a short string, it does not pad with undef - so
+	# the guard that catches a short SO_PEERCRED is the element COUNT, and
+	# a `defined` test on the elements could never have caught it.
+	my @none = unpack('iii', 'xx');
+	is(scalar(@none), 0,
+		"F7: unpack('iii') on two bytes yields NO values - it does not pad with undef, as the comment claimed");
+	my @two = unpack('iii', 'x' x 8);
+	is(scalar(@two), 2,
+		'F7: and on eight bytes it yields two - truncation, which is why the count check is the guard');
+	ok((grep { defined } @two) == 2, 'F7: and the values it does yield are all defined, never partial');
+
+	# getsockopt() on undef DIES, it does not return undef - so `defined
+	# $socket` is redundant only because of the eval, which the comment
+	# never mentioned.
+	my $error = _dies(sub { getsockopt(undef, Socket::SOL_SOCKET(), 17) });
+	ok($error, 'F7: getsockopt() on undef dies rather than returning undef, which is what made the old reason wrong');
+}
+{
+	# peercred()'s `defined $uid` refusal, and admit_peer()'s reading of
+	# it: a filehandle that is not a socket is the one reachable way for
+	# SO_PEERCRED to have no answer, and it must be a refusal rather than
+	# "unknown, therefore fine". Benign in itself - peer_uid_allowed()
+	# fails closed on an undefined uid anyway - but it is the branch that
+	# produces the "no identity to check" diagnostic, and nothing covered
+	# it.
+	my $fh = _handle("not a socket at all");
+	my $server = $S->new(app => FakeApp->new, mode => 'a', self_uid => $> + 0);
+	my $admitted;
+	my $stderr = _capture_stderr(sub {
+		$admitted = $server->admit_peer($fh, Socket::pack_sockaddr_un(''));
+	});
+	is($admitted, undef,
+		'a connection the kernel will not report credentials for is refused, not admitted as unknown');
+	like($stderr, qr/would not report SO_PEERCRED/,
+		'and it says which of the two mode-A refusals this was, since the remedies are different');
+	close $fh;
 }
 
 ###############################################################################
