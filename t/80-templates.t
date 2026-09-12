@@ -43,7 +43,7 @@ use FindBin ();
 use lib "$FindBin::Bin/..", "$FindBin::Bin/../ui-src/lib";
 
 use File::Temp qw(tempdir tempfile);
-use Test::More tests => 198;
+use Test::More tests => 207;
 
 my $DIST = "$FindBin::Bin/../ui-src/dist";
 my $RENDERER = "$DIST/render-template.sh";
@@ -225,6 +225,73 @@ like($csf_ui, qr/^RuntimeDirectory=csf-ui-web$/m,
 	'csf-ui.service: RuntimeDirectory=csf-ui-web (a directory csfui can actually write to)');
 like($csf_ui, qr/^RuntimeDirectoryMode=0750$/m,
 	'csf-ui.service: RuntimeDirectoryMode=0750');
+
+###############################################################################
+# THE MODE-A SOCKET PATH, ASSERTED ACROSS ALL FOUR FILES THAT NAME IT.
+#
+# This guard exists because of exactly what it prevents, which already
+# happened once: the path was written into the front-end templates, into
+# the installer, and into the systemd unit's RuntimeDirectory - and
+# implemented in none of them. Mode A shipped inert, and no test in this
+# suite could see it, because every file was individually consistent with
+# itself.
+#
+# So the module that now binds the socket
+# (ConfigServer::UI::Server::$DEFAULT_UNIX_SOCKET_PATH) is the single
+# authority and the other three are compared against it. A future edit
+# that moves the path in one place and not the others reddens here rather
+# than becoming a 502 on somebody's server.
+###############################################################################
+require_ok('ConfigServer::UI::Server');
+# Each of these package variables is read exactly once here, which is
+# what "used only once: possible typo" is for - the names are correct and
+# are the point of this block.
+no warnings 'once';
+my $SOCKET_PATH = $ConfigServer::UI::Server::DEFAULT_UNIX_SOCKET_PATH;
+ok(defined $SOCKET_PATH && length $SOCKET_PATH,
+	'Server.pm names the mode-A socket path it binds');
+
+my $installer = slurp("$DIST/install-webui.sh");
+like($installer, qr/^\s*sock=\Q$SOCKET_PATH\E\s*$/m,
+	"install-webui.sh renders the same socket path Server.pm binds ($SOCKET_PATH)");
+
+# The directory half: the socket cannot exist unless something creates
+# the directory it lives in, and in the shipped deployment that something
+# is this one systemd directive.
+my ($runtime_directory) = $csf_ui =~ /^RuntimeDirectory=(\S+)$/m;
+ok(defined $runtime_directory, 'csf-ui.service names a RuntimeDirectory');
+my $socket_directory = $SOCKET_PATH;
+$socket_directory =~ s{/[^/]+\z}{};
+is($socket_directory, '/run/' . (defined $runtime_directory ? $runtime_directory : ''),
+	'and that RuntimeDirectory IS the directory Server.pm binds its socket in - nothing else creates it');
+
+# And the three templates: each must carry the path once rendered with
+# it, in the directive its own server uses to reach a unix socket. A
+# template that rendered the value into a comment and not into its proxy
+# directive would sail through the generic no-placeholder check above.
+{
+	my (undef, $out) = render($TEMPLATE{nginx}, 'UI_PORT=8443', "UI_SOCK=$SOCKET_PATH",
+		'UI_ALLOW_INCLUDE=/etc/csf-ui/allow-nginx.conf');
+	like($out, qr{proxy_pass\s+http://unix:\Q$SOCKET_PATH\E:}, 'nginx proxies to that exact socket path');
+}
+{
+	my (undef, $out) = render($TEMPLATE{apache}, 'UI_PORT=8443', "UI_SOCK=$SOCKET_PATH",
+		'UI_ALLOW_INCLUDE=/etc/csf-ui/allow-apache.conf');
+	like($out, qr{ProxyPass\s+"/"\s+"unix:\Q$SOCKET_PATH\E\|}, 'Apache proxies to that exact socket path');
+}
+{
+	my (undef, $out) = render($TEMPLATE{litespeed}, 'UI_PORT=8443', "UI_SOCK=$SOCKET_PATH",
+		'UI_ALLOW_INCLUDE=/etc/csf-ui/allow-litespeed.conf');
+	like($out, qr{address\s+UDS://\Q$SOCKET_PATH\E}, 'LiteSpeed proxies to that exact socket path');
+}
+
+# The socket's own mode is the other half of "the front server can reach
+# it": the directory being traversable is necessary and not sufficient,
+# which is what csf-ui.service's own comment already says. 0660 is what
+# _open_unix_listener() sets and then verifies; asserted here so changing
+# it has to be a deliberate change to a documented number.
+is(sprintf('%04o', $ConfigServer::UI::Server::UNIX_SOCKET_MODE), '0660',
+	'the socket is served at 0660, so the group csf-ui.service hands to the front server can connect');
 
 SKIP: {
 	my $analyzer = `command -v systemd-analyze 2>/dev/null`;
