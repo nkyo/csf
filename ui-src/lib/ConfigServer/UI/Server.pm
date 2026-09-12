@@ -18,14 +18,55 @@
 # this program; if not, see <https://www.gnu.org/licenses>.
 ###############################################################################
 # Added 2026-09-11 in https://github.com/nkyo/csf - see CHANGES.md.
+# Extended 2026-09-12 with the Mode A listen path (ruling R82) - see the
+# "Two transports, one loop" note below.
 #
-# The Mode B listener (docs/WEBUI-RPC.md section 13): TLS termination, the
-# IP allowlist, and the accept loop, for hosts with no front web server or
-# where the administrator does not want csf touching one. This is the mode
-# that reintroduces exactly the risk Mode A removes - a process of ours
-# parsing HTTP from the network as the thing that answers the TLS
-# handshake - which is why every refusal below is loud and every default is
-# the strict one.
+# The listener, in both of docs/WEBUI-RPC.md's deployment modes:
+#
+#   * Mode B (section 13): TLS termination, the IP allowlist, and the
+#     accept loop on a TCP port, for hosts with no front web server or
+#     where the administrator does not want csf touching one. This is the
+#     mode that reintroduces exactly the risk Mode A removes - a process
+#     of ours parsing HTTP from the network as the thing that answers the
+#     TLS handshake - which is why every refusal below is loud and every
+#     default is the strict one.
+#
+#   * Mode A (docs/WEBUI-PLAN.md section 4): a unix socket that a front
+#     nginx/Apache/LiteSpeed proxies to (ui-src/dist/*.conf.tpl). The
+#     front server terminates TLS, enforces UI_ALLOW, and parses HTTP
+#     from the network first; this process never touches a network
+#     socket at all.
+#
+# TWO TRANSPORTS, ONE LOOP (ruling R82). Mode A is a listen path in this
+# module, not a second listener beside it. The accept loop, the child cap,
+# the reaping, the accept backoff and the per-phase watchdogs are
+# transport-agnostic and carry four rounds of review; a second copy of
+# them would be a second copy of every bug those rounds removed. What the
+# two modes genuinely do NOT share is exactly three things, and each is a
+# named branch rather than a scattered `if`:
+#
+#   1. what is opened          _open_listener() vs _open_unix_listener()
+#   2. who is admitted         admit_peer(), which is peer_allowed() on an
+#                              IP in mode B and peercred()/peer_uid_allowed()
+#                              on a kernel-supplied uid in mode A - the SAME
+#                              point in run()'s sequence either way: after
+#                              accept(), before fork(), before HTTP.pm has
+#                              seen one byte
+#   3. what wraps the socket   a TLS handshake in mode B; nothing at all in
+#                              mode A, where TLS was already terminated by
+#                              the front server one hop earlier
+#
+# WHAT MODE A DELIBERATELY DOES NOT DO, because reading it as an omission
+# is the likely mistake:
+#
+#   * it does not enforce UI_ALLOW (section 10 says outright that in mode
+#     A csf-ui does not; the front server does, from the same value - see
+#     run() and admit_peer(), both of which say so at the point of the
+#     non-enforcement rather than only here);
+#   * it does not require IO::Socket::SSL, because there is no TLS in
+#     this process in mode A (preflight());
+#   * it does not bind a TCP port, and refuses a ui.conf that names one
+#     (read_ui_conf(), section 10's "mode A and it is present").
 #
 # What this module is not: it does not parse HTTP (ConfigServer::UI::HTTP
 # does, from a filehandle this module hands it) and it does not route,
@@ -51,6 +92,10 @@
 #     request to ConfigServer::UI::App, write the response, close - one
 #     request per connection, always, because this tier implements no
 #     keep-alive at all.
+#
+# In mode A the first two of those refusals are different rather than
+# absent - see preflight() for what replaces the IO::Socket::SSL demand,
+# and admit_peer() for what replaces the allowlist check in the same slot.
 #
 # run() itself - the loop's own control flow, wired to a real accept() -
 # is untested by design, the same way ui-src/bin/csf-ui-helper's own main()
@@ -113,6 +158,58 @@ our $DEFAULT_ACCEPT_BACKOFF = 0.1;
 # than before this fix existed at all, when such a child held its slot for
 # the full combined budget rather than only this one.
 our $DEFAULT_HANDSHAKE_TIMEOUT = 10;
+
+###############################################################################
+# Mode A's transport constants. NONE of these is a ui.conf key, and none of
+# them may become one: docs/WEBUI-RPC.md section 10 is a frozen table whose
+# own rules say "adding a key means amending this table first", and this
+# module is not the place that amendment gets made by accident. They are
+# module constants in the same way $TLS_CERT_FILE/$TLS_KEY_FILE below
+# already are for the other mode's out-of-contract material, and
+# constructor-overridable so a test never has to be root or own /run.
+#
+# $DEFAULT_UNIX_SOCKET_PATH is NOT a free choice. It is the path three
+# already-shipped files point at and nothing until now created:
+# ui-src/dist/nginx.conf.tpl's proxy_pass, ui-src/dist/apache.conf.tpl's
+# ProxyPass, and ui-src/dist/install-webui.sh's own `sock=` - which is in
+# turn the path csf-ui.service's RuntimeDirectory=csf-ui-web creates the
+# directory for. Four places, one string: t/80-templates.t asserts they
+# still agree, because the whole reason mode A was inert is that a path
+# can be written in several files and implemented in none.
+#
+# $UNIX_SOCKET_MODE is 0660, not 0666 and not whatever UMask= leaves
+# behind. csf-ui.service sets UMask=0077, under which bind() would create
+# the socket 0700 and the front server's worker - which is in the
+# directory's group, not this process's uid - could never connect. That is
+# a silent failure: the socket exists, the unit is "active", and every
+# proxied request becomes a 502 with nothing in any log of ours. The mode
+# is therefore set explicitly and then VERIFIED (see _open_unix_listener),
+# the same way ui-src/bin/csf-ui-helper's own preflight() chmod()s its
+# socket rather than trusting UMask=.
+###############################################################################
+our $DEFAULT_UNIX_SOCKET_PATH = '/run/csf-ui-web/csf-ui.sock';
+our $UNIX_SOCKET_MODE = 0660;
+
+# What _peer_text() answers for a unix peer. Deliberately not an address:
+# it must never be mistaken for one, and it must never reach
+# ConfigServer::UI::RateLimit as a rate-limit key - in mode A the key is
+# the per-client address the front server states in $FRONT_PEER_HEADER
+# (see peer_from_front()), and a constant here would collapse every
+# visitor into one bucket, which docs/WEBUI-RPC.md section 14.1 forbids by
+# name. This value exists for this module's own diagnostics; if it ever
+# shows up in an access log, something is wrong and it says so plainly.
+our $UNIX_PEER_TEXT = 'unix';
+
+# The header every mode-A front-end template sets unconditionally from its
+# own view of the connecting peer (nginx.conf.tpl:84 proxy_set_header,
+# apache.conf.tpl:97 RequestHeader set, litespeed.conf.tpl:65
+# extraHeaders). See peer_from_front() for why a header is the right - and
+# the only - source for `peer` in this mode, and what makes it trustworthy.
+our $FRONT_PEER_HEADER = 'x-real-ip';
+
+# The bound on the passwd enumeration unix_peer_uids() falls back to; see
+# there for when it runs at all (rarely) and why it is bounded.
+our $MAX_PASSWD_SCAN = 20000;
 
 ###############################################################################
 # ui.conf (docs/WEBUI-RPC.md section 10)
@@ -314,11 +411,37 @@ sub read_ui_conf {
 # Every startup precondition this process owns, mirroring the shape
 # ui-src/bin/csf-ui-helper's own preflight() already established: a list of
 # human-readable problems, empty when it is safe to bind and listen. %opt:
-# ui_conf_path (default $DEFAULT_UI_CONF_PATH).
+# ui_conf_path (default $DEFAULT_UI_CONF_PATH), socket_path (mode A only,
+# default $DEFAULT_UNIX_SOCKET_PATH).
+#
+# THE PRECONDITIONS ARE PER MODE, and this function used to say so in the
+# bluntest possible way: it refused outright whenever UI_MODE was not "b",
+# because at the time that was the truth - mode A had no listener at all.
+# That refusal is now a mode SELECTION, and the two modes' preconditions
+# are genuinely different rather than one being a subset of the other:
+#
+#   mode B needs IO::Socket::SSL, and needs it so badly that it never
+#   serves plain HTTP instead. Mode A must NOT demand it - there is no TLS
+#   in this process in mode A, the front server terminated it one hop
+#   earlier, and a hard dependency on a TLS library for a process that
+#   opens no TLS socket would refuse to start a perfectly sound
+#   deployment for a reason that does not apply to it.
+#
+#   mode A needs SO_PEERCRED, and needs it exactly as badly as mode B
+#   needs TLS, for the same kind of reason: it is the ONLY identity a unix
+#   socket carries. Without it this process cannot tell the front server
+#   from any local user who found the socket, and every guarantee mode A
+#   makes - the front server's UI_ALLOW, the front server's own view of
+#   the client address - rests on being able to tell those apart. So it is
+#   a startup refusal, never a runtime degradation, and there is no
+#   fallback (G3). docs/WEBUI-RPC.md section 2.1 makes the identical
+#   demand of the helper for the identical reason, and section 11.7 raised
+#   the whole project's Perl floor to 5.14 to get it.
 ###############################################################################
 sub preflight {
 	my (%opt) = @_;
 	my $ui_conf_path = $opt{ui_conf_path} || $DEFAULT_UI_CONF_PATH;
+	my $socket_path  = $opt{socket_path}  || $DEFAULT_UNIX_SOCKET_PATH;
 	my @problem;
 
 	push @problem, 'Perl 5.14 or later is required' unless $] >= 5.014;
@@ -330,31 +453,105 @@ sub preflight {
 	push @problem, 'this process must not run as root; it is the unprivileged half of the WebUI split and must run as the unprivileged web-tier user'
 		if $> == 0;
 
-	# The one dependency this task adds, and the one this whole module
-	# refuses to run without: TLS via IO::Socket::SSL, never a plain-HTTP
-	# fallback. Not installed in this workspace by design (G1) - this
-	# branch is exercised for real by t/41-http-hostile.t, not mocked,
-	# because a refusal that only a mock ever exercises is not proven.
-	unless (eval { require IO::Socket::SSL; 1 }) {
-		push @problem, 'IO::Socket::SSL is not installed; install it '
-			. '(Debian/Ubuntu: libio-socket-ssl-perl; RHEL/CloudLinux/cPanel: perl-IO-Socket-SSL) '
-			. 'so the standalone web UI can serve TLS - it never serves plain HTTP instead';
-	}
-
 	my ($conf, $problems) = read_ui_conf($ui_conf_path);
-	if (@$problems) {
-		push @problem, @$problems;
+	push @problem, @$problems if @$problems;
+
+	# An unreadable or invalid ui.conf has no mode, and the refusals above
+	# already say so. It is treated as mode B here only so that the
+	# IO::Socket::SSL problem is still reported alongside the config ones
+	# rather than withheld until the config is fixed and the process is
+	# started a second time.
+	my $mode = (!@$problems && $conf) ? $conf->{UI_MODE} : 'b';
+
+	if ($mode eq 'b') {
+		# The one dependency this task adds, and the one mode B refuses to
+		# run without: TLS via IO::Socket::SSL, never a plain-HTTP
+		# fallback. Not installed in this workspace by design (G1) - this
+		# branch is exercised for real by t/41-http-hostile.t, not mocked,
+		# because a refusal that only a mock ever exercises is not proven.
+		unless (eval { require IO::Socket::SSL; 1 }) {
+			push @problem, 'IO::Socket::SSL is not installed; install it '
+				. '(Debian/Ubuntu: libio-socket-ssl-perl; RHEL/CloudLinux/cPanel: perl-IO-Socket-SSL) '
+				. 'so the standalone web UI can serve TLS - it never serves plain HTTP instead';
+		}
 	}
-	elsif ($conf->{UI_MODE} ne 'b') {
-		# Section 10's own grammar only requires UI_MODE to be "a" or "b";
-		# this process is specifically the mode-B listener, so a
-		# syntactically valid "a" is still this process's own refusal to
-		# start - it has nothing to bind, and mode A's listener is a front
-		# web server this module is not.
-		push @problem, 'ui.conf: UI_MODE is "a"; this is the mode-B standalone listener and does not run when a front web server serves the UI instead';
+	else {
+		push @problem, mode_a_preflight(socket_path => $socket_path);
 	}
 
 	return @problem;
+}
+
+###############################################################################
+# mode_a_preflight(%opt) -> @problems
+#
+# Mode A's own startup preconditions, split out from preflight() so they
+# are reachable from a test without a mode-A ui.conf on disk, and so that
+# the list is readable as a list rather than as one arm of an if.
+#
+# Two families, and both of them are "this cannot work, and would fail
+# silently if allowed to proceed":
+#
+#   IDENTITY. SO_PEERCRED must resolve, and must be usable. See
+#   preflight()'s own comment for why this is a refusal and not a
+#   degradation.
+#
+#   THE DIRECTORY THE SOCKET GOES IN. Not the socket - that does not exist
+#   yet - but the directory that decides who can reach it, which in the
+#   shipped deployment is csf-ui.service's RuntimeDirectory=csf-ui-web,
+#   created 0750 csfui:csf-ui-sock before ExecStart runs. Three things have
+#   to hold and each has a distinct failure:
+#
+#     * it exists and is a directory - otherwise bind() fails with ENOENT
+#       at a moment when the message would be about a socket rather than
+#       about the directory that is actually missing;
+#     * this process owns it - a directory this process does not own is
+#       one it cannot create a socket in, and (docs/WEBUI-RPC.md section
+#       2.1 makes the same argument for the helper's own socket
+#       directory) one where somebody else chooses where our socket lives;
+#     * it is not writable by other - a world-writable directory means any
+#       local user can unlink our socket and bind their own in its place,
+#       and the front server would then proxy the administrator's session
+#       to them. The mode of the socket itself cannot defend against that;
+#       only the directory can.
+###############################################################################
+sub mode_a_preflight {
+	my (%opt) = @_;
+	my $socket_path = $opt{socket_path} || $DEFAULT_UNIX_SOCKET_PATH;
+	my @problem;
+
+	unless (defined &Socket::SO_PEERCRED && defined &Socket::SOL_SOCKET) {
+		push @problem, 'this Socket module does not provide SO_PEERCRED; mode A cannot identify the process at the other end of its unix socket and will not start without it (Perl 5.14 or later with Socket 1.94 or later is required - docs/WEBUI-RPC.md section 11.7)';
+	}
+
+	my $directory = _socket_directory($socket_path);
+	my @st = stat($directory);
+	if (!@st) {
+		push @problem, "the mode-A socket directory ($directory) does not exist or cannot be read; it is created by csf-ui.service's RuntimeDirectory=, so a missing one usually means this process was started outside its unit";
+	}
+	elsif (!-d _) {
+		push @problem, "the mode-A socket directory ($directory) is not a directory";
+	}
+	else {
+		push @problem, "the mode-A socket directory ($directory) is owned by uid $st[4], not by this process (uid $>); it cannot create its socket there"
+			unless $st[4] == $>;
+		push @problem, "the mode-A socket directory ($directory) is writable by other; any local user could replace the socket the front web server connects to"
+			if ($st[2] & 0002);
+	}
+
+	return @problem;
+}
+
+# The directory a socket path lives in, without File::Basename (core, but
+# one more thing to load for one line) and without assuming the path has a
+# directory part at all.
+sub _socket_directory {
+	my ($path) = @_;
+	return '.' unless defined $path && length $path;
+	my $index = rindex($path, '/');
+	return '.' if $index < 0;
+	return '/' if $index == 0;
+	return substr($path, 0, $index);
 }
 
 ###############################################################################
@@ -406,6 +603,248 @@ sub _netmask {
 }
 
 ###############################################################################
+# MODE A'S PEER IDENTITY
+#
+# peercred($socket) -> ($pid, $uid, $gid) | ()
+#
+# The kernel's answer to "what is at the other end of this unix socket",
+# and in mode A the ONLY answer there is: a unix socket carries no
+# address, so there is nothing else to ask. docs/WEBUI-RPC.md section 2.2
+# uses the identical call for the identical reason on the helper's socket,
+# and states as verified fact that SO_PEERCRED is 17, SOL_SOCKET is 1 and
+# the three-integer "iii" layout is correct on the target platform.
+#
+# Returns the empty list, never a partial answer, when getsockopt fails or
+# the option comes back too short to unpack - the same "fewer than 3
+# values means close immediately" row section 2.2's own table carries.
+# Callers must treat the empty list as a refusal, not as "unknown".
+###############################################################################
+sub peercred {
+	my ($socket) = @_;
+	return () unless defined $socket;
+	return () unless defined &Socket::SO_PEERCRED && defined &Socket::SOL_SOCKET;
+
+	my $packed = eval { getsockopt($socket, Socket::SOL_SOCKET(), Socket::SO_PEERCRED()) };
+	return () unless defined $packed;
+	return () if length($packed) < 12; # three 32-bit ints; anything shorter is not an answer
+
+	my @credential = unpack('iii', $packed);
+	return () unless @credential == 3;
+	return () unless defined $credential[1];
+	return @credential;
+}
+
+###############################################################################
+# unix_peer_uids($gid, %opt) -> \%uid_is_accepted
+#
+# THE ACCEPTED SET, AND WHY IT IS DERIVED RATHER THAN CONFIGURED.
+#
+# docs/WEBUI-RPC.md section 10 is frozen, so there is no ui.conf key
+# naming the front web server's account and this module must not invent
+# one. It does not need one: the deployment has already stated the answer
+# twice, in the only two places that actually decide who can connect.
+#
+#   * The socket is 0660 and group-owned by the group that gates it -
+#     csf-ui-sock in the shipped install, which exists for exactly this
+#     one purpose and gates nothing else (install-webui.sh's
+#     create_account()/grant_socket_group(), csf-ui.service's Group=).
+#     The installer adds the detected front server's worker account to
+#     that group and nothing else to it, so the group's membership IS the
+#     list of accounts the administrator's install designated.
+#   * The kernel already enforces that list on connect(). This check is
+#     not a substitute for the file mode; it is the second, independent
+#     gate for the cases the mode cannot cover - a directory or socket
+#     relaxed by hand, and root, which bypasses mode bits entirely.
+#
+# WHY SECTION 2.2'S uid==0 RULE IS NOT COPIED HERE. That rule is
+# csf-ui-helper's, and it is right there: the helper's only legitimate
+# peer is csf-ui, so root arriving at the helper's socket is always
+# something other than the caller it exists for, and "if root wants to run
+# csf, root runs csf" disposes of it completely. Neither half of that
+# transfers. This socket's legitimate peer is the front server's worker
+# account, which is never root, so root is not rejected for being root -
+# it is simply not in a set derived from group membership, exactly like
+# any other uid the install did not designate. The difference matters in
+# the one case where the two rules disagree: an administrator whose front
+# server genuinely runs its workers as root (uncommon, and its own
+# problem, but real) can put root in the socket group and have it work,
+# where a copied uid==0 rule would refuse forever and say only "root".
+#
+# THREE WAYS IN, cheapest first, each with a distinct reason:
+#
+#   1. the peer's uid is this process's own. It owns the socket; the file
+#     mode admits it; and a process already running as this uid holds the
+#     session store and the rate-limit state, so refusing it would protect
+#     nothing it could not simply take.
+#   2. the peer's PRIMARY gid is the socket's gid. This is the case the
+#     member list cannot see: getgrgid()'s member list names only
+#     supplementary members, so an account created with the socket group
+#     as its primary group appears nowhere in it - while the kernel
+#     admits it on exactly that group bit. Checked per connection from
+#     the credentials themselves, so it costs no NSS lookup at all.
+#   3. the peer's uid is in the socket group's member list, resolved once
+#     at startup (section 2.2 resolves its own uid once at startup for
+#     the same reason: an NSS lookup per connection is a dependency on a
+#     name service in the request path).
+#
+# THE PASSWD SCAN, and why it is in the failure path only. run() refuses
+# to start when the accepted set contains nobody but this process - that
+# is the shape of an install whose grant_socket_group() never found a
+# front-server account, where every proxied request becomes a 502 with
+# nothing in any log of ours. But "the member list is empty" is not proof
+# of that, because of case 2 above. So before that refusal can be
+# concluded, and ONLY then, the passwd database is enumerated to look for
+# an account whose primary group is the socket's group. It is bounded
+# ($MAX_PASSWD_SCAN) because getpwent() over a directory-backed NSS is
+# not guaranteed to be either fast or finite, and a startup that hangs in
+# NSS is worse than one that refuses; the bound is only ever reached on a
+# host where the answer was already "no local account", and the refusal it
+# leads to names the remedy.
+###############################################################################
+sub unix_peer_uids {
+	my ($gid, %opt) = @_;
+
+	my $self_uid = defined $opt{self_uid} ? $opt{self_uid} : $> + 0;
+	my %uid = ($self_uid => 1);
+	return \%uid unless defined $gid;
+
+	my $group_lookup = $opt{group_lookup} || sub { return getgrgid($_[0]) };
+	my $name_lookup  = $opt{name_lookup}  || sub { return getpwnam($_[0]) };
+
+	my @group = $group_lookup->($gid);
+	if (@group) {
+		my $members = defined $group[3] ? $group[3] : '';
+		for my $name (split(/\s+/, $members)) {
+			next unless length $name;
+			my @passwd = $name_lookup->($name);
+			next unless @passwd && defined $passwd[2];
+			$uid{ $passwd[2] + 0 } = 1;
+		}
+	}
+
+	# Only when the member list produced nobody but ourselves: see the
+	# header comment for why this cannot be skipped and why it is bounded.
+	return \%uid if grep { $_ != $self_uid } keys %uid;
+
+	my $passwd_scan = $opt{passwd_scan} || \&_primary_group_members;
+	for my $found ($passwd_scan->($gid)) {
+		$uid{ $found + 0 } = 1;
+	}
+	return \%uid;
+}
+
+sub _primary_group_members {
+	my ($gid) = @_;
+	my @uid;
+	my $seen = 0;
+	setpwent();
+	while (my @passwd = getpwent()) {
+		last if ++$seen > $MAX_PASSWD_SCAN;
+		next unless defined $passwd[3] && $passwd[3] == $gid;
+		push @uid, $passwd[2];
+	}
+	endpwent();
+	return @uid;
+}
+
+###############################################################################
+# peer_uid_allowed($self, $uid, $gid) -> 1 | 0
+#
+# The three ways in from unix_peer_uids()' header comment, applied to one
+# connection's credentials. Fails closed on anything missing: an undefined
+# uid, or a set that was never built, is a refusal rather than a pass.
+###############################################################################
+sub peer_uid_allowed {
+	my ($self, $uid, $gid) = @_;
+	return 0 unless defined $uid;
+
+	return 1 if defined $self->{self_uid} && $uid == $self->{self_uid};
+	return 1 if defined $gid && defined $self->{socket_gid} && $gid == $self->{socket_gid};
+
+	return 0 unless ref($self->{peer_uids}) eq 'HASH';
+	return $self->{peer_uids}{$uid} ? 1 : 0;
+}
+
+###############################################################################
+# peer_from_front($request) -> $address_text | undef
+#
+# WHERE `peer` COMES FROM IN MODE A, which is the one place this design
+# has to reason its way out of an apparent contradiction in the contract
+# rather than simply obey it.
+#
+# docs/WEBUI-RPC.md section 14.1 binds whoever fills in `peer` with two
+# rules: (1) it must be per-connecting-client, never a constant, or
+# RateLimit.pm's per-address cap collapses into one bucket where a handful
+# of failed logins from any one visitor locks out every visitor; and (2)
+# it must never come from a client-supplied header that this tier treats
+# as trusted. On a unix socket those two rules have no common answer on
+# their face: the transport carries no client address at all, so the only
+# possible source of a per-client value is a header - and rule 2 appears
+# to forbid exactly that.
+#
+# It does not, and the word doing the work is "client-supplied". The
+# header is not the client's here. Every front-end template this project
+# ships sets it unconditionally from the front server's own view of the
+# connecting peer, overwriting whatever the client sent
+# (nginx.conf.tpl:84, apache.conf.tpl:97, litespeed.conf.tpl:65 - all
+# three carry the same comment saying so). So the value is the front
+# server's statement, not the client's, and the whole question reduces to
+# a single one: is the thing that connected actually that front server?
+#
+# That question is what admit_peer()'s SO_PEERCRED check answers, before
+# this function is ever reached, and it is why that check is mandatory
+# rather than defence in depth. Without it a local unprivileged user
+# connects to the socket directly, is never seen by the front server's
+# UI_ALLOW at all, and writes whatever X-Real-IP they like into the
+# rate-limit key and the access log - which is to say, picks which other
+# visitor gets locked out, and whose address the audit trail blames.
+#
+# The refusals below all fall closed to "no peer", never to a default,
+# and handle_connection() turns that into a 400 rather than serving the
+# request with an invented address. A front server that does not send the
+# header is a front server that has not been configured to this module's
+# contract; serving it anyway would mean either a constant `peer` (rule 1
+# broken, silently) or an empty one (which ui-src/bin/csf-ui already
+# refuses one layer in, with a worse message).
+###############################################################################
+sub peer_from_front {
+	my ($request) = @_;
+	return undef unless ref($request) eq 'HASH';
+	return undef unless ref($request->{headers}) eq 'HASH';
+
+	my $value = $request->{headers}{$FRONT_PEER_HEADER};
+	return undef unless defined $value && !ref($value) && length $value;
+
+	# Before ip_info(), and cheaper than it: this rejects the shapes a
+	# proxy chain produces (a comma-joined list), a bracketed IPv6
+	# literal, an address with a port, and an IPv6 zone index - none of
+	# which section 14.1 permits ("no port, no brackets") and each of
+	# which would otherwise reach a validator as a puzzle rather than as a
+	# refusal.
+	return undef if $value =~ /[^0-9A-Fa-f:.]/;
+
+	# removal => 1 for the same reason peer_allowed() uses it on a peer:
+	# it admits :: and ::1, which are real, unremarkable source addresses
+	# for a front server on the same host and which ip_info()'s
+	# IPv4-mapped rule would otherwise catch as a false positive (R18). It
+	# grants nothing - this value is a rate-limit key and a log line, not
+	# a permission.
+	my $info = $P->can('ip_info')->($value, removal => 1);
+	return undef unless $info;
+
+	# A prefix is not one client. removal => 1 accepts /0, and a front
+	# server has no business sending any prefix at all, so the whole
+	# question is settled by refusing every one of them rather than by
+	# reasoning about which are harmless.
+	return undef if defined $info->{plen};
+
+	# The canonical form, not the bytes as sent: two spellings of one IPv6
+	# address must not become two rate-limit buckets and two kinds of line
+	# in the access log.
+	return $info->{canonical};
+}
+
+###############################################################################
 # Construction
 #
 # Every dependency a test needs to replace is injectable, the same pattern
@@ -446,6 +885,35 @@ sub _netmask {
 #                      violated none of them). Defaults to
 #                      $DEFAULT_HANDSHAKE_TIMEOUT.
 ###############################################################################
+#   mode           'a' or 'b'. NOT a free choice at runtime: run() always
+#                  overwrites it from ui.conf, which is the single place
+#                  the mode is decided (ui-src/bin/csf-ui's own entry
+#                  point says the same thing about not re-deciding it).
+#                  The constructor argument exists so a test can exercise
+#                  a mode-specific path - admit_peer(), handle_connection(),
+#                  _serve_accepted() - without a ui.conf and without run().
+#                  Defaults to 'b', which is the mode this file had when
+#                  it was the only one.
+#   socket_path    mode A's unix socket. Defaults to
+#                  $DEFAULT_UNIX_SOCKET_PATH; overridden by tests, which
+#                  own neither /run nor root.
+#   self_uid       this process's uid, resolved once. Injectable only so a
+#                  test can construct a peer that is deliberately NOT this
+#                  process without needing a second account to run as.
+#   socket_gid     mode A: the gid the socket is group-owned by, which is
+#                  what the kernel checks its 0660 group bit against.
+#                  Normally read off the socket run() just bound, never
+#                  guessed from the process's egid or the directory.
+#   peer_uids      mode A: the accepted uid set. run() derives it from
+#                  socket_gid (unix_peer_uids()) unless one was injected,
+#                  the same "an injected dependency wins" rule tls_wrap,
+#                  watchdog_exit and listener above already follow.
+#   listen_family  mode B: the family of the listener this module opened,
+#                  passed to _peer_text() so a peer address is unpacked by
+#                  what it IS rather than by how long it happens to be.
+#                  Deliberately left undef for an injected listener, whose
+#                  family this module did not choose and must not assert.
+###############################################################################
 sub new {
 	my ($class, %opt) = @_;
 	return bless {
@@ -453,6 +921,13 @@ sub new {
 		app               => $opt{app},
 		tls_wrap          => $opt{tls_wrap},
 		listener          => $opt{listener},
+		mode              => (defined $opt{mode} && $opt{mode} eq 'a') ? 'a' : 'b',
+		socket_path       => defined $opt{socket_path} ? $opt{socket_path} : $DEFAULT_UNIX_SOCKET_PATH,
+		self_uid          => defined $opt{self_uid} ? $opt{self_uid} + 0 : $> + 0,
+		socket_gid        => $opt{socket_gid},
+		peer_uids         => $opt{peer_uids},
+		listen_family     => $opt{listen_family},
+		refused_logged    => {},
 		max_children      => defined $opt{max_children} ? $opt{max_children} : $DEFAULT_MAX_CHILDREN,
 		backlog           => defined $opt{backlog} ? $opt{backlog} : $DEFAULT_LISTEN_BACKLOG,
 		accept_backoff    => defined $opt{accept_backoff} ? $opt{accept_backoff} : $DEFAULT_ACCEPT_BACKOFF,
@@ -508,7 +983,36 @@ sub handle_connection {
 	}
 	return unless defined $request; # nothing was ever sent; close in silence
 
-	$request->{peer} = $peer_addr;
+	# docs/WEBUI-RPC.md section 14.1's `peer`, and the one field whose
+	# source differs between the two modes. In mode B it is the address
+	# accept() reported, already checked against UI_ALLOW before this
+	# connection was ever forked for. In mode A accept() reports no
+	# address at all and the front server states the client's instead -
+	# see peer_from_front() for why a header is both the only possible
+	# source and a sound one, and for what makes it sound (admit_peer()'s
+	# SO_PEERCRED check, which has already run by the time we are here).
+	if ($self->{mode} eq 'a') {
+		my $front_peer = peer_from_front($request);
+		unless (defined $front_peer) {
+			# Refused, not defaulted. A front server that did not state
+			# the client's address has not been configured to this
+			# module's contract, and the two things this could do instead
+			# are both worse: a constant would collapse every visitor into
+			# one rate-limit bucket (section 14.1 forbids it by name), and
+			# an empty string is refused by ui-src/bin/csf-ui one layer in
+			# anyway, with a message that cannot say what is actually
+			# wrong because by then nothing knows.
+			$H->can('write_response')->($socket,
+				$H->can('error_response')->(400,
+					"this server is behind a front web server, which must send the connecting client's address in a $FRONT_PEER_HEADER header"),
+				timeout => $self->{write_timeout});
+			return;
+		}
+		$request->{peer} = $front_peer;
+	}
+	else {
+		$request->{peer} = $peer_addr;
+	}
 
 	my $response = eval { $self->{app}->dispatch($request) };
 	$response = $H->can('error_response')->(500, 'an internal error occurred')
@@ -541,9 +1045,58 @@ sub _open_listener {
 	return $listener;
 }
 
+###############################################################################
+# _peer_text($paddr, $family) -> $text | undef
+#
+# THE UNIX CASE IS ITS OWN CASE, not a fallthrough - which is what it was,
+# and what made every mode-A connection fail silently before the mode
+# existed to fail. The shape of that bug is worth keeping written down,
+# because it is the shape a "just add a transport" change naturally has:
+# this function used to decide between IPv6 and IPv4 by the LENGTH of the
+# sockaddr (>= 28 meant v6), with IPv4 as the else-branch. accept() on a
+# unix socket returns a sockaddr of 2 bytes for the usual client that
+# never bound an address of its own, so a unix peer took the IPv4 branch,
+# unpack_sockaddr_in() died inside its eval, and the function returned
+# undef - which run() then fed to the allowlist, which refused it, which
+# closed the connection. Every unix connection, silently, with nothing
+# logged anywhere and a 502 at the front server.
+#
+# So the family is now an ARGUMENT, supplied by whoever opened the
+# listener and therefore actually knows, rather than inferred from a byte
+# count. The length heuristic survives only as the fallback for a caller
+# that passes nothing (the injected-listener path, which has no family to
+# report), and Socket::sockaddr_family() is consulted first when this
+# Socket provides it - so even that fallback recognises a unix sockaddr
+# rather than mistaking it for a truncated IPv4 one.
+#
+# A unix peer's answer is the constant $UNIX_PEER_TEXT, never the path
+# from the sockaddr even when the peer bound one: that path is text the
+# peer chose, it would reach this module's own diagnostics, and there is
+# nothing it could be used for that is worth carrying peer-controlled
+# text to say it. The real per-client address in mode A arrives later and
+# elsewhere (peer_from_front()).
+###############################################################################
 sub _peer_text {
-	my ($paddr) = @_;
+	my ($paddr, $family) = @_;
 	return undef unless defined $paddr;
+
+	$family = _sockaddr_family($paddr) unless defined $family;
+
+	if (defined $family) {
+		return $UNIX_PEER_TEXT if $family == Socket::AF_UNIX();
+		if ($family == Socket::AF_INET6()) {
+			my (undef, $addr) = eval { Socket::unpack_sockaddr_in6($paddr) };
+			return undef unless defined $addr;
+			return lc(Socket::inet_ntop(Socket::AF_INET6(), $addr));
+		}
+		if ($family == Socket::AF_INET()) {
+			my (undef, $addr) = eval { Socket::unpack_sockaddr_in($paddr) };
+			return undef unless defined $addr;
+			return Socket::inet_ntop(Socket::AF_INET(), $addr);
+		}
+		return undef;
+	}
+
 	if (length($paddr) >= 28) {
 		my (undef, $addr) = eval { Socket::unpack_sockaddr_in6($paddr) };
 		return undef unless defined $addr;
@@ -552,6 +1105,215 @@ sub _peer_text {
 	my (undef, $addr) = eval { Socket::unpack_sockaddr_in($paddr) };
 	return undef unless defined $addr;
 	return Socket::inet_ntop(Socket::AF_INET(), $addr);
+}
+
+# Socket::sockaddr_family() when this Socket has it, undef otherwise -
+# never a hand-rolled unpack of sa_family_t, whose width and whether it is
+# preceded by a length byte are platform details this module has no
+# business guessing at (G3's "no regex fallback for address parsing" is
+# the same argument one layer down).
+sub _sockaddr_family {
+	my ($paddr) = @_;
+	return undef unless defined $paddr && length($paddr) >= 2;
+	return undef unless defined &Socket::sockaddr_family;
+	my $family = eval { Socket::sockaddr_family($paddr) };
+	return defined $family ? $family : undef;
+}
+
+###############################################################################
+# _open_unix_listener($path, %opt) -> ($listener, $gid)
+#
+# Mode A's transport, and the four things that have to be true for the
+# front server's worker to reach a socket here and for nobody else to.
+# Every one of them was verified against a real socket rather than
+# reasoned about, because three of the four fail SILENTLY - the socket
+# exists, the unit is active, and the only symptom is a 502 from a process
+# that logged nothing.
+#
+# 1. A STALE SOCKET IS AN EADDRINUSE, NOT AN OVERWRITE. bind() to a path
+#    that already exists fails; it does not replace what is there. In the
+#    shipped deployment systemd removes csf-ui.service's RuntimeDirectory
+#    (and therefore the socket inside it) on every stop, so the path is
+#    normally fresh - but that is a property of one unit file, not of this
+#    code, and it does not hold for a hand-rolled start, a host without
+#    systemd, or RuntimeDirectoryPreserve=. So the stale socket is removed
+#    here, under the rule docs/WEBUI-RPC.md section 2.1 already states for
+#    the helper's own socket - never unlink an arbitrary path:
+#    _unlink_stale_socket() unlinks only a socket, only one this process
+#    owns, and follows no symlink to get there.
+#
+# 2. THE MODE IS SET, NOT INHERITED. csf-ui.service sets UMask=0077, under
+#    which bind() creates the socket 0700 and the front server's worker -
+#    which reaches it through the directory's GROUP, not through this
+#    process's uid - can never connect. The umask is narrowed rather than
+#    widened around the bind (so a loose inherited umask cannot produce a
+#    world-writable socket even for the instant before the chmod), and the
+#    mode is then set explicitly to $UNIX_SOCKET_MODE.
+#
+# 3. THE MODE IS THEN CHECKED. A chmod() that returned success on a
+#    filesystem that did not honour it would leave exactly the silent
+#    failure this whole function exists to prevent, so the mode is read
+#    back off the bound socket and disagreement is fatal.
+#
+# 4. listen() COMES LAST. Between bind() and chmod() the socket is
+#    stricter than intended, never looser, and nothing can connect to it
+#    at all until listen() - so the window is fail-closed on both counts
+#    rather than being a moment when the wrong peers could get in.
+#
+# Returns the listener and the socket's own gid, which is what the kernel
+# checks the 0660 group bit against and therefore what unix_peer_uids()
+# must derive the accepted set from - not the directory's gid, and not
+# this process's egid, either of which could differ from it (a setgid
+# directory, a changed unit file) and would then describe a different set
+# of accounts than the one that can actually connect.
+###############################################################################
+sub _open_unix_listener {
+	my ($path, %opt) = @_;
+	my $backlog = defined $opt{backlog} ? $opt{backlog} : $DEFAULT_LISTEN_BACKLOG;
+
+	# sun_path is 108 bytes on Linux and shorter on some other platforms;
+	# pack_sockaddr_un() truncates silently rather than failing, which
+	# would bind a socket at a path nothing else names.
+	die "Server.pm: the mode-A socket path ($path) is too long for a unix socket address\n"
+		if length($path) > 100;
+
+	_unlink_stale_socket($path);
+
+	socket(my $listener, Socket::PF_UNIX(), Socket::SOCK_STREAM(), 0)
+		or die "Server.pm: socket(AF_UNIX): $!\n";
+
+	my $previous_umask = umask(0177);
+	my $bound = bind($listener, Socket::pack_sockaddr_un($path));
+	my $bind_error = $!;
+	umask(defined $previous_umask ? $previous_umask : 0022);
+	die "Server.pm: bind $path: $bind_error\n" unless $bound;
+
+	unless (chmod($UNIX_SOCKET_MODE, $path)) {
+		my $chmod_error = $!;
+		unlink($path);
+		die "Server.pm: chmod on $path: $chmod_error\n";
+	}
+
+	my @st = stat($path);
+	unless (@st) {
+		my $stat_error = $!;
+		unlink($path);
+		die "Server.pm: stat on the socket just bound at $path: $stat_error\n";
+	}
+	unless (($st[2] & 07777) == $UNIX_SOCKET_MODE) {
+		unlink($path);
+		die sprintf("Server.pm: %s is mode %04o after chmod, not %04o; the front web server could not reach it\n",
+			$path, $st[2] & 07777, $UNIX_SOCKET_MODE);
+	}
+
+	unless (listen($listener, $backlog)) {
+		my $listen_error = $!;
+		unlink($path);
+		die "Server.pm: listen on $path: $listen_error\n";
+	}
+
+	return ($listener, $st[5]);
+}
+
+# docs/WEBUI-RPC.md section 2.1's "an existing socket owned by uid 0 (then
+# it is unlinked) - never unlink an arbitrary path", with the owner the
+# only thing that changes: this process is not root and must not be, so
+# "owned by uid 0" becomes "owned by us". lstat, not stat, and -S on the
+# lstat buffer: a symlink at this path is refused rather than followed,
+# because following one would unlink whatever it pointed at.
+sub _unlink_stale_socket {
+	my ($path) = @_;
+	my @st = lstat($path);
+	return 0 unless @st;
+
+	die "Server.pm: $path already exists and is not a socket; refusing to unlink it\n"
+		unless -S _;
+	die "Server.pm: the socket at $path is owned by uid $st[4], not by this process (uid $>); refusing to unlink it\n"
+		unless $st[4] == $>;
+
+	unlink($path) or die "Server.pm: could not remove the stale socket at $path: $!\n";
+	return 1;
+}
+
+###############################################################################
+# admit_peer($self, $connection, $paddr) -> $peer_text | undef
+#
+# THE SAME SLOT IN THE SEQUENCE, IN BOTH MODES. run() calls this
+# immediately after accept() returns and before anything else happens to
+# the connection: before the child cap is consulted, before fork(), before
+# TLS, and - the property that matters - before ConfigServer::UI::HTTP has
+# seen a single byte. That ordering is deliberate in mode B and is stated
+# as such in run(); it must not quietly become something weaker in mode A,
+# which is exactly the risk in porting a listener to a transport that has
+# no IP address to check.
+#
+# Because THE ALLOWLIST CHECK IS NOT MOVED IN MODE A - it is REPLACED, in
+# place, by a different question with the same three properties. Mode B
+# asks "is this address one the administrator listed", from accept()'s own
+# report, never a header. Mode A asks "is this the front web server's
+# account", from the kernel's own SO_PEERCRED answer, never a header. Both
+# are: (1) evaluated at the same point, (2) answerable without parsing
+# anything the peer wrote, and (3) fail-closed on an answer that is
+# missing or unrecognised. What mode A must never do is drop the check
+# here and lean on something later - a rate limiter, an authentication
+# form, ui-src/bin/csf-ui's own routing - because all of those are things
+# that happen AFTER this process has already read and parsed bytes chosen
+# by whoever connected, and being able to refuse before that is the whole
+# value of the slot.
+#
+# UI_ALLOW IS DELIBERATELY NOT CONSULTED IN THE MODE-A BRANCH, and this
+# is the reason, kept here at the point of the non-enforcement rather than
+# only in run(): docs/WEBUI-RPC.md section 10 says "UI_ALLOW in mode A is
+# not enforced by csf-ui - in mode A csf-ui listens on a unix socket and
+# the peer address it sees is the front web server". Checking it here
+# would be checking the front server's own uid against a list of visitor
+# IP addresses, which cannot match and would refuse every request. The
+# same value IS enforced in mode A - by the front server, from the
+# template Task 9 renders it into (nginx.conf.tpl's allow/deny include,
+# apache.conf.tpl's RequireAny, litespeed.conf.tpl's accessControl) -
+# which is why the key is still mandatory and still non-empty in this
+# mode. run() sets $self->{allow} to undef in mode A so that this is a
+# fact about the object and not only a fact about this branch.
+###############################################################################
+sub admit_peer {
+	my ($self, $connection, $paddr) = @_;
+
+	if ($self->{mode} eq 'a') {
+		my ($pid, $uid, $gid) = peercred($connection);
+		unless (defined $uid) {
+			$self->_refuse_peer(undef,
+				'the kernel would not report SO_PEERCRED for a connection on the unix socket, so there is no identity to check');
+			return undef;
+		}
+		unless ($self->peer_uid_allowed($uid, $gid)) {
+			$self->_refuse_peer($uid,
+				"uid $uid connected to the unix socket but is not an account that may reach it; add the front web server's worker account to the group that owns the socket, and nothing else to that group");
+			return undef;
+		}
+		return _peer_text($paddr, Socket::AF_UNIX());
+	}
+
+	my $peer_addr = _peer_text($paddr, $self->{listen_family});
+	return undef unless defined $peer_addr;
+	return undef unless peer_allowed($peer_addr, $self->{allow});
+	return $peer_addr;
+}
+
+# One line per DISTINCT refusal, not one per refused connection. A refusal
+# that said nothing at all would leave an administrator whose front server
+# is not in the socket's group with a 502 and no way to find out why - the
+# silent-failure class this whole mode was reviewed for. A refusal that
+# logged every attempt would hand any local user who can see the socket an
+# unbounded write into this process's journal. Keying on the uid keeps the
+# diagnostic (which account was turned away, once) and bounds the volume
+# by the number of accounts on the host rather than by the number of
+# attempts.
+sub _refuse_peer {
+	my ($self, $uid, $why) = @_;
+	my $key = defined $uid ? "uid:$uid" : 'no-credentials';
+	return if $self->{refused_logged}{$key}++;
+	print STDERR "csf-ui (Server.pm): refused a connection on the mode-A unix socket: $why\n";
+	return;
 }
 
 # The certificate/key pair is not a docs/WEBUI-RPC.md section 2.3 or
@@ -633,11 +1395,46 @@ sub _default_tls_wrap {
 # Time::HiRes::alarm() rather than the builtin: the builtin truncates to
 # whole seconds, which would make a test's short, injected timeouts (0.1s
 # each) round down to "cancel the alarm" instead of "fire almost at once".
+#
+# MODE A HAS NO HANDSHAKE PHASE AT ALL, and so has one watchdog rather
+# than two. That is not a relaxation of R31/R36 - it is those rulings
+# applied honestly to a connection that does no TLS: the front web server
+# terminated TLS one hop earlier, this socket carries plain HTTP from a
+# peer the kernel has already identified, and there is no negotiation here
+# for a handshake budget to bound. Arming one anyway would be arming a
+# deadline over nothing, and - worse - would invite the reading that
+# $handshake_timeout is a general "time before the request starts" budget,
+# which is exactly the conflation R36 was raised to remove.
+#
+# The request phase keeps its own full budget, unchanged, and in mode A
+# that budget is doing something HTTP.pm's own deadlines do not. HTTP.pm
+# bounds every read and every write it performs, so a mode-A peer that
+# connects and sends nothing is already refused by it - but the child's
+# time is not all spent in HTTP.pm. dispatch() has no deadline of its own
+# (docs/WEBUI-RPC.md section 14.3 promises a return, not a prompt one),
+# and that call is inside this budget. Without it, one request that hangs
+# in the app holds a child slot forever, thirty-two of them deny the UI,
+# and waitpid() never reaps any of them because none of them ever exit -
+# R31's failure mode exactly, reached by a different road.
+#
+# $self->{tls_wrap} is ignored in mode A rather than consulted and found
+# irrelevant. A tls_wrap on a mode-A server is a configuration mistake,
+# and running it would produce a TLS server speaking into a plain-HTTP
+# proxy connection - a hang, not an error.
 ###############################################################################
 sub _serve_accepted {
 	my ($self, $connection, $peer_addr) = @_;
 
 	local $SIG{ALRM} = $self->{watchdog_exit};
+
+	if ($self->{mode} eq 'a') {
+		my $request_budget = $self->{header_timeout} + $self->{body_timeout} + $self->{write_timeout};
+		Time::HiRes::alarm($request_budget);
+		$self->handle_connection($connection, $peer_addr);
+		Time::HiRes::alarm(0);
+		close $connection;
+		return;
+	}
 
 	Time::HiRes::alarm($self->{handshake_timeout});
 	my $tls_socket = eval {
@@ -701,10 +1498,24 @@ sub _accept_backoff {
 	return;
 }
 
+###############################################################################
+# run() - the daemon, in whichever mode ui.conf selects.
+#
+# THE MODE IS READ HERE AND NOWHERE ELSE. ui-src/bin/csf-ui's entry point
+# deliberately does not decide it ("re-deciding any of that here would
+# just be a second place for the two to disagree"), and neither does
+# anything the constructor was given: whatever $self->{mode} held is
+# overwritten from the file, because a server told one mode by its caller
+# and another by its config is a server with two answers to the only
+# question that decides what it binds.
+###############################################################################
 sub run {
 	my ($self) = @_;
 
-	my @problem = preflight(ui_conf_path => $self->{ui_conf_path});
+	my @problem = preflight(
+		ui_conf_path => $self->{ui_conf_path},
+		socket_path  => $self->{socket_path},
+	);
 	if (@problem) {
 		print STDERR "csf-ui (Server.pm) refuses to start:\n";
 		print STDERR "  - $_\n" for @problem;
@@ -713,12 +1524,77 @@ sub run {
 	die "Server.pm: run() requires an app instance (ConfigServer::UI::App); nothing here loads ui-src/bin/csf-ui on its own\n"
 		unless ref($self->{app}) && $self->{app}->can('dispatch');
 
-	require IO::Socket::SSL; # already proven to load, by preflight() above
-
 	my ($conf) = read_ui_conf($self->{ui_conf_path});
-	$self->{allow} = $conf->{UI_ALLOW};
+	$self->{mode} = $conf->{UI_MODE};
 
-	my $listener = $self->{listener} || _open_listener($conf);
+	my $listener;
+	my $unix_path;
+
+	if ($self->{mode} eq 'a') {
+		# UI_ALLOW IS DELIBERATELY NOT LOADED IN MODE A. Not "loaded and
+		# happens to go unused" - set to undef, on purpose, so that the
+		# object itself says so and admit_peer()'s mode-A branch could not
+		# consult it even if a later edit tried to. docs/WEBUI-RPC.md
+		# section 10: "UI_ALLOW in mode A is not enforced by csf-ui - in
+		# mode A csf-ui listens on a unix socket and the peer address it
+		# sees is the front web server. It does not trust X-Forwarded-For
+		# for access control." The key is still mandatory and still
+		# non-empty in this mode, and it is still enforced - by the front
+		# server, from the same value, rendered into its vhost by the
+		# installer. read_ui_conf() has already refused an empty one.
+		# Code that silently stops enforcing a security key reads as a
+		# bug; this is the line that says it is a ruling.
+		$self->{allow} = undef;
+
+		if ($self->{listener}) {
+			$listener = $self->{listener};
+		}
+		else {
+			$unix_path = $self->{socket_path};
+			($listener, $self->{socket_gid}) =
+				_open_unix_listener($unix_path, backlog => $self->{backlog});
+		}
+
+		# Derived from the socket's own gid, unless a caller injected a
+		# set - the same "an injected dependency wins" rule tls_wrap,
+		# watchdog_exit and listener already follow in this file, and
+		# reachable from the same one place (a test; ui-src/bin/csf-ui
+		# passes nothing but `app`).
+		$self->{peer_uids} = unix_peer_uids($self->{socket_gid}, self_uid => $self->{self_uid})
+			unless ref($self->{peer_uids}) eq 'HASH';
+
+		# A socket nothing but this process can reach is a mode-A install
+		# whose front web server was never granted the socket's group -
+		# the exact shape that produces a 502 on every request with
+		# nothing logged by anything of ours. Refuse loudly at startup
+		# instead, naming the remedy, rather than accept connections that
+		# can only ever be refused one at a time.
+		unless (grep { $_ != $self->{self_uid} } keys %{ $self->{peer_uids} }) {
+			my $group = defined $self->{socket_gid} ? $self->{socket_gid} : '(unknown)';
+			print STDERR "csf-ui (Server.pm) refuses to start:\n";
+			print STDERR "  - no account other than this one can reach the mode-A socket: group $group,"
+				. " which owns it, has no other member. Add the front web server's worker account to that group"
+				. " (the installer's own grant_socket_group() does this) and start again.\n";
+			close $listener;
+			unlink($unix_path) if defined $unix_path;
+			return 1;
+		}
+	}
+	else {
+		require IO::Socket::SSL; # already proven to load, by preflight() above
+		$self->{allow} = $conf->{UI_ALLOW};
+		if ($self->{listener}) {
+			# An injected listener whose family this module did not
+			# choose: _peer_text() falls back to its own detection rather
+			# than being told something that might not be true.
+			$listener = $self->{listener};
+		}
+		else {
+			$listener = _open_listener($conf);
+			$self->{listen_family} = ($conf->{UI_LISTEN} =~ /:/)
+				? Socket::AF_INET6() : Socket::AF_INET();
+		}
+	}
 
 	$SIG{PIPE} = 'IGNORE';
 	my %child;
@@ -737,12 +1613,15 @@ sub run {
 			next;
 		}
 
-		my $peer_addr = _peer_text($paddr);
-		# Checked BEFORE TLS: the cheapest possible rejection for a peer
-		# with no business here at all, and one that never spends a TLS
-		# handshake, let alone an HTTP parse, on an address the
-		# administrator never listed.
-		unless (defined $peer_addr && peer_allowed($peer_addr, $self->{allow})) {
+		# Checked BEFORE TLS and before fork(): the cheapest possible
+		# rejection for a peer with no business here at all, and one that
+		# never spends a TLS handshake, let alone an HTTP parse, on an
+		# address the administrator never listed - or, in mode A, on an
+		# account the install never designated. See admit_peer() for what
+		# each mode actually asks here and why the two questions occupy
+		# the same slot rather than one of them being deferred.
+		my $peer_addr = $self->admit_peer($connection, $paddr);
+		unless (defined $peer_addr) {
 			close $connection;
 			next;
 		}
@@ -773,6 +1652,15 @@ sub run {
 	}
 
 	close $listener;
+	# Only the parent, only on a clean exit, and only a path this process
+	# bound itself: a child never reaches here (POSIX::_exit(0) above), and
+	# an injected listener left $unix_path undef precisely because this
+	# module did not create that socket and has no business removing it.
+	# Leaving it behind is not fatal - _unlink_stale_socket() would clear
+	# it on the next start - but a socket file outliving the process that
+	# answered it is a thing an administrator has to reason about, and
+	# there is no reason to make them.
+	unlink($unix_path) if defined $unix_path;
 	return 0;
 }
 

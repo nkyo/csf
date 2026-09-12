@@ -40,7 +40,7 @@ use lib "$FindBin::Bin/..", "$FindBin::Bin/../ui-src/lib";
 use File::Temp qw(tempdir);
 use Socket ();
 use Time::HiRes ();
-use Test::More tests => 144;
+use Test::More tests => 229;
 
 require_ok('ConfigServer::UI::HTTP');
 require_ok('ConfigServer::UI::Server');
@@ -563,10 +563,27 @@ sub _conf {
 		'preflight refuses to start without IO::Socket::SSL, and names the package to install');
 }
 {
+	# The refusal that used to live here - "UI_MODE is 'a'; this is the
+	# mode-B standalone listener" - was the code's statement that mode A
+	# did not exist. It is now a mode SELECTION, and the two halves of
+	# that are asserted separately below: mode A no longer refuses on its
+	# mode, and mode A no longer demands a TLS library it has no use for.
+	# The second half is real rather than mocked in the same way the
+	# mode-B assertion above is: IO::Socket::SSL genuinely is not
+	# installed in this workspace, so if mode A still demanded it, this
+	# would go red here rather than on somebody's server.
+	my $directory = tempdir(CLEANUP => 1);
 	my $path = _conf(qq(UI_MODE="a"\nUI_ALLOW="10.0.0.0/8"\n));
-	my @problems = $S->can('preflight')->(ui_conf_path => $path);
-	ok((grep { /UI_MODE/ } @problems),
-		'preflight also refuses when ui.conf configures mode A - this binary is the mode-B listener only');
+	my @problems = $S->can('preflight')->(
+		ui_conf_path => $path,
+		socket_path  => "$directory/csf-ui.sock",
+	);
+	ok(!(grep { /UI_MODE/ } @problems),
+		'preflight no longer refuses on the mode itself - mode A is a mode this listener has');
+	ok(!(grep { /IO::Socket::SSL/ } @problems),
+		'and mode A does not demand IO::Socket::SSL: there is no TLS in this process when a front server terminated it');
+	is_deeply(\@problems, [],
+		'a mode-A ui.conf with a usable socket directory has no startup problems at all');
 }
 {
 	my $path = _conf(qq(UI_MODE="b"\nUI_ALOW="typo"\n));
@@ -851,6 +868,582 @@ sub _conf {
 	like($stderr, qr/accept\(\) failed/, 'I2: a non-EINTR accept() failure is logged, not silent');
 	like($stderr, qr/Too many open files/, 'I2: naming the actual errno text, not merely "something failed"');
 	cmp_ok($elapsed, '>=', 0.1, 'I2: and the loop backs off rather than spinning unthrottled');
+}
+
+###############################################################################
+# MODE A (ruling R82) - the unix-socket listen path.
+#
+# Everything below drives REAL unix sockets, REAL bind()/chmod()/listen()
+# and REAL SO_PEERCRED, because the three things most likely to be wrong
+# here all fail SILENTLY on a live host and none of them can be proven by
+# reasoning:
+#
+#   * a socket whose mode the front server's worker cannot reach. The unit
+#     runs with UMask=0077; a socket left at whatever that produces is 0700
+#     and every proxied request becomes a 502 from a process that logged
+#     nothing. So the mode is measured off a socket actually created under
+#     that umask, not asserted about.
+#   * a sockaddr this module cannot read. _peer_text()'s length heuristic
+#     sent a unix sockaddr down the IPv4 branch, where it became undef and
+#     then a closed connection. So a real accept()ed unix sockaddr is fed
+#     through it.
+#   * an identity that is not actually checked. SO_PEERCRED is the only
+#     identity mode A has, so it is read off real connected sockets, and
+#     the accepted/refused decision is driven with credentials that
+#     genuinely do and do not match.
+#
+# The cross-UID half of the permission story - "and nobody else" - is the
+# one part no test here can perform, because creating a process under a
+# second account needs root and this is a non-root suite by contract. What
+# IS proven is every part this process can perform: the mode is 0660 and
+# not the umask's, the group is the one the installer grants, and a peer
+# whose credentials are not in the accepted set is refused at the same
+# point in the sequence as a mode-B peer outside UI_ALLOW.
+###############################################################################
+my $SOCK_DIR = tempdir(CLEANUP => 1);
+my $sock_n = 0;
+sub _sock_path { return "$SOCK_DIR/s" . (++$sock_n) . '.sock' }
+
+sub _capture_stderr {
+	my ($code) = @_;
+	my $buffer = '';
+	{
+		local *STDERR;
+		open(STDERR, '>', \$buffer) or die "cannot redirect STDERR: $!";
+		$code->();
+	}
+	return $buffer;
+}
+
+# Connect to a unix socket this process is listening on, from this
+# process: a listen backlog accepts the connection without anything
+# calling accept() yet, so no fork and no second process is needed to
+# produce a genuinely connected pair over a genuinely bound path.
+sub _connect_unix {
+	my ($path) = @_;
+	socket(my $client, Socket::PF_UNIX(), Socket::SOCK_STREAM(), 0) or die "socket: $!";
+	connect($client, Socket::pack_sockaddr_un($path)) or die "connect $path: $!";
+	return $client;
+}
+
+###############################################################################
+# _open_unix_listener() - requirement 1. Created and connected to, not
+# reasoned about.
+###############################################################################
+{
+	my $path = _sock_path();
+	my ($listener, $gid);
+	my $previous = umask(0077); # exactly what csf-ui.service's UMask= leaves
+	eval { ($listener, $gid) = $S->can('_open_unix_listener')->($path); 1 }
+		or diag("_open_unix_listener died: $@");
+	umask($previous);
+
+	ok(defined $listener, 'a unix listener is actually created at the path the templates point at');
+	ok(-S $path, 'and what is at that path is a socket');
+
+	my @st = stat($path);
+	is(sprintf('%04o', $st[2] & 07777), '0660',
+		'the socket is 0660 EVEN THOUGH it was bound under umask 0077 - the mode is set, never inherited');
+	is($gid, $st[5], 'the gid returned is the socket\'s own gid, which is what the kernel checks the group bit against');
+
+	my $client = _connect_unix($path);
+	ok(defined $client, 'a client can connect to it');
+	my $paddr = accept(my $connection, $listener);
+	ok(defined $paddr, 'and the listener accepts that connection');
+
+	# The sockaddr that used to become undef. This is the exact value
+	# run() feeds the admission check, so it is the exact value that used
+	# to close every mode-A connection in silence.
+	is($S->can('_peer_text')->($paddr, Socket::AF_UNIX()), 'unix',
+		'requirement 2: an accept()ed unix sockaddr has its own case in _peer_text(), not the IPv4 fallthrough');
+
+	close $connection;
+	close $client;
+	close $listener;
+	unlink $path;
+}
+{
+	# The IPv4 fallthrough it used to take, shown for what it produced -
+	# so that a future edit that removes the unix case cannot pass by
+	# accident.
+	my $unix_sockaddr = Socket::pack_sockaddr_un('');
+	is($S->can('_peer_text')->($unix_sockaddr, Socket::AF_INET()), undef,
+		'requirement 2: read as an IPv4 sockaddr, a unix one still produces undef - which is what run() used to close on');
+}
+{
+	# A stale socket across a restart: bind() to an existing path is
+	# EADDRINUSE, not an overwrite. systemd normally removes the
+	# RuntimeDirectory on stop, but that is a property of one unit file,
+	# not of this code.
+	my $path = _sock_path();
+	my ($first) = $S->can('_open_unix_listener')->($path);
+	ok(-S $path, 'a first listener binds');
+
+	my ($second, $second_gid);
+	my $error = '';
+	unless (eval { ($second, $second_gid) = $S->can('_open_unix_listener')->($path); 1 }) { $error = $@ }
+	is($error, '', 'a second start over the stale socket succeeds rather than dying with EADDRINUSE');
+	ok(defined $second, 'and produces a working listener');
+
+	# Proven by which listener the connection actually lands on, not by
+	# the absence of an error: the path must now name the NEW socket.
+	my $client = _connect_unix($path);
+	my $paddr = accept(my $connection, $second);
+	ok(defined $paddr, 'a connection to the path reaches the SECOND listener, so the path was genuinely rebound');
+
+	close $connection; close $client; close $first; close $second;
+	unlink $path;
+}
+{
+	my $path = _sock_path();
+	open(my $fh, '>', $path) or die $!;
+	print $fh "not a socket\n";
+	close $fh;
+	my $error = _dies(sub { $S->can('_open_unix_listener')->($path) });
+	like($error, qr/is not a socket/, 'a regular file at the socket path is refused, never unlinked');
+	ok(-f $path, 'and the file is still there - "never unlink an arbitrary path" (docs/WEBUI-RPC.md S2.1)');
+	unlink $path;
+}
+{
+	my $target = "$SOCK_DIR/symlink-target.txt";
+	open(my $fh, '>', $target) or die $!;
+	print $fh "important\n";
+	close $fh;
+	my $path = _sock_path();
+	symlink($target, $path) or die "symlink: $!";
+
+	my $error = _dies(sub { $S->can('_open_unix_listener')->($path) });
+	like($error, qr/is not a socket/, 'a symlink at the socket path is refused');
+	ok(-f $target, 'and the file it pointed at is untouched - lstat, so the link was never followed');
+	unlink $path;
+}
+{
+	my $long = "$SOCK_DIR/" . ('x' x 200) . '.sock';
+	my $error = _dies(sub { $S->can('_open_unix_listener')->($long) });
+	like($error, qr/too long/, 'a socket path too long for a sockaddr_un is refused rather than silently truncated');
+}
+
+###############################################################################
+# mode_a_preflight() - the startup preconditions that are mode A's alone.
+# This suite runs without root by contract (see t/80-templates.t's header),
+# which is what makes the "owned by another uid" case testable at all: any
+# path under / is owned by uid 0 and this process is not.
+###############################################################################
+{
+	my @problems = $S->can('mode_a_preflight')->(socket_path => "$SOCK_DIR/ok.sock");
+	is_deeply(\@problems, [], 'a directory this process owns, not writable by other, is accepted');
+}
+{
+	my @problems = $S->can('mode_a_preflight')->(socket_path => '/nonexistent-csf-ui-dir/csf-ui.sock');
+	ok((grep { /does not exist/ } @problems),
+		'a missing socket directory refuses at startup, rather than failing later as a confusing bind() error');
+	ok((grep { /RuntimeDirectory/ } @problems),
+		'and names where that directory normally comes from');
+}
+{
+	my @problems = $S->can('mode_a_preflight')->(socket_path => '/csf-ui.sock');
+	ok((grep { /owned by uid 0, not by this process/ } @problems),
+		'a socket directory this process does not own refuses - it could not create a socket there anyway');
+}
+{
+	my $wide = tempdir(CLEANUP => 1);
+	chmod(0777, $wide) or die "chmod: $!";
+	my @problems = $S->can('mode_a_preflight')->(socket_path => "$wide/csf-ui.sock");
+	ok((grep { /writable by other/ } @problems),
+		'a world-writable socket directory refuses: any local user could replace the socket the front server connects to');
+	chmod(0700, $wide);
+}
+{
+	my $file = "$SOCK_DIR/a-file";
+	open(my $fh, '>', $file) or die $!;
+	close $fh;
+	my @problems = $S->can('mode_a_preflight')->(socket_path => "$file/csf-ui.sock");
+	ok((grep { /is not a directory/ } @problems), 'a socket "directory" that is a regular file refuses');
+}
+
+###############################################################################
+# peercred() - requirement 5. Real credentials off real sockets.
+###############################################################################
+{
+	my ($near, $far) = _pair();
+	my ($pid, $uid, $gid) = $S->can('peercred')->($near);
+	is($uid, $> + 0, 'peercred reads the peer uid the kernel reports');
+	ok(defined $pid && $pid > 0, 'and a pid');
+	ok(defined $gid, 'and a gid');
+	close $near; close $far;
+}
+{
+	my @credential = $S->can('peercred')->(undef);
+	is(scalar(@credential), 0, 'peercred on nothing is the empty list, never a partial answer');
+}
+{
+	my $fh = _handle("some bytes");
+	my @credential = $S->can('peercred')->($fh);
+	is(scalar(@credential), 0, 'peercred on a filehandle that is not a socket is the empty list too');
+}
+
+###############################################################################
+# unix_peer_uids() - the accepted set, derived from the group that gates
+# the socket rather than from a ui.conf key docs/WEBUI-RPC.md S10 does not
+# have. The NSS lookups are injected here so the set is driven by known
+# input; the real, uninjected path is exercised immediately afterwards.
+###############################################################################
+{
+	my $set = $S->can('unix_peer_uids')->(4242,
+		self_uid     => 1000,
+		group_lookup => sub { return ('csf-ui-sock', '', 4242, 'www-data nginx') },
+		name_lookup  => sub { return ($_[0], '', { 'www-data' => 33, nginx => 104 }->{$_[0]}, 4242) },
+		passwd_scan  => sub { die "the passwd scan must not run when the member list already found somebody\n" },
+	);
+	is_deeply([sort { $a <=> $b } keys %$set], [33, 104, 1000],
+		'the accepted set is the socket group\'s members plus this process itself');
+}
+{
+	# The case getgrgid() cannot see: an account whose PRIMARY group is
+	# the socket's group appears in no member list, while the kernel
+	# admits it on exactly that group bit. The fallback scan exists for
+	# it, and runs only here - in the path that would otherwise conclude
+	# "nobody can reach this socket" and refuse to start.
+	my $scanned = 0;
+	my $set = $S->can('unix_peer_uids')->(4242,
+		self_uid     => 1000,
+		group_lookup => sub { return ('csf-ui-sock', '', 4242, '') },
+		name_lookup  => sub { return () },
+		passwd_scan  => sub { $scanned++; return (77) },
+	);
+	is($scanned, 1, 'an empty member list falls back to the passwd scan before concluding nobody can connect');
+	is_deeply([sort { $a <=> $b } keys %$set], [77, 1000],
+		'and an account whose primary group is the socket group is found by it');
+}
+{
+	my $set = $S->can('unix_peer_uids')->(undef, self_uid => 1000);
+	is_deeply([keys %$set], [1000], 'with no socket gid at all the set is this process alone - fail closed, not fail open');
+}
+{
+	# The real NSS path, uninjected: this process's own primary group
+	# must at minimum yield this process.
+	my $set = $S->can('unix_peer_uids')->($( + 0);
+	ok($set->{$> + 0}, 'against the real passwd/group database, the set always contains this process');
+}
+
+###############################################################################
+# peer_uid_allowed() - the three ways in, each proven separately, and the
+# deliberate absence of a fourth. docs/WEBUI-RPC.md S2.2's uid==0 rule is
+# NOT copied here: root is not rejected for being root, it is simply not
+# in a set derived from group membership - which is a different rule with
+# a different consequence, as the last two blocks show.
+###############################################################################
+{
+	my $server = $S->new(app => FakeApp->new, mode => 'a',
+		self_uid => 1000, socket_gid => 4242, peer_uids => { 33 => 1 });
+	ok($server->peer_uid_allowed(1000, 999), 'way 1: this process\'s own uid is admitted');
+	ok($server->peer_uid_allowed(5000, 4242), 'way 2: a peer whose PRIMARY gid is the socket\'s gid is admitted');
+	ok($server->peer_uid_allowed(33, 33), 'way 3: a peer in the socket group\'s member list is admitted');
+	ok(!$server->peer_uid_allowed(5000, 999), 'and a peer matching none of the three is refused');
+	ok(!$server->peer_uid_allowed(undef, 4242), 'an absent uid is refused, never treated as unknown-therefore-fine');
+	ok(!$server->peer_uid_allowed(0, 0), 'root, not being in the group, is refused');
+}
+{
+	my $server = $S->new(app => FakeApp->new, mode => 'a',
+		self_uid => 1000, socket_gid => 4242, peer_uids => { 0 => 1 });
+	ok($server->peer_uid_allowed(0, 0),
+		'but root IS admitted when the install put root in the socket group - the rule is membership, not a uid==0 test');
+}
+{
+	my $server = $S->new(app => FakeApp->new, mode => 'a', self_uid => 1000);
+	ok(!$server->peer_uid_allowed(33, 44), 'with no accepted set built at all, every peer is refused');
+}
+
+###############################################################################
+# admit_peer() - requirement 3. The mode-B allowlist check is REPLACED at
+# the same point in run()'s sequence, not dropped and deferred to
+# something later; and requirement 4, UI_ALLOW is not consulted in mode A.
+###############################################################################
+{
+	my ($near, $far) = _pair();
+	my $server = $S->new(app => FakeApp->new, mode => 'a', self_uid => $> + 0);
+	is($server->admit_peer($near, Socket::pack_sockaddr_un('')), 'unix',
+		'a peer whose credentials are accepted is admitted, and gets the unix peer text');
+	close $near; close $far;
+}
+{
+	my ($near, $far) = _pair();
+	# Nothing matches: not our uid (self_uid is deliberately somebody
+	# else), not our gid, and an empty member list.
+	my $server = $S->new(app => FakeApp->new, mode => 'a',
+		self_uid => $> + 1, socket_gid => $( + 1, peer_uids => {});
+	my $admitted;
+	my $stderr = _capture_stderr(sub { $admitted = $server->admit_peer($near, Socket::pack_sockaddr_un('')) });
+	is($admitted, undef, 'requirement 5: a peer whose uid is not in the accepted set is refused');
+	like($stderr, qr/refused a connection on the mode-A unix socket/,
+		'and the refusal is logged rather than being a silent close nobody can diagnose');
+	like($stderr, qr/uid \Q$>\E /, 'naming the uid that was turned away');
+	close $near; close $far;
+}
+{
+	my ($near, $far) = _pair();
+	my $server = $S->new(app => FakeApp->new, mode => 'a',
+		self_uid => $> + 1, socket_gid => $( + 1, peer_uids => {});
+	my $stderr = _capture_stderr(sub {
+		$server->admit_peer($near, Socket::pack_sockaddr_un('')) for 1 .. 5;
+	});
+	my @lines = grep { /\S/ } split(/\n/, $stderr);
+	is(scalar(@lines), 1,
+		'five refusals of the same uid produce ONE line - diagnostic kept, journal flood from a local peer bounded');
+	close $near; close $far;
+}
+{
+	# Requirement 4, proven as behaviour rather than as a comment: a
+	# mode-A server carrying an allowlist that would reject 'unix' - and
+	# would reject anything, since a uid is not an address - still admits
+	# the peer, because in mode A UI_ALLOW is the front server's to
+	# enforce (docs/WEBUI-RPC.md S10).
+	my ($near, $far) = _pair();
+	my $conf_path = _conf(qq(UI_MODE="b"\nUI_ALLOW="192.0.2.0/24"\n));
+	my ($conf) = $S->can('read_ui_conf')->($conf_path);
+	my $server = $S->new(app => FakeApp->new, mode => 'a', self_uid => $> + 0);
+	$server->{allow} = $conf->{UI_ALLOW};
+	is($server->admit_peer($near, Socket::pack_sockaddr_un('')), 'unix',
+		'requirement 4: UI_ALLOW is not consulted in mode A, even when one is loaded on the object');
+	close $near; close $far;
+}
+{
+	# The same object in mode B, to show the check did not simply
+	# disappear from the slot: same allowlist, same call, opposite answer.
+	my $conf_path = _conf(qq(UI_MODE="b"\nUI_ALLOW="192.0.2.0/24"\n));
+	my ($conf) = $S->can('read_ui_conf')->($conf_path);
+	my $server = $S->new(app => FakeApp->new, mode => 'b');
+	$server->{allow} = $conf->{UI_ALLOW};
+	my $inside  = Socket::pack_sockaddr_in(1, Socket::inet_pton(Socket::AF_INET(), '192.0.2.5'));
+	my $outside = Socket::pack_sockaddr_in(1, Socket::inet_pton(Socket::AF_INET(), '198.51.100.5'));
+	is($server->admit_peer(undef, $inside), '192.0.2.5', 'mode B still admits an address inside UI_ALLOW at this same point');
+	is($server->admit_peer(undef, $outside), undef, 'and still refuses one outside it, before a byte is parsed');
+}
+
+###############################################################################
+# peer_from_front() - where `peer` comes from in mode A, and the shapes it
+# refuses. docs/WEBUI-RPC.md S14.1: text form, no port, no brackets,
+# per-connecting-client and never a constant.
+###############################################################################
+{
+	my $from = sub { return $S->can('peer_from_front')->({ headers => { 'x-real-ip' => $_[0] } }) };
+	is($from->('203.0.113.9'), '203.0.113.9', 'an IPv4 address passes through');
+	is($from->('2001:DB8::1'), '2001:db8::1', 'an IPv6 address is canonicalised, so one client is one rate-limit bucket');
+	is($from->('::1'), '::1', 'IPv6 loopback is a real front-server source address and is accepted');
+	is($from->('203.0.113.9, 198.51.100.1'), undef, 'a comma-joined proxy chain is refused - this tier takes no chain');
+	is($from->('[2001:db8::1]'), undef, 'a bracketed literal is refused (S14.1: no brackets)');
+	is($from->('203.0.113.9:443'), undef, 'an address with a port is refused (S14.1: no port)');
+	is($from->('203.0.113.0/24'), undef, 'a prefix is refused - a CIDR is not one client');
+	is($from->('example.com'), undef, 'a hostname is refused; there is no DNS at this tier (G3)');
+	is($from->('fe80::1%eth0'), undef, 'a zone index is refused');
+	is($from->(''), undef, 'an empty header value is refused');
+	is($from->(' '), undef, 'a whitespace-only value is refused');
+}
+{
+	is($S->can('peer_from_front')->({ headers => {} }), undef, 'a missing header is refused');
+	is($S->can('peer_from_front')->({}), undef, 'a request with no headers hash at all is refused');
+	is($S->can('peer_from_front')->(undef), undef, 'and so is no request');
+}
+
+###############################################################################
+# handle_connection() in mode A - the whole pipeline over a REAL unix
+# socket, end to end: bind, connect, accept, admit, parse, dispatch,
+# respond. This is the test that would have caught "mode A is inert".
+###############################################################################
+{
+	my $path = _sock_path();
+	my ($listener) = $S->can('_open_unix_listener')->($path);
+	my $client = _connect_unix($path);
+	syswrite($client, "GET /api/status HTTP/1.1\r\nHost: x\r\nX-Real-IP: 203.0.113.77\r\n\r\n");
+
+	my $paddr = accept(my $connection, $listener);
+	my $app = FakeApp->new;
+	my $server = $S->new(app => $app, mode => 'a', self_uid => $> + 0,
+		header_timeout => 2, body_timeout => 2, write_timeout => 2);
+
+	my $peer = $server->admit_peer($connection, $paddr);
+	is($peer, 'unix', 'end to end: the connection is admitted');
+	$server->handle_connection($connection, $peer);
+	close $connection;
+
+	my $out = '';
+	my $chunk;
+	while (sysread($client, $chunk, 4096)) { $out .= $chunk }
+	close $client; close $listener; unlink $path;
+
+	like($out, qr{\AHTTP/1\.1 200 OK\r\n}, 'a real request over a real unix socket is served');
+	is($app->{calls}[0]{peer}, '203.0.113.77',
+		'and dispatch() receives the CLIENT\'s address from the front server, not the unix transport');
+	unlike($out, qr/"peer":"unix"/, 'the unix marker never reaches dispatch() as a rate-limit key');
+}
+{
+	# No X-Real-IP: refused with a 400 that says what is missing, rather
+	# than served with an invented or constant peer.
+	my ($near, $far) = _pair();
+	syswrite($far, "GET /api/status HTTP/1.1\r\nHost: x\r\n\r\n");
+	my $app = FakeApp->new;
+	my $server = $S->new(app => $app, mode => 'a',
+		header_timeout => 2, body_timeout => 2, write_timeout => 2);
+	$server->handle_connection($near, 'unix');
+	close $near;
+	local $/;
+	my $out = <$far>;
+	close $far;
+
+	like($out, qr{\AHTTP/1\.1 400 }, 'mode A refuses a request with no X-Real-IP');
+	like($out, qr/x-real-ip/i, 'naming the header the front server has to send');
+	is(scalar(@{ $app->{calls} }), 0, 'and dispatch() is never reached with a peer nobody can key a rate limit on');
+}
+{
+	# A forged, hostile header value is the same refusal, not a lenient
+	# best-effort parse.
+	my ($near, $far) = _pair();
+	syswrite($far, "GET /api/status HTTP/1.1\r\nHost: x\r\nX-Real-IP: not-an-address\r\n\r\n");
+	my $app = FakeApp->new;
+	my $server = $S->new(app => $app, mode => 'a',
+		header_timeout => 2, body_timeout => 2, write_timeout => 2);
+	$server->handle_connection($near, 'unix');
+	close $near;
+	local $/;
+	my $out = <$far>;
+	close $far;
+	like($out, qr{\AHTTP/1\.1 400 }, 'an X-Real-IP that is not an address is refused, not passed through as a key');
+	is(scalar(@{ $app->{calls} }), 0, 'dispatch() is not reached');
+}
+{
+	# Mode B is untouched by any of this: its peer still comes from the
+	# transport, and a header claiming otherwise changes nothing.
+	my ($near, $far) = _pair();
+	syswrite($far, "GET /api/status HTTP/1.1\r\nHost: x\r\nX-Real-IP: 198.51.100.1\r\n\r\n");
+	my $app = FakeApp->new;
+	my $server = $S->new(app => $app, header_timeout => 2, body_timeout => 2);
+	$server->handle_connection($near, '203.0.113.9');
+	close $near; close $far;
+	is($app->{calls}[0]{peer}, '203.0.113.9',
+		'in mode B the peer is still accept()\'s own answer - an X-Real-IP header is not consulted at all');
+}
+
+###############################################################################
+# Requirement 7 - HTTP.pm's limits are NOT relaxed behind a front server.
+# They are the defence against a local peer that got past the peercred
+# check, and a bound on what the front server re-emits. Each of these
+# drives the mode-A path specifically.
+###############################################################################
+{
+	my $too_big = $ConfigServer::UI::HTTP::MAX_BODY_BYTES + 1;
+	my ($near, $far) = _pair();
+	syswrite($far, "POST /api/deny HTTP/1.1\r\nHost: x\r\nX-Real-IP: 203.0.113.9\r\n"
+		. "Content-Length: $too_big\r\n\r\n");
+	my $app = FakeApp->new;
+	my $server = $S->new(app => $app, mode => 'a',
+		header_timeout => 2, body_timeout => 2, write_timeout => 2);
+	$server->handle_connection($near, 'unix');
+	close $near;
+	local $/;
+	my $out = <$far>;
+	close $far;
+	like($out, qr{\AHTTP/1\.1 413 }, 'requirement 7: the body cap still applies in mode A');
+	is(scalar(@{ $app->{calls} }), 0, 'and the oversized body is never read into memory to find out');
+}
+{
+	my ($near, $far) = _pair();
+	my $headers = join('', map { "X-Pad-$_: v\r\n" } 1 .. ($ConfigServer::UI::HTTP::MAX_HEADERS + 2));
+	syswrite($far, "GET / HTTP/1.1\r\nX-Real-IP: 203.0.113.9\r\n$headers\r\n");
+	my $app = FakeApp->new;
+	my $server = $S->new(app => $app, mode => 'a',
+		header_timeout => 2, body_timeout => 2, write_timeout => 2);
+	$server->handle_connection($near, 'unix');
+	close $near;
+	local $/;
+	my $out = <$far>;
+	close $far;
+	like($out, qr{\AHTTP/1\.1 431 }, 'requirement 7: the header count cap still applies in mode A');
+}
+{
+	my ($near, $far) = _pair();
+	syswrite($far, "DELETE / HTTP/1.1\r\nX-Real-IP: 203.0.113.9\r\n\r\n");
+	my $app = FakeApp->new;
+	my $server = $S->new(app => $app, mode => 'a',
+		header_timeout => 2, body_timeout => 2, write_timeout => 2);
+	$server->handle_connection($near, 'unix');
+	close $near;
+	local $/;
+	my $out = <$far>;
+	close $far;
+	like($out, qr{\AHTTP/1\.1 405 }, 'requirement 7: the method allowlist still applies in mode A');
+}
+{
+	my ($near, $far) = _pair();
+	syswrite($far, "GET " . ('/x' x 6000) . " HTTP/1.1\r\nX-Real-IP: 203.0.113.9\r\n\r\n");
+	my $app = FakeApp->new;
+	my $server = $S->new(app => $app, mode => 'a',
+		header_timeout => 2, body_timeout => 2, write_timeout => 2);
+	$server->handle_connection($near, 'unix');
+	close $near;
+	local $/;
+	my $out = <$far>;
+	close $far;
+	like($out, qr{\AHTTP/1\.1 414 }, 'requirement 7: the request-line cap still applies in mode A');
+}
+
+###############################################################################
+# _serve_accepted() in mode A - no TLS, one watchdog, and the request
+# budget is still enforced.
+###############################################################################
+{
+	my ($near, $far) = _pair();
+	syswrite($far, "GET /api/status HTTP/1.1\r\nHost: x\r\nX-Real-IP: 203.0.113.9\r\n\r\n");
+	my $app = FakeApp->new;
+	my $server = $S->new(app => $app, mode => 'a',
+		header_timeout => 2, body_timeout => 2, write_timeout => 2,
+		tls_wrap => sub { die "tls_wrap must never run in mode A\n" },
+		watchdog_exit => sub { die "watchdog fired (should not have)\n" });
+
+	my $died = eval { $server->_serve_accepted($near, 'unix'); 1 } ? '' : $@;
+	is($died, '', 'mode A serves a connection without ever calling tls_wrap - there is no TLS in this process');
+	is(scalar(@{ $app->{calls} }), 1, 'and the request reaches dispatch()');
+	local $/;
+	my $out = <$far>;
+	close $far;
+	like($out, qr{\AHTTP/1\.1 200 OK\r\n}, 'with a response written back over the plain socket');
+}
+{
+	# R31's hazard reached by a different road, and the reason mode A
+	# still arms the request budget even though HTTP.pm already bounds
+	# every read and write it performs itself: dispatch() is inside that
+	# budget and has no deadline of its own (docs/WEBUI-RPC.md S14.3
+	# promises a return, not a prompt one). Without the alarm, one request
+	# that hangs in the app holds a child slot forever, and
+	# $DEFAULT_MAX_CHILDREN of them deny the UI with waitpid() never
+	# reaping any, because none of them ever exit.
+	package HangingApp;
+	sub new { return bless {}, shift }
+	sub dispatch { select(undef, undef, undef, 10); return { status => 200, headers => [], body => '' } }
+}
+{
+	my ($near, $far) = _pair();
+	syswrite($far, "GET /api/status HTTP/1.1\r\nHost: x\r\nX-Real-IP: 203.0.113.9\r\n\r\n");
+	# The watchdog is COUNTED rather than only allowed to die: in
+	# production it is POSIX::_exit(1), which cannot be caught, but a
+	# test's dying stand-in is caught one frame in by handle_connection's
+	# own eval around dispatch() and turned into a 500 - so "did it die
+	# out here" is not the question. "Did the deadline fire, and did it
+	# fire on time" is.
+	my $fired = 0;
+	my $server = $S->new(
+		app            => HangingApp->new,
+		mode           => 'a',
+		header_timeout => 0.1, body_timeout => 0.1, write_timeout => 0.1,
+		watchdog_exit  => sub { $fired++; die "mode A watchdog fired\n" },
+	);
+	my $t0 = Time::HiRes::time();
+	eval { $server->_serve_accepted($near, 'unix') };
+	my $elapsed = Time::HiRes::time() - $t0;
+	is($fired, 1,
+		'a mode-A child stuck in dispatch() has the request budget fire on it - the only deadline over that call');
+	cmp_ok($elapsed, '<', 5,
+		'and it fires on its OWN budget, not after a ten-second hang - nothing waits for dispatch() to finish');
+	close $far;
 }
 
 print "# KEEP: " . scalar(@KEEP) . " temp files held open for the duration of this run\n";
