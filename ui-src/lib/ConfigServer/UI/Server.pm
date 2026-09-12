@@ -251,6 +251,80 @@ our $DEFAULT_DISPATCH_TIMEOUT =
 	$ConfigServer::UI::Client::DEFAULT_TIMEOUT * $MAX_HELPER_CALLS_PER_REQUEST;
 
 ###############################################################################
+# THE FRONT SERVER'S BACKEND READ DEADLINE, WHICH THE BUDGET ABOVE HAD
+# QUIETLY OUTGROWN (fix round 2, R106).
+#
+# In mode A the daemon is never the last word on whether a request
+# succeeded: a front server is reading its response, and that server has a
+# deadline of its own. Every template this tree ships set that deadline to
+# 30s - nginx.conf.tpl's proxy_read_timeout, apache.conf.tpl's ProxyPass
+# timeout=, litespeed.conf.tpl's initTimeout - while the budget above is
+# 75s. Three numbers in three files with nothing comparing them.
+#
+# MEASURED, behind real front servers, against the real listener in mode A
+# with a dispatch() of 44s (the figure F1's own fix makes serviceable):
+#
+#   nginx 1.24, proxy_read_timeout 30s   -> 504 Gateway Time-out at 30.03s
+#   Apache 2.4.58, timeout=30            -> 502 Proxy Error   at 30.03s
+#   nginx, proxy_read_timeout 80s        -> 200 OK            at 44.00s
+#   Apache, ProxyPass timeout=80         -> 200 OK            at 44.00s
+#
+# So behind the shipped configuration the administrator got an error page
+# either way - which is F1's own failure mode (a response the daemon was
+# about to produce, discarded) displaced one hop outward. Fix round 1
+# widened the gap from 5s to 45s rather than opening it: 35 > 30 already.
+#
+# THE FRONT SERVER MUST NEVER BE THE THING THAT GIVES UP FIRST. The
+# daemon's watchdog is the deadline that knows what it is bounding; the
+# front server only knows that nothing has arrived yet. So the number
+# below is the budget PLUS a margin, and the margin's only job is to keep
+# that order - enough for accept/scheduling delay on a loaded host, and
+# deliberately the same 5s the templates already give their CONNECT step,
+# so it is a figure this deployment already uses rather than a new one.
+#
+# WHY THE FULL BUDGET AND NOT THE SMALLER TIME A PROXY CAN ACTUALLY REACH.
+# A front server that buffers the whole request before connecting spends
+# the header and body phases on its own clock, not on this daemon's, so
+# the reachable time through it is only dispatch + write = 45s. That is
+# true, and MEASURED for nginx: headers dribbled over 14s then a 30s
+# dispatch was served 200 at 44.01s against a proxy_read_timeout of only
+# 35s, which it could not have been had those 14s been charged to this
+# daemon. It is still the wrong number to assert, for two reasons that
+# are the same reason. First it is not one number: Apache's mod_proxy_http
+# streams a request BODY rather than spooling it, so the reachable time
+# there is body + dispatch + write = 60s, and LiteSpeed's behaviour is
+# unverified - one tighter figure would be wrong for at least one shipped
+# front server. Second, all of it rests on a third-party default an
+# operator can turn off in one documented line (proxy_request_buffering
+# off) with nothing here to notice. docs/WEBUI-RPC.md's own rule is that a
+# limit that cannot be counted is not a limit; the budget below is the
+# only figure in this relation that can be counted from inside this tree.
+# What the choice costs is slack on a HUNG UI - a browser waits for this
+# daemon's own watchdog instead of for an answer the front server invented
+# - and that is the cost worth paying.
+#
+# t/80-templates.t asserts all three templates carry exactly
+# front_server_read_timeout(), so none of the numbers can move alone.
+###############################################################################
+our $FRONT_SERVER_TIMEOUT_MARGIN = 5;
+
+# The package-level twin of _request_budget(), for the one caller that has
+# no $self: the cross-file check in t/80-templates.t, which is comparing
+# three shipped config files against the defaults a shipped daemon runs
+# with. That test also asserts this equals a real object's
+# _request_budget(), so the two sums cannot drift apart.
+sub default_request_budget {
+	return $ConfigServer::UI::HTTP::HEADER_TIMEOUT
+		+ $ConfigServer::UI::HTTP::BODY_TIMEOUT
+		+ $ConfigServer::UI::HTTP::WRITE_TIMEOUT
+		+ $DEFAULT_DISPATCH_TIMEOUT;
+}
+
+sub front_server_read_timeout {
+	return default_request_budget() + $FRONT_SERVER_TIMEOUT_MARGIN;
+}
+
+###############################################################################
 # Mode A's transport constants. NONE of these is a ui.conf key, and none of
 # them may become one: docs/WEBUI-RPC.md section 10 is a frozen table whose
 # own rules say "adding a key means amending this table first", and this

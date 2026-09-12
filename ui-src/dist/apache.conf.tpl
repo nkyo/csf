@@ -63,6 +63,12 @@ Listen @@UI_PORT@@ https
 	LimitRequestBody 65536
 	LimitRequestFieldSize 8190
 	LimitRequestFields 64
+	# TimeOut governs Apache's CLIENT-facing waits and deliberately stays
+	# at 30: the backend read deadline is set on ProxyPass below with
+	# timeout=, which overrides TimeOut for that connection alone. Proven
+	# rather than assumed (fix round 2, R106): with TimeOut left at 30 and
+	# only ProxyPass timeout= raised, a 44s response was served 200 at
+	# 44.00s.
 	TimeOut 30
 
 	# docs/WEBUI-RPC.md S10: UI_ALLOW is enforced HERE in mode A, never by
@@ -77,7 +83,23 @@ Listen @@UI_PORT@@ https
 	</Location>
 
 	ProxyPreserveHost On
-	ProxyPass        "/" "unix:@@UI_SOCK@@|http://csf-ui/" connectiontimeout=5 timeout=30
+	# timeout= IS NOT A FREE CHOICE (fix round 2, R106). It is the
+	# deadline on csf-ui's whole response, and csf-ui arms a request budget
+	# of its own over exactly the same span - 75s: ConfigServer::UI::HTTP's
+	# header (15) + body (15) + write (5) plus the dispatch term F1 added
+	# (4 helper calls x ConfigServer::UI::Client's 10s). At 30 this number
+	# was SMALLER than that budget, so a request csf-ui served correctly at
+	# 44s became an error page here and the administrator never saw it -
+	# measured: 502 Proxy Error at 30.03s against a dispatch of 44s (Apache
+	# renders a proxy read timeout as 502, where nginx renders it 504), 200
+	# OK at 44.00s once this read timeout=80.
+	#
+	# The rule is that csf-ui's watchdog gives up first, never this one, so
+	# the value is csf-ui's budget plus a small margin - and it is not
+	# maintained by hand: ConfigServer::UI::Server::front_server_read_timeout()
+	# derives it, and t/80-templates.t asserts this file, nginx.conf.tpl
+	# and litespeed.conf.tpl all carry exactly that.
+	ProxyPass        "/" "unix:@@UI_SOCK@@|http://csf-ui/" connectiontimeout=5 timeout=80
 	ProxyPassReverse "/" "unix:@@UI_SOCK@@|http://csf-ui/"
 
 	# The address ConfigServer::UI::RateLimit keys on and csf-ui's own

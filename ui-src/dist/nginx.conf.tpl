@@ -83,8 +83,32 @@ server {
 		# matters.
 		proxy_set_header X-Real-IP $remote_addr;
 
+		# proxy_read_timeout IS NOT A FREE CHOICE (fix round 2, R106). It
+		# is the deadline on csf-ui's whole response, and csf-ui arms a
+		# request budget of its own over exactly the same span - 75s:
+		# ConfigServer::UI::HTTP's header (15) + body (15) + write (5)
+		# plus the dispatch term F1 added (4 helper calls x
+		# ConfigServer::UI::Client's 10s). At 30s this number was SMALLER
+		# than that budget, so a request csf-ui served correctly at 44s
+		# became a 504 here and the administrator never saw it - measured:
+		# 504 Gateway Time-out at 30.03s against a dispatch of 44s, 200 OK
+		# at 44.00s once this line read 80s.
+		#
+		# The rule is that CSF-UI's watchdog gives up first, never this
+		# one: this deadline only knows nothing has arrived yet, while the
+		# watchdog knows what it was bounding. So the value is csf-ui's
+		# budget plus a small margin, and it is not maintained by hand -
+		# ConfigServer::UI::Server::front_server_read_timeout() derives it,
+		# and t/80-templates.t asserts this file, apache.conf.tpl and
+		# litespeed.conf.tpl all carry exactly that, so none of the four
+		# numbers can move on its own.
+		#
+		# Only the BACKEND read deadline moves. proxy_send_timeout is the
+		# write of an already-buffered request into a local unix socket,
+		# and the client-facing client_header_timeout/client_body_timeout/
+		# send_timeout above bound a human's connection, not csf-ui's work.
 		proxy_connect_timeout 5s;
-		proxy_read_timeout 30s;
+		proxy_read_timeout 80s;
 		proxy_send_timeout 30s;
 	}
 }

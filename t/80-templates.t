@@ -44,7 +44,7 @@ use lib "$FindBin::Bin/..", "$FindBin::Bin/../ui-src/lib";
 
 use File::Temp qw(tempdir tempfile);
 use POSIX ();
-use Test::More tests => 209;
+use Test::More tests => 214;
 
 my $DIST = "$FindBin::Bin/../ui-src/dist";
 my $RENDERER = "$DIST/render-template.sh";
@@ -314,6 +314,71 @@ my $SENTINEL = '/run/csf-ui-sentinel/only-here.sock';
 		'UI_ALLOW_INCLUDE=/etc/csf-ui/allow-litespeed.conf');
 	like($out, qr{address\s+UDS://\Q$SENTINEL\E},
 		"and so is LiteSpeed's address UDS://");
+}
+
+###############################################################################
+# THE FRONT SERVER'S BACKEND READ DEADLINE AGAINST THE DAEMON'S REQUEST
+# BUDGET (fix round 2, R106).
+#
+# Every one of these three templates set that deadline to 30 - nginx's
+# proxy_read_timeout, Apache's ProxyPass timeout=, LiteSpeed's initTimeout
+# - while ConfigServer::UI::Server's request budget is 75. FOUR numbers in
+# four files with nothing comparing them, and the comparison is the whole
+# point: the daemon is not the last word on whether a request succeeded in
+# mode A, and if the front server gives up first the administrator is
+# shown an error page for a response the daemon was about to deliver.
+#
+# Measured behind the real servers, against the real mode-A listener with
+# a dispatch() of 44s - the figure F1's own fix exists to make serviceable:
+#
+#   nginx 1.24, proxy_read_timeout 30s -> 504 Gateway Time-out at 30.03s
+#   Apache 2.4.58, timeout=30          -> 502 Proxy Error      at 30.03s
+#   nginx, proxy_read_timeout 80s      -> 200 OK               at 44.00s
+#   Apache, ProxyPass timeout=80       -> 200 OK               at 44.00s
+#
+# So the shipped configuration failed either way, and fix round 1 widened
+# the gap (35 > 30 already) rather than opening it.
+#
+# WHAT IS ASSERTED, and why it is an equality rather than ">=":
+# docs/WEBUI-RPC.md's own rule (S14.2) is that a limit that cannot be
+# counted is not a limit, and ">=" would let any of these numbers drift on
+# its own as long as it drifted the harmless way - which is how three
+# files came to hold 30 against a budget of 75 in the first place. So
+# Server.pm derives the figure once
+# (front_server_read_timeout() = default_request_budget() + margin) and
+# each template is asserted to carry exactly that. Move the budget, the
+# margin or any one template alone and this block reddens.
+#
+# The margin exists so the DAEMON's watchdog is always the deadline that
+# fires first: it knows what it was bounding, while the front server only
+# knows nothing has arrived yet.
+###############################################################################
+{
+	my $budget = ConfigServer::UI::Server::default_request_budget();
+	my $front  = ConfigServer::UI::Server::front_server_read_timeout();
+
+	# The package-level sum must be the sum a shipped daemon actually
+	# arms, or every assertion below is about a number nothing uses.
+	my $server = ConfigServer::UI::Server->new(app => undef);
+	is($server->_request_budget, $budget,
+		"R106: default_request_budget() is the budget a default daemon actually arms ($budget s), not a second copy of the sum");
+	cmp_ok($front, '>', $budget,
+		"R106: and the front server's deadline is strictly longer ($front s vs $budget s), so csf-ui's own watchdog is what gives up first - the front server only knows nothing has arrived yet");
+
+	my $nginx     = slurp($TEMPLATE{nginx});
+	my $apache    = slurp($TEMPLATE{apache});
+	my $litespeed = slurp($TEMPLATE{litespeed});
+
+	my ($nginx_read)     = $nginx     =~ /^\s*proxy_read_timeout\s+(\d+)s;/m;
+	my ($apache_read)    = $apache    =~ /^\s*ProxyPass\s+.*\btimeout=(\d+)\s*$/m;
+	my ($litespeed_read) = $litespeed =~ /^\s*initTimeout\s+(\d+)\s*$/m;
+
+	is($nginx_read, $front,
+		"R106: nginx.conf.tpl's proxy_read_timeout is csf-ui's request budget plus its margin ($front s) - at 30s a request csf-ui served at 44s was a 504 the administrator never saw past");
+	is($apache_read, $front,
+		"R106: apache.conf.tpl's ProxyPass timeout= is the same figure ($front s) - at 30 it was a 502 Proxy Error at 30.03s");
+	is($litespeed_read, $front,
+		"R106: litespeed.conf.tpl's initTimeout is the same figure ($front s) - it is the same deadline under a third name, and it was 30 too");
 }
 
 # The socket's own mode is the other half of "the front server can reach

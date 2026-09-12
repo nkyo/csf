@@ -46,7 +46,27 @@ extprocessor csfui {
 	address                 UDS://@@UI_SOCK@@
 	maxConns                35
 	pcKeepAliveTimeout      15
-	initTimeout             30
+	# initTimeout IS NOT A FREE CHOICE (fix round 2, R106) - it is
+	# LiteSpeed's deadline on the first response from this external
+	# application, the same deadline nginx spells proxy_read_timeout and
+	# Apache spells ProxyPass timeout=. csf-ui arms a request budget of
+	# its own over the same span - 75s: ConfigServer::UI::HTTP's header
+	# (15) + body (15) + write (5) plus the dispatch term F1 added (4
+	# helper calls x ConfigServer::UI::Client's 10s) - so at 30 this
+	# number was SMALLER than the budget and a request csf-ui served
+	# correctly at 44s would have been abandoned here, with the
+	# administrator never seeing it. Measured on nginx and Apache, whose
+	# equivalents both did exactly that (504 and 502 at 30.03s); this
+	# server's own reproduction is not available in this workspace, which
+	# is why the value is derived from the same authority rather than
+	# tuned by observation here.
+	#
+	# Not maintained by hand:
+	# ConfigServer::UI::Server::front_server_read_timeout() derives it, and
+	# t/80-templates.t asserts this file, nginx.conf.tpl and
+	# apache.conf.tpl all carry exactly that, so none of the numbers can
+	# move on its own.
+	initTimeout             80
 	retryTimeout            0
 	respBuffer              0
 }
