@@ -97,20 +97,29 @@
 # absent - see preflight() for what replaces the IO::Socket::SSL demand,
 # and admit_peer() for what replaces the allowlist check in the same slot.
 #
-# run() itself - the loop's own control flow, wired to a real accept() -
-# is untested by design, the same way ui-src/bin/csf-ui-helper's own main()
-# is not unit-tested by t/11-helper-validate.t: it needs a real listening
-# socket, a real fork, and, in production, a real TLS library this
-# workspace does not have installed, and it sits behind preflight(), which
-# always refuses here for exactly that last reason. Everything the loop
-# actually DOES with one connection is factored out into plain functions or
-# functions that take their socket as an argument instead, precisely so
-# each piece is testable without any of that: preflight(), read_ui_conf(),
-# peer_allowed(), handle_connection(), _serve_accepted() (the per-connection
-# TLS-wrap-then-serve step, watchdog included - task-5-review.md R31/R32)
-# and _accept_backoff() (the accept()-failure policy - I2). t/40 and t/41
-# exercise all of them directly, using socketpair()s in place of accept()ed
-# connections and a fake `app` in place of ConfigServer::UI::App.
+# run() itself IS tested now, and this comment used to say the opposite
+# (fix round 1, F6). The claim was true while mode A did not exist: run()
+# needed a real listening socket, a real fork, and, in production, a real
+# TLS library this workspace does not have, and it sat behind preflight(),
+# which always refused here for exactly that last reason. Mode A removed
+# the last of those - there is no TLS in this process in mode A, so
+# preflight() does not demand IO::Socket::SSL - and commit 4d57037 then
+# drove run() for the first time. t/40 drives its mode-A startup refusal;
+# t/42-listen-loop.t drives the accept loop itself, over a real bound
+# socket, with real accept()s and real forked children, including the child
+# cap, the fork()-failure branch, the reaping order and the exit-time
+# unlink.
+#
+# What remains true, and is the reason the factoring below is still worth
+# having, is that everything the loop DOES with one connection is a plain
+# function or a function that takes its socket as an argument: preflight(),
+# read_ui_conf(), peer_allowed(), handle_connection(), _serve_accepted()
+# (the per-connection TLS-wrap-then-serve step, watchdog included -
+# task-5-review.md R31/R32) and _accept_backoff() (the accept()-failure
+# policy - I2). t/40 and t/41 exercise all of them directly, using
+# socketpair()s in place of accept()ed connections and a fake `app` in
+# place of ConfigServer::UI::App - which is how the hostile-input table
+# gets driven without a daemon at all.
 ###############################################################################
 package ConfigServer::UI::Server;
 
@@ -143,6 +152,14 @@ our $DEFAULT_UI_CONF_PATH = '/etc/csf-ui/ui.conf';
 our $DEFAULT_MAX_CHILDREN = 32;
 our $DEFAULT_LISTEN_BACKLOG = 64;
 our $DEFAULT_ACCEPT_BACKOFF = 0.1;
+
+# How often the accept loop's two SILENT drops may each put a line on
+# stderr (fix round 1, F2). See _log_drop() for the whole reasoning; the
+# number itself is a minute because that is short enough that an
+# administrator watching `journalctl -fu csf-ui` while the UI misbehaves
+# sees a line promptly, and long enough that a peer reconnecting as fast
+# as the kernel allows cannot turn the log into the denial.
+our $DEFAULT_DROP_LOG_INTERVAL = 60;
 
 # task-5-review.md R36: the TLS handshake's own watchdog budget, separate
 # from HTTP.pm's header/body/write timeouts (see _serve_accepted() below
@@ -1024,9 +1041,11 @@ sub new {
 		peer_uids         => $opt{peer_uids},
 		listen_family     => $opt{listen_family},
 		refused_logged    => {},
+		drop_logged       => {},
 		max_children      => defined $opt{max_children} ? $opt{max_children} : $DEFAULT_MAX_CHILDREN,
 		backlog           => defined $opt{backlog} ? $opt{backlog} : $DEFAULT_LISTEN_BACKLOG,
 		accept_backoff    => defined $opt{accept_backoff} ? $opt{accept_backoff} : $DEFAULT_ACCEPT_BACKOFF,
+		drop_log_interval => defined $opt{drop_log_interval} ? $opt{drop_log_interval} : $DEFAULT_DROP_LOG_INTERVAL,
 		handshake_timeout => defined $opt{handshake_timeout} ? $opt{handshake_timeout} : $DEFAULT_HANDSHAKE_TIMEOUT,
 		dispatch_timeout  => defined $opt{dispatch_timeout}  ? $opt{dispatch_timeout}  : $DEFAULT_DISPATCH_TIMEOUT,
 		header_timeout    => defined $opt{header_timeout} ? $opt{header_timeout} : $ConfigServer::UI::HTTP::HEADER_TIMEOUT,
@@ -1120,9 +1139,11 @@ sub handle_connection {
 }
 
 ###############################################################################
-# The daemon. See the module header comment for why this is not exercised
-# by t/40 or t/41 - it needs a real listening socket, a real fork, and, in
-# production, a real TLS library.
+# The daemon's own mode-B listener. This one genuinely is not exercised by
+# the suite - it binds a TCP port, which the mode-A cases below deliberately
+# never need - but the loop it feeds no longer is: see the module header
+# comment, and t/42-listen-loop.t (fix round 1, F6; this comment said run()
+# was untested long after commit 4d57037 had driven it).
 ###############################################################################
 sub _open_listener {
 	my ($conf) = @_;
@@ -1419,6 +1440,65 @@ sub _refuse_peer {
 	my $key = defined $uid ? "uid:$uid" : 'no-credentials';
 	return if $self->{refused_logged}{$key}++;
 	print STDERR "csf-ui (Server.pm): refused a connection on the mode-A unix socket: $why\n";
+	return;
+}
+
+###############################################################################
+# _log_drop($self, $kind, $why) - fix round 1, F2.
+#
+# THE TWO SILENT PATHS IN THE ACCEPT LOOP, AND WHY THEY WERE THE WRONG TWO
+# TO LEAVE SILENT. _accept_backoff() logs. _refuse_peer() logs. The busy
+# drop and the fork() failure logged nothing at all - and those are exactly
+# the two an attacker drives. Measured at max_children=4: four connections
+# that send nothing occupy all four slots (each for the 15s HTTP.pm's own
+# absolute header deadline allows, which is CORRECT and is not changed
+# here), three consecutive legitimate requests were each dropped in about
+# 15ms with an empty response, and the daemon's stderr was zero bytes.
+# Sustainable indefinitely by reconnecting. The operator could not tell a
+# busy UI from a broken one, because from outside both are a 502 at the
+# front server and nothing anywhere else.
+#
+# RATE-LIMITED BY TIME, NOT DEDUPED PER LIFETIME, which is where this
+# departs from _refuse_peer() on purpose. _refuse_peer()'s key is an
+# ACCOUNT: the set is bounded by the host's passwd database, and the same
+# account turned away twice really is the same fact, so once per lifetime
+# says everything there is to say (measured: 327,711 refused connects in
+# 6s changed nothing). "Busy" has no such key. A busy minute this morning
+# and a busy minute next week are different operational facts, and a
+# once-ever line answers the first while hiding the second - which is the
+# same silence this is fixing, only harder to notice. So the bound is a
+# window, and the line carries how many drops the window suppressed, so
+# that the scale is in the log rather than only the fact.
+#
+# WHAT THIS DELIBERATELY DOES NOT DO:
+#
+#   * it does not write a 503 to the dropped peer. That write happens in
+#     the PARENT, between accept() and the next accept(), and would put a
+#     bounded-but-real blocking write into the one loop in this module
+#     that must never block: a front server slow to read would then stall
+#     accept() itself, turning a partial denial into a total one. The
+#     front server already renders an unanswered connection as a 502; what
+#     was missing was never the peer's diagnosis, it was the operator's.
+#   * it does not raise max_children. The cap is the defence, not the
+#     defect - without it the same four silent connections become as many
+#     children as the host has processes.
+#   * it does not shorten the slot hold time. That is HTTP.pm's absolute
+#     header deadline, armed before the first read, and requirement 7
+#     froze HTTP.pm.
+###############################################################################
+sub _log_drop {
+	my ($self, $kind, $why) = @_;
+	my $state = $self->{drop_logged}{$kind} ||= { suppressed => 0, last => undef };
+	$state->{suppressed}++;
+	my $now = Time::HiRes::time();
+	return if defined $state->{last}
+		&& ($now - $state->{last}) < $self->{drop_log_interval};
+	my $count = $state->{suppressed};
+	$state->{suppressed} = 0;
+	$state->{last} = $now;
+	print STDERR "csf-ui (Server.pm): $why"
+		. " ($count such connection(s) since the last line of this kind;"
+		. " at most one line per $self->{drop_log_interval}s)\n";
 	return;
 }
 
@@ -1749,13 +1829,48 @@ sub run {
 			next;
 		}
 
+		# REAPED AGAIN, HERE, and not only at the top of the loop. The
+		# reap above runs BEFORE accept(), so every child that exits
+		# while the parent is blocked in accept() - which is where the
+		# parent spends nearly all of its time - leaves %child stale for
+		# exactly one connection, and that connection is then dropped as
+		# "busy" against slots that are in fact free. Measured as one
+		# legitimate request silently dropped per burst. A second
+		# non-blocking waitpid() sweep costs one syscall per accepted
+		# connection and makes the cap check read the truth.
+		while ((my $done = waitpid(-1, POSIX::WNOHANG())) > 0) { delete $child{$done} }
+
 		if (scalar(keys %child) >= $self->{max_children}) {
-			close $connection; # busy; dropped rather than queued without bound
+			# Dropped rather than queued without bound - and said so.
+			# F2: this was the loop's first silent path, and the one an
+			# attacker drives. See _log_drop() for why the bound on the
+			# volume is a time window rather than _refuse_peer()'s
+			# per-lifetime key.
+			$self->_log_drop('busy',
+				"all $self->{max_children} connection slots are in use, so a connection was accepted and dropped"
+				. " without a response; the front web server will report this as a 502."
+				. " If it persists, connections are being held open without completing a request");
+			close $connection;
 			next;
 		}
 
 		my $pid = fork();
 		unless (defined $pid) {
+			# F2: the loop's second silent path. One EAGAIN under
+			# RLIMIT_NPROC dropped a request with no record that anything
+			# had happened at all.
+			#
+			# AND THIS BRANCH IS LOAD-BEARING FOR MORE THAN THE LOG.
+			# Without it $pid is undef, `if ($pid)` below is false, and
+			# the PARENT falls through into the child path: it closes its
+			# own listener, serves this one request, and POSIX::_exit(0)s.
+			# Measured: the daemon is dead after request 1, a stale socket
+			# is left behind, and the next connect() is ECONNREFUSED. One
+			# transient fork() failure terminates the firewall's admin
+			# interface. t/42-listen-loop.t drives exactly that.
+			$self->_log_drop('fork',
+				"fork() failed, so a connection was accepted and dropped without a response ($!);"
+				. " the host is out of processes or this account is at its RLIMIT_NPROC");
 			close $connection;
 			next;
 		}
