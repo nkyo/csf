@@ -390,6 +390,67 @@ my $SENTINEL = '/run/csf-ui-sentinel/only-here.sock';
 is(sprintf('%04o', $ConfigServer::UI::Server::UNIX_SOCKET_MODE), '0660',
 	'the socket is served at 0660, so the group csf-ui.service hands to the front server can connect');
 
+# _verify_unit() - fix round 1, item 1. `systemd-analyze verify` checks two
+# different things at once: the UNIT FILE'S OWN SYNTAX (a property of the
+# template this suite owns and must catch a break in), and whether
+# ExecStart's target exists and is executable ON THE HOST RUNNING THE TEST
+# (a property of an INSTALLED system - Task 9's installer puts
+# /usr/local/csf-ui/bin/csf-ui{,-helper} there; a dev workspace never has).
+# Those two facts share one exit code, and conflating them is exactly why
+# this block went from green to red on this same host with an identical
+# repository: a PRIOR session had `csf-ui`/`csf-ui-helper` installed at
+# that path as a side effect of its own work, this test was never actually
+# verifying syntax on its own (it was riding someone else's installed
+# binary), and it went red the moment that lab was cleaned up. That is a
+# sixth shape of "passing for the wrong reason", on top of the five the
+# task brief already named: passing because of a side effect an unrelated
+# session happened to leave on the host.
+#
+# So the ONE diagnostic systemd-analyze can emit for "ExecStart's target is
+# not on this host" is treated as expected-and-explained here, never
+# silently swallowed - every other line it prints still fails the test.
+# This is deliberately NOT a skip: a skip that says nothing is shape one
+# from the same list, and this block still runs systemd-analyze and still
+# checks its output; it merely does not fail on the one line that is a
+# property of installation state, not of the file this suite owns.
+sub _verify_unit {
+	my ($path) = @_;
+
+	# Two-arg open()+fork()-then-exec(), not backticks/qx and not a shell
+	# redirection string: this merges the child's STDERR into the same pipe
+	# as its STDOUT (systemd-analyze writes its diagnostics to STDERR) with
+	# no shell in between, which is what lets $output below see every line
+	# systemd-analyze actually printed instead of only the ones that
+	# happened to land on STDOUT.
+	my $pid = open(my $fh, '-|');
+	die "fork failed: $!" unless defined $pid;
+	if ($pid == 0) {
+		open(STDERR, '>&', STDOUT) or POSIX::_exit(125);
+		exec('systemd-analyze', 'verify', $path) or POSIX::_exit(126);
+	}
+	local $/;
+	my $output = <$fh>;
+	close $fh;
+	my $rc = $?;
+	$output = '' unless defined $output;
+
+	return (1, $output) if $rc == 0;
+
+	my @unexplained;
+	for my $line (split /\n/, $output) {
+		next if $line eq '';
+		# The one carved-out diagnostic, tied to the unit's OWN name so a
+		# report about a DIFFERENT unit's missing binary still counts as
+		# unexplained here - each unit is judged on its own line.
+		my $base = ($path =~ m{([^/]+)$})[0];
+		next if $line =~ /^\Q$base\E: Command \S+ is not executable: No such file or directory\s*$/;
+		push @unexplained, $line;
+	}
+
+	return (1, $output) unless @unexplained;
+	return (0, $output);
+}
+
 SKIP: {
 	my $analyzer = `command -v systemd-analyze 2>/dev/null`;
 	chomp $analyzer;
@@ -397,8 +458,13 @@ SKIP: {
 		unless length $analyzer;
 
 	for my $name (sort keys %UNIT) {
-		my $rc = system('systemd-analyze', 'verify', $UNIT{$name});
-		is($rc, 0, "systemd-analyze verify accepts $name");
+		my ($ok, $output) = _verify_unit($UNIT{$name});
+		ok($ok, "systemd-analyze verify accepts $name (syntax), or explains a not-yet-installed ExecStart target as the only reason it did not")
+			or diag("systemd-analyze verify $UNIT{$name}:\n$output");
+		if ($ok && $output =~ /is not executable: No such file or directory/) {
+			diag("$name: ExecStart's target is not installed on this host (expected in a dev workspace) - "
+				. "syntax and every other check still passed; not a failure of the unit file itself");
+		}
 	}
 }
 
