@@ -549,8 +549,26 @@ connect(\$c, Socket::pack_sockaddr_un(\$sock_path)) or do { print \$rf "PROBE_CO
 my \$out = '';
 eval {
 	local \$SIG{ALRM} = sub { die "t\\n" };
+	# 10s (widened from 5s in fix round 2, on a since-disproven timeout
+	# theory - the real cause was the EPIPE race fixed just below, not a
+	# deadline anywhere being too tight). Kept anyway: it costs nothing
+	# measurable (t/92 alone runs in well under a second) and is still
+	# real margin against unrelated host contention, so there is no reason
+	# to narrow it back just because it was not the actual fix.
 	alarm(10);
-	syswrite(\$c, \$line) or die "write failed: \$!\\n";
+	# NOT "or die": the helper answers a wrong-uid peer with E_PEER and
+	# CLOSES (section 2.2's own behaviour, proven by 3c's own assertion
+	# below). Under contention the close can land before this write
+	# completes, syswrite() then fails with EPIPE, and the response is
+	# ALREADY SITTING in this process's receive buffer, unread. Dying here
+	# would throw that real, correct answer away and misreport it as "the
+	# peer answered nothing" - a false negative on the exact behaviour this
+	# section exists to prove. Fix round 3: measured as the actual cause of
+	# an intermittent failure (misdiagnosed as a timeout in fix round 2,
+	# which widened alarms that turned out to be irrelevant to this race).
+	# A syswrite() failure here is not fatal; the read loop below is what
+	# decides whether anything real came back.
+	syswrite(\$c, \$line);
 	# NOT "1 while sysread(\$c, my \$chunk, 4096) > 0 and (...)" - a 'my'
 	# declared inside a postfix-while's own condition does not carry its
 	# value into the low-precedence 'and' clause of that SAME condition on
@@ -734,6 +752,18 @@ ok(1, 'the helper daemon was stopped');
 		# about admit_peer() itself, only about a mode bit S2.3 already
 		# covers. Loosened here, on this test's own throwaway socket only,
 		# so the REJECTION under test is the application-level one.
+		#
+		# Worth stating plainly rather than leaving implicit: this host is
+		# explicitly shared with other agents' labs (this project's own
+		# CLAUDE.md says so), and for the remainder of THIS SKIP block any
+		# local account on the host - not only 'nobody' - can connect to
+		# this one throwaway mode-A socket, because 0666 admits anyone who
+		# can reach the path and 0755 on $dir2 makes the path reachable.
+		# Bounded in scope (this socket only, this tempdir only, torn down
+		# with the rest of $dir2 when this file exits) and bounded in time
+		# (only while this SKIP block runs), but real for that window - not
+		# a mode this project would ever ship, and not one any other file
+		# in this test tree leaves open past the one check that needs it.
 		chmod 0666, $web_sock;
 		chmod 0755, $dir2;
 
@@ -758,7 +788,14 @@ eval {
 	alarm(0);
 };
 print \$rf "PROBE_EVAL_DIED:\$@" if \$@ && \$@ ne "t\\n";
-print \$rf \$out;
+# Fix round 3, shape 9 (the review's own name: "the expected observation
+# is the null observation" - a pass condition of "nothing came back"
+# cannot tell the guard firing apart from the probe never running at all).
+# A POSITIVE CONTROL: this marker is written unconditionally, right before
+# close, whenever execution reaches this far - so its ABSENCE (not merely
+# an empty \$out) is what "the probe never ran, or died, or could not be
+# read back" looks like, and THAT must redden this row, not pass it.
+print \$rf "PROBE_DONE:" . length(\$out) . "\\n" . \$out;
 close \$rf;
 PERL
 		my $script_path4b = "$dir2/prober4b.pl";
@@ -776,7 +813,16 @@ PERL
 		unlike($out4b, qr/^PROBE_(SOCKET|CONNECT)_FAILED/,
 			'4b: the prober actually reached connect() as the second uid on the WEB socket')
 			or diag("prober infra failure: $out4b");
-		is($out4b, '', '4b: S2.4 refuses a wrong-uid peer with NOTHING AT ALL - closed before a byte is read, unlike S2.2\'s real E_PEER response')
+		# The positive control IS the assertion now, not a separate check:
+		# "S2.4 refuses with nothing at all" is read off PROBE_DONE:0, not
+		# off an empty string that a probe which never ran would also
+		# produce. A prober that could not exec (permission denied), could
+		# not open its result file, or whose result file this process
+		# could not read back all yield '' here too - and all three must
+		# fail this assertion, not pass it (proven below by deliberately
+		# causing the first one and confirming this line reddens).
+		is($out4b, "PROBE_DONE:0\n",
+			'4b: S2.4 refuses a wrong-uid peer with NOTHING AT ALL - closed before a byte is read, unlike S2.2\'s real E_PEER response')
 			or diag('got: ' . length($out4b) . ' bytes: ' . substr($out4b, 0, 200)
 				. "; web-daemon.err: " . (_slurp("$dir2/web-daemon.err") // '(none)'));
 	}
