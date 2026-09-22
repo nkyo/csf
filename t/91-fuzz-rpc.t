@@ -169,11 +169,26 @@ sub _write { my ($p, $t) = @_; open(my $fh, '>', $p) or die $!; print $fh $t; cl
 ###############################################################################
 {
 	my ($ctx, $peer) = fixture();
+	# Fix round 2, I2: handle_request() (csf-ui-helper) validates `id`
+	# BEFORE the op lookup - E_PROTOCOL on a bad/missing id returns before
+	# $OPS{$op} is ever consulted. A generator with no `id` field at all
+	# can therefore never reach E_UNKNOWN_OP, whatever `op` says: a traced
+	# 200-case run at seed 20260922 produced 201 E_PROTOCOL, 157 E_ARG, 14
+	# E_BUSY and zero E_UNKNOWN_OP. Every generator below that is meant to
+	# exercise op lookup or argument validation now carries a syntactically
+	# valid id (matching Proto::validate_id's own grammar,
+	# ^[A-Za-z0-9._:-]{1,64}$) so the id check is not what stops it before
+	# it gets there - and a DEDICATED unknown-op generator (with a valid
+	# id) is added so "unknown ops" is a surface this file actually
+	# reaches, not merely names.
+	my $rand_id = sub { return sprintf('%016x', int(rand(2**32))) . sprintf('%016x', int(rand(2**32))) };
+
 	my @generators = (
 		sub { return _rand_bytes(int(rand(2000))) },
 		sub { return _rand_garbage(int(rand(500))) },
-		sub { return '{"op":"' . _rand_garbage(int(rand(50))) . '"}' },
-		sub { return '{"op":"deny","args":' . _rand_garbage(int(rand(200))) . '}' },
+		sub { return '{"op":"' . _rand_garbage(int(rand(50))) . '"}' },   # no id at all: E_PROTOCOL before op lookup, on purpose - the "malformed envelope" surface
+		sub { return '{"op":"' . _rand_garbage(int(rand(50))) . '","id":"' . $rand_id->() . '"}' },   # WITH a valid id: reaches op lookup, exercises E_UNKNOWN_OP
+		sub { return '{"op":"deny","args":' . _rand_garbage(int(rand(200))) . ',"id":"' . $rand_id->() . '"}' },
 		sub { return '[' . join(',', map { int(rand(1000)) } (1 .. int(rand(20)))) . ']' },   # top-level array, not object
 		sub { return '"just a string"' },
 		sub { return int(rand(100000)) . '' },   # top-level number
@@ -182,6 +197,7 @@ sub _write { my ($p, $t) = @_; open(my $fh, '>', $p) or die $!; print $fh $t; cl
 		sub { return '{"op":"deny","args":{},"id":"' . ('x' x (100 + int(rand(2000)))) . '"}' },     # oversize id
 	);
 
+	my %seen_error;
 	my $N = 200;
 	for my $i (1 .. $N) {
 		my $line = $generators[int(rand(scalar @generators))]->();
@@ -217,8 +233,30 @@ sub _write { my ($p, $t) = @_; open(my $fh, '>', $p) or die $!; print $fh $t; cl
 				&& (${ $resp->{ok} } ? exists($resp->{data}) : (exists($resp->{error}) && exists($resp->{message})));
 			ok($shaped, "A#$i: handle_line always returns a well-formed section-3.3 envelope")
 				or diag('resp=' . (defined $resp ? join(',', map { "$_=" . (defined $resp->{$_} ? $resp->{$_} : 'undef') } sort keys %$resp) : 'undef'));
+			$seen_error{ $resp->{error} }++ if $shaped && !${ $resp->{ok} } && defined $resp->{error};
 		}
 	}
+
+	# Fix round 2, I2's own coverage claim, checked rather than left to
+	# chance: the random loop above draws one of 11 generators per case, so
+	# whether the unknown-op-with-a-valid-id generator gets picked enough
+	# times to actually reach E_UNKNOWN_OP is itself a random variable - it
+	# did at seed 20260922 and did not at seed 42, in a 200-case run, which
+	# would make this claim's own proof flaky at the seed level. So the
+	# claim is checked DETERMINISTICALLY instead, once, outside the random
+	# draw: a fixed garbage op with a fixed valid id must reach
+	# E_UNKNOWN_OP every time, at every seed - not "probably, given enough
+	# draws".
+	diag('A: error codes seen across this run\'s random draws: '
+		. (%seen_error ? join(', ', map { "$_=$seen_error{$_}" } sort keys %seen_error) : '(none)'));
+	my $probe_line = '{"op":"' . 'definitely-not-a-real-op' . '","id":"' . $rand_id->() . '"}';
+	my ($probe_result, $probe_err) = _bounded(5, sub { return $H->can('handle_line')->($ctx, $probe_line, $peer) });
+	ok(!defined($probe_err), 'A: the deterministic unknown-op probe does not hang or die')
+		or diag("error: $probe_err");
+	my $probe_resp = defined $probe_result ? $probe_result->[0] : undef;
+	is(ref($probe_resp) eq 'HASH' ? $probe_resp->{error} : undef, 'E_UNKNOWN_OP',
+		'A: ...and a garbage op with a syntactically valid id is specifically E_UNKNOWN_OP - the "unknown ops" surface is reached, not merely named')
+		or diag('resp=' . (ref($probe_resp) eq 'HASH' ? join(',', map { "$_=" . (defined $probe_resp->{$_} ? $probe_resp->{$_} : 'undef') } sort keys %$probe_resp) : 'not a hashref'));
 }
 
 ###############################################################################
