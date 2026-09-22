@@ -340,8 +340,9 @@ my $SENTINEL = '/run/csf-ui-sentinel/only-here.sock';
 # the gap (35 > 30 already) rather than opening it.
 #
 # WHAT IS ASSERTED, and why it is an equality rather than ">=":
-# docs/WEBUI-RPC.md's own rule (S14.2) is that a limit that cannot be
-# counted is not a limit, and ">=" would let any of these numbers drift on
+# docs/WEBUI-RPC.md's own rule (S7) is that a limit that cannot be
+# counted is not a limit; S14.5 is where the relation asserted below is
+# itself frozen. ">=" would let any of these numbers drift on
 # its own as long as it drifted the harmless way - which is how three
 # files came to hold 30 against a budget of 75 in the first place. So
 # Server.pm derives the figure once

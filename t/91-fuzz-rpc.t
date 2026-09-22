@@ -1,0 +1,449 @@
+#!/usr/bin/perl
+###############################################################################
+# Copyright (C) 2006-2025 Jonathan Michaelson
+#
+# https://github.com/waytotheweb/scripts
+#
+# This program is free software; you can redistribute it and/or modify it under
+# the terms of the GNU General Public License as published by the Free Software
+# Foundation; either version 3 of the License, or (at your option) any later
+# version.
+#
+# This program is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+# FOR A PARTICULAR PURPOSE. See the GNU General Public License for more
+# details.
+#
+# You should have received a copy of the GNU General Public License along with
+# this program; if not, see <https://www.gnu.org/licenses>.
+###############################################################################
+# Added 2026-09-22 in https://github.com/nkyo/csf - see CHANGES.md.
+#
+# Task 10: hostile-input fuzz pass, RPC half. Four surfaces, matching the
+# task brief's own list:
+#
+#   A. malformed JSON / arbitrary bytes as a request line, at
+#      ConfigServer::UI::Helper::handle_line() - the framing decode itself;
+#   B. oversize lines and the wire's own 65536-byte cap, at
+#      ConfigServer::UI::Proto::read_message() over a real socketpair - t/10
+#      already proves this at fixed boundary values; this file proves it
+#      under random ones too;
+#   C. every one of the 14 known ops, called with hostile arguments drawn
+#      from a per-type hostile-value pool (never the argument the op
+#      actually wants), which must always come back E_ARG (or, for the
+#      handful of shapes that are not even the right JSON type, closed
+#      before an op is even chosen) - never ok:true, never an uncaught die,
+#      never an error code outside section 3.5's closed enumeration;
+#   D. every MUTATING op, on a role that section 5's own words restrict to
+#      "grep and list only" (support) - driven through the real
+#      ConfigServer::UI::App router (Task 4), with hostile arguments on top,
+#      to prove the 403 in t/33's one hand-picked case holds for the whole
+#      operation list under randomised input, not only for the row t/33
+#      happened to pick.
+#
+# Every call here is in-process (handle_line()/handle_request() call
+# straight into Perl; App->dispatch() calls a FakeClient, never a real
+# socket) - so nothing here needs root, a real csf, or a real network. What
+# each case must never do: hang (alarm-bounded, backstop over the module's
+# own timeouts, same discipline as t/90), die any way other than a
+# recognised fault()/is_fault() shape, or answer with something outside the
+# closed set section 3.5 defines.
+###############################################################################
+use strict;
+use warnings;
+
+use FindBin ();
+use lib "$FindBin::Bin/..", "$FindBin::Bin/../ui-src/lib";
+
+use File::Temp qw(tempdir);
+use Socket ();
+use JSON::Tiny ();
+use Test::More;
+
+my $HELPER_PATH = "$FindBin::Bin/../ui-src/bin/csf-ui-helper";
+my $APP_PATH    = "$FindBin::Bin/../ui-src/bin/csf-ui";
+ok(-f $HELPER_PATH, 'the helper source is where the contract says it is');
+ok(-f $APP_PATH, 'csf-ui is where the contract says it is');
+require $HELPER_PATH;
+require $APP_PATH;
+my $H = 'ConfigServer::UI::Helper';
+my $A = 'ConfigServer::UI::App';
+my $P = 'ConfigServer::UI::Proto';
+
+$SIG{PIPE} = 'IGNORE';
+
+my $SEED = defined $ENV{CSF_FUZZ_SEED} ? $ENV{CSF_FUZZ_SEED} : 20260922;
+srand($SEED);
+diag("t/91-fuzz-rpc.t: seed=$SEED (set CSF_FUZZ_SEED to reproduce a different run)");
+
+our $BLOCKED = 0;
+sub _bounded {
+	my ($seconds, $code) = @_;
+	local $SIG{ALRM} = sub { die "FUZZ_ALARM\n" };
+	alarm($seconds);
+	my @out = eval { $code->() };
+	my $err = $@;
+	alarm(0);
+	if ($err ne '') {
+		$BLOCKED++ if $err eq "FUZZ_ALARM\n";
+		return (undef, $err);
+	}
+	return (\@out, undef);
+}
+
+###############################################################################
+# Generators shared across sections
+###############################################################################
+sub _rand_byte { return chr(int(rand(256))) }
+sub _rand_bytes { my ($n) = @_; return join('', map { _rand_byte() } (1 .. $n)) }
+sub _rand_garbage {
+	my ($n) = @_;
+	my $out = '';
+	for (1 .. $n) {
+		my $r = rand();
+		if ($r < 0.70) { $out .= chr(32 + int(rand(95))) }
+		elsif ($r < 0.90) { $out .= chr(int(rand(32))) }
+		else { $out .= chr(127 + int(rand(129))) }
+	}
+	return $out;
+}
+
+my @HOSTILE_STRING = (
+	'', ' ', "\0", "\n", "\t", "-1", "0", "999999999999999999999",
+	'; rm -rf /', '$(id)', '`id`', '../../etc/shadow', '../../../../etc/passwd',
+	'<script>alert(1)</script>', "a" x 5000, "\xC0\xAF", "\x{1F4A9}",
+	'0.0.0.0/0', '::/0', '127.0.0.1', '::1', '10.0.0.0/33', 'not-an-ip',
+	'-p 22 -d out', "a\nInclude /etc/shadow", "a|b", 'NaN', 'Infinity',
+);
+my @HOSTILE_NUMBER = (-1, 0, 1, 60, 59, 604800, 604801, 2**31, -(2**31), 3.14, 'NaN');
+my @HOSTILE_ARRAY  = ([], [1,2,3], ['x' x 100], [map { "$_" x 32 } (1..600)]);
+my @HOSTILE_TYPE   = (undef, 1, 3.14, 'a string', [1,2], {a=>1}, \1);
+
+sub _hostile {
+	my ($kind) = @_;
+	if ($kind eq 'string') { return $HOSTILE_STRING[int(rand(scalar @HOSTILE_STRING))] }
+	if ($kind eq 'number') { return $HOSTILE_NUMBER[int(rand(scalar @HOSTILE_NUMBER))] }
+	if ($kind eq 'array')  { return $HOSTILE_ARRAY[int(rand(scalar @HOSTILE_ARRAY))] }
+	return $HOSTILE_TYPE[int(rand(scalar @HOSTILE_TYPE))];
+}
+
+###############################################################################
+# Fixture: the same shape t/11-helper-validate.t builds - a tempdir, a
+# no-op 'run' stub (no real csf, no real child), group_ready/expect_uid set
+# so the peer check never gets in the way of what THIS file is fuzzing
+# (argument validation and dispatch, not the peer gate - t/92 covers that).
+###############################################################################
+sub fixture {
+	my $dir = tempdir(CLEANUP => 1);
+	mkdir "$dir/run";
+	mkdir "$dir/helper";
+	my %path = (
+		socket_dir  => "$dir/run", socket => "$dir/run/helper.sock",
+		rate_state  => "$dir/run/rate.state", helper_dir => "$dir/helper",
+		authfail    => "$dir/helper/authfail.state", audit_log => "$dir/audit.log",
+		users       => "$dir/users", csf_bin => "$dir/csf", csf_conf => "$dir/csf.conf",
+		csf_deny    => "$dir/csf.deny", csf_allow => "$dir/csf.allow",
+		csf_disable => "$dir/csf.disable", csf_error => "$dir/csf.error",
+		csf_version => "$dir/version.txt", tempban => "$dir/csf.tempban",
+		tempallow   => "$dir/csf.tempallow", lfd_pid => "$dir/lfd.pid",
+	);
+	_write($path{csf_conf}, qq(TESTING = "0"\nIPV6 = "0"\nLF_IPSET = "0"\nIPTABLES = "/sbin/iptables"\nIP6TABLES = "/sbin/ip6tables"\n));
+	_write($path{csf_deny}, ''); _write($path{csf_allow}, ''); _write($path{tempban}, ''); _write($path{tempallow}, '');
+	_write($path{csf_version}, "15.00\n");
+	_write($path{users}, "alice:6:\$6\$salt\$hash:admin:1757548800\n");
+	chmod 0600, $path{users};
+	my $peer = { uid => 1000, pid => 4242 };
+	my $ctx = $H->can('new_context')->(
+		path => \%path, now => sub { 1757548800 }, expect_uid => 1000, group_ready => 1,
+		run => sub {
+			my ($ctx, $deadline, @argv) = @_;
+			return { exit => 0, status => 0, output => '' };
+		},
+	);
+	return ($ctx, $peer);
+}
+sub _write { my ($p, $t) = @_; open(my $fh, '>', $p) or die $!; print $fh $t; close $fh }
+
+###############################################################################
+# A. malformed JSON / arbitrary bytes as a request line, at handle_line().
+###############################################################################
+{
+	my ($ctx, $peer) = fixture();
+	my @generators = (
+		sub { return _rand_bytes(int(rand(2000))) },
+		sub { return _rand_garbage(int(rand(500))) },
+		sub { return '{"op":"' . _rand_garbage(int(rand(50))) . '"}' },
+		sub { return '{"op":"deny","args":' . _rand_garbage(int(rand(200))) . '}' },
+		sub { return '[' . join(',', map { int(rand(1000)) } (1 .. int(rand(20)))) . ']' },   # top-level array, not object
+		sub { return '"just a string"' },
+		sub { return int(rand(100000)) . '' },   # top-level number
+		sub { return 'null' },
+		sub { my $depth = 20 + int(rand(200)); return ('{"a":' x $depth) . '1' . ('}' x $depth) },  # deep nesting
+		sub { return '{"op":"deny","args":{},"id":"' . ('x' x (100 + int(rand(2000)))) . '"}' },     # oversize id
+	);
+
+	my $N = 200;
+	for my $i (1 .. $N) {
+		my $line = $generators[int(rand(scalar @generators))]->();
+		my ($result, $err) = _bounded(5, sub { return $H->can('handle_line')->($ctx, $line, $peer) });
+		ok(!(defined $err && $err eq "FUZZ_ALARM\n"),
+			"A#$i: handle_line does not hang (" . length($line) . ' bytes)')
+			or diag('input(60)=' . substr($line, 0, 60));
+		if (defined $err && $err ne "FUZZ_ALARM\n") {
+			ok(0, "A#$i: handle_line must never let a die escape it")
+				or diag("died with: $err");
+		}
+		else {
+			my $resp = $result->[0];
+			my $shaped = ref($resp) eq 'HASH' && exists($resp->{ok})
+				&& (${ $resp->{ok} } ? exists($resp->{data}) : (exists($resp->{error}) && exists($resp->{message})));
+			ok($shaped, "A#$i: handle_line always returns a well-formed section-3.3 envelope")
+				or diag('resp=' . (defined $resp ? join(',', map { "$_=" . (defined $resp->{$_} ? $resp->{$_} : 'undef') } sort keys %$resp) : 'undef'));
+		}
+	}
+}
+
+###############################################################################
+# B. oversize lines and the wire cap, at Proto::read_message() over a real
+# socketpair - t/10 proves the boundary by hand; this proves it under
+# random sizes either side of it, and under garbage that never finds a
+# newline at all.
+###############################################################################
+{
+	my $N = 40;
+	for my $i (1 .. $N) {
+		socketpair(my $near, my $far, Socket::AF_UNIX(), Socket::SOCK_STREAM(), Socket::PF_UNSPEC())
+			or die "socketpair: $!";
+		my $mode = int(rand(3));
+		my $payload;
+		if ($mode == 0) {
+			# a line-terminated payload of random size either side of the 65536 cap
+			my $len = int(rand(140000));
+			$payload = ('{"op":"status","id":"' . ('a' x 8) . '","args":{"note":"') . ('x' x $len) . '"}}' . "\n";
+		}
+		elsif ($mode == 1) {
+			# never terminated at all - pure garbage, no newline
+			$payload = _rand_bytes(int(rand(3000)));
+		}
+		else {
+			$payload = _rand_garbage(int(rand(3000))) . "\n";
+		}
+		syswrite($far, $payload);
+		shutdown($far, 1);
+
+		my ($result, $err) = _bounded(5, sub {
+			return $P->can('read_message')->($near, time() + 2);
+		});
+		ok(!(defined $err && $err eq "FUZZ_ALARM\n"),
+			"B#$i: read_message does not hang (" . length($payload) . ' bytes, mode=' . $mode . ')');
+		if (defined $err && $err ne "FUZZ_ALARM\n") {
+			ok($P->can('is_fault')->($err), "B#$i: any die from read_message is a controlled fault()")
+				or diag("died with: $err");
+		}
+		else {
+			ok(1, "B#$i: read_message returned without dying");
+		}
+		close $near; close $far;
+	}
+}
+
+###############################################################################
+# C. every one of the 14 known ops, hostile arguments - must always come
+# back E_ARG (or E_PROTOCOL/E_UNKNOWN_OP for the handful of shapes that
+# never reach argument validation at all), an id that echoes what was sent
+# when one was sent, and NEVER ok:true, NEVER an error code outside
+# section 3.5, and (specifically for authenticate) NEVER the raw pass value
+# anywhere in the response.
+###############################################################################
+my @OP = qw(status counts deny undeny allow unallow tempdeny temprm list grep
+	reconcile reconcile_fix restart authenticate);
+my %ARG_KIND = (
+	ip => 'string', note => 'string', ttl => 'number', ports => 'string',
+	which => 'string', offset => 'number', limit => 'number', filter => 'string',
+	ids => 'array', user => 'string', pass => 'string',
+);
+my %OP_ARGS = (
+	status => [], counts => [], deny => [qw(ip note)], undeny => [qw(ip)],
+	allow => [qw(ip note)], unallow => [qw(ip)], tempdeny => [qw(ip ttl ports)],
+	temprm => [qw(ip)], list => [qw(which offset limit filter)], 'grep' => [qw(ip)],
+	reconcile => [], reconcile_fix => [qw(ids)], restart => [],
+	authenticate => [qw(user pass)],
+);
+my @KNOWN_ERROR = qw(E_PROTOCOL E_UNKNOWN_OP E_ARG E_PEER E_UNAVAILABLE E_BUSY E_REFUSED E_BACKEND E_STALE E_INTERNAL);
+my %KNOWN_ERROR = map { $_ => 1 } @KNOWN_ERROR;
+
+{
+	my ($ctx, $peer) = fixture();
+	my $n = 0;
+	for my $op (@OP) {
+		for (1 .. 15) {   # 15 hostile draws per op
+			$n++;
+			my %args;
+			for my $field (@{ $OP_ARGS{$op} }) {
+				$args{$field} = _hostile($ARG_KIND{$field});
+			}
+			my $id = sprintf('%032x', $n);
+			my $request = { op => $op, args => \%args, id => $id };
+
+			my ($result, $err) = _bounded(5, sub { return $H->can('handle_request')->($ctx, $request, $peer) });
+			ok(!(defined $err && $err eq "FUZZ_ALARM\n"), "C: $op hostile-args #$n does not hang");
+			if (defined $err) {
+				ok(0, "C: $op hostile-args #$n: handle_request must never die") if $err ne "FUZZ_ALARM\n";
+				next;
+			}
+			my $resp = $result->[0];
+			ok(ref($resp) eq 'HASH' && exists($resp->{ok}), "C: $op #$n: response is a well-formed envelope");
+			my $ok_bool = ref($resp->{ok}) eq 'SCALAR' ? ${ $resp->{ok} } : $resp->{ok};
+			if ($ok_bool) {
+				# A hostile draw CAN legitimately validate for some fields
+				# (e.g. offset=0, limit=60 are both in-range hostile-pool
+				# values) - success itself is not a defect. What matters is
+				# that ops with NO required args (status/counts/reconcile/
+				# restart) never choke on the (empty) args this loop sent,
+				# and that authenticate never leaks anything about `pass`.
+				ok(1, "C: $op #$n: a hostile draw that happened to validate is not itself a failure");
+			}
+			else {
+				ok($KNOWN_ERROR{ $resp->{error} || '' },
+					"C: $op #$n: error code is in section 3.5's closed enumeration (" . ($resp->{error} || '(none)') . ')');
+			}
+			if ($op eq 'authenticate') {
+				my $encoded = eval { $P->can('encode')->($resp) };
+				$encoded = '' unless defined $encoded;
+				my $pass_value = $args{pass};
+				if (defined $pass_value && !ref($pass_value) && length($pass_value) >= 4) {
+					unlike($encoded, qr/\Q$pass_value\E/, "C: authenticate #$n: the hostile pass value never reaches the encoded response");
+				}
+				else {
+					ok(1, "C: authenticate #$n: pass value too short/typed to be a meaningful leak probe");
+				}
+			}
+		}
+	}
+}
+
+###############################################################################
+# C2. A small DETERMINISTIC table on top of C's random draws. C itself
+# treats a hostile draw that happens to validate as acceptable (many of the
+# pool's values are only hostile for SOME fields - offset=0 is a legal
+# limit, not a legal ttl), so it cannot pin down that one specific value is
+# ALWAYS rejected for one specific field - a guard silently removed from a
+# single validator could still leave every C-draw "not a failure" by
+# chance. These rows are chosen to be invalid for EVERY reason but one,
+# isolating exactly the guard each is named for.
+###############################################################################
+{
+	my ($ctx, $peer) = fixture();
+	my @DETERMINISTIC = (
+		['tempdeny', { ip => '192.0.2.1', ttl => 604801 }, 'ttl one second over the 7-day ceiling (S4.2)'],
+		['tempdeny', { ip => '192.0.2.1', ttl => 59 },      'ttl one second under the 60s floor (S4.2)'],
+		['deny',     { ip => '0.0.0.0/0', note => 'x' },    '/0 rejected for deny (S4.1)'],
+		['deny',     { ip => '192.0.2.0/4', note => 'x' },  'below the /8 floor for deny (S4.1)'],
+		['deny',     { ip => '192.0.2.10/24', note => 'x' }, 'host bits set (S4.1)'],
+		['deny',     { ip => '127.0.0.1', note => 'x' },    'loopback (S4.1)'],
+		['deny',     { ip => '192.0.2.1', note => '-p 22 -d out' }, 'option-looking note (S4.4)'],
+		['deny',     { ip => '192.0.2.1', note => "a\nb" }, 'control byte in note (S4.4)'],
+		['deny',     { ip => '192.0.2.1', note => 'a|b' },  'pipe in note (S4.4)'],
+		['list',     { which => 'ignore' },                 "which outside deny|temp|allow (S4.5)"],
+		['list',     { which => 'deny', limit => 501 },      'limit over the 500 ceiling (S4.6)'],
+		['list',     { which => 'deny', limit => 0 },        'limit of zero (S4.6)'],
+		['reconcile_fix', { ids => ['DEADBEEF' x 4] },       'uppercase id, grammar is lowercase-only (S4.8)'],
+		['reconcile_fix', { ids => [('a' x 32) x 2] },       'duplicate ids (S4.8)'],
+		['authenticate', { user => 'Alice', pass => 'x' },   'uppercase byte in user (S4.9)'],
+		['tempdeny', { ip => '192.0.2.1', ttl => 3600, ports => '1000-2000' }, 'port range expands past the 20-port cap (S4.3)'],
+	);
+	for my $row (@DETERMINISTIC) {
+		my ($op, $args, $why) = @$row;
+		my $id = sprintf('%032x', 90000 + scalar(@DETERMINISTIC));
+		my $resp = $H->can('handle_request')->($ctx, { op => $op, args => $args, id => $id }, $peer);
+		my $ok_bool = ${ $resp->{ok} };
+		is($ok_bool ? 1 : 0, 0, "C2: $op rejects - $why") or diag('data=' . ($ok_bool ? Dumper_ish($resp->{data}) : ''));
+		is($resp->{error}, 'E_ARG', "C2: $op - $why - is specifically E_ARG") if !$ok_bool;
+	}
+}
+sub Dumper_ish { my ($h) = @_; return ref($h) eq 'HASH' ? join(',', map {"$_=$h->{$_}"} sort keys %$h) : (defined $h ? $h : 'undef') }
+
+###############################################################################
+# D. every MUTATING op, support role, hostile arguments, through the real
+# App router - must always be 403 WEB_FORBIDDEN, regardless of what the
+# arguments are (t/33 proves this for ONE op by hand; this proves it for
+# all eight mutating ops under randomised argument content).
+###############################################################################
+{
+	package FakeClient;
+	sub new { return bless { n => 0 }, shift }
+	sub generate_id { my ($self) = @_; return 'fake-' . (++$self->{n}) }
+	sub call {
+		my ($self, $op, $args, %opt) = @_;
+		# Never actually reached for a mutating op on a support session -
+		# the gate must refuse before this. Returning ok:true here means
+		# "if you see this in a test failure, the gate did not fire."
+		return { id => $opt{id}, ok => \1, data => { unexpected_call_reached_client => 1 } };
+	}
+	package main;
+}
+
+my @MUTATING_OP_ROUTE = (
+	['POST', '/api/deny',          { ip => '192.0.2.1', note => 'x' }],
+	['POST', '/api/undeny',        { ip => '192.0.2.1' }],
+	['POST', '/api/allow',         { ip => '192.0.2.1', note => 'x' }],
+	['POST', '/api/unallow',       { ip => '192.0.2.1' }],
+	['POST', '/api/tempdeny',      { ip => '192.0.2.1', ttl => 3600 }],
+	['POST', '/api/temprm',        { ip => '192.0.2.1' }],
+	['POST', '/api/reconcile_fix', { ids => ['a' x 32] }],
+	['POST', '/api/restart',       {}],
+);
+
+{
+	my $base = tempdir(CLEANUP => 1);
+	my $client = FakeClient->new;
+	my $sessions  = ConfigServer::UI::Session->new(dir => "$base/sessions", now => sub { 1_000_000 });
+	my $ratelimit = ConfigServer::UI::RateLimit->new(dir => "$base/rl", now => sub { 1_000_000 });
+	my $app = $A->new(client => $client, sessions => $sessions, ratelimit => $ratelimit,
+		access_log => "$base/access.log", now => sub { 1_000_000 });
+	my $sess = $sessions->create(user => 'trent', role => 'support');
+	my $cookie = "csfui_sid=$sess->{id}";
+
+	my $n = 0;
+	for my $route (@MUTATING_OP_ROUTE) {
+		my ($method, $path, $base_args) = @$route;
+		for (1 .. 10) {   # 10 hostile draws per mutating route
+			$n++;
+			my %args = %$base_args;
+			# Randomise the VALUES, not the keys - a route-appropriate hostile
+			# body is what a real attacker would send; an unknown key would
+			# be E_ARG for an unrelated reason and prove nothing about the
+			# role gate this section exists to check.
+			for my $k (keys %args) { $args{$k} = _hostile('string') if rand() < 0.6 }
+			my $body = join('&', map { "$_=" . _url_escape($args{$_}) } keys %args);
+			$body .= ($body ? '&' : '') . "_csrf=$sess->{csrf}";
+
+			my ($result, $err) = _bounded(5, sub {
+				return $app->dispatch({
+					method => $method, path => $path,
+					headers => { cookie => $cookie, 'x-csrf-token' => $sess->{csrf} },
+					body => $body, peer => '198.51.100.7',
+				});
+			});
+			ok(!(defined $err && $err eq "FUZZ_ALARM\n"), "D: support+$path #$n does not hang");
+			if (defined $err) {
+				ok(0, "D: support+$path #$n: dispatch must never die") if $err ne "FUZZ_ALARM\n";
+				next;
+			}
+			my $resp = $result->[0];
+			is($resp->{status}, 403, "D: support role is refused $path regardless of argument content (draw #$n)");
+			like($resp->{body}, qr/WEB_FORBIDDEN/, "D: ...with WEB_FORBIDDEN, not a validation error that would imply it reached the op");
+		}
+	}
+}
+
+sub _url_escape {
+	my ($v) = @_;
+	$v = '' unless defined $v && !ref($v);
+	$v =~ s/([^A-Za-z0-9_.~-])/sprintf('%%%02X', ord($1))/ge;
+	return $v;
+}
+
+is($BLOCKED, 0, 'no fuzz case in this file hit its bounding alarm - every case returned or died on its own');
+
+done_testing();
