@@ -437,6 +437,22 @@ sub _verify_unit {
 	return (1, $output) if $rc == 0;
 
 	my @unexplained;
+	# Fix round 2, I4 (reviewer's own "shape 8 - silence read as
+	# agreement"): an allowlist over an external tool's OWN OUTPUT LINES
+	# passes vacuously when that tool prints no lines at all - measured
+	# with stub binaries standing in for systemd-analyze: exiting 1 with
+	# nothing printed, or exiting 127 (not found) with nothing printed,
+	# both produced an EMPTY @unexplained and a pass, indistinguishable
+	# from "verified clean". That includes this very function's own
+	# POSIX::_exit(126) exec-failure path a few lines up - a systemd-analyze
+	# that could not even be exec'd would have passed too. The harness was
+	# never dead (this sub returns and the surrounding ok() prints), what
+	# died was the judged subsystem, silently, which is why this is shape 8
+	# and not shape 2 from the task brief's own catalogue. A nonzero exit
+	# with nothing to explain it is now its own unexplained line.
+	push @unexplained, "systemd-analyze exited $rc with no output at all - "
+		. 'a crashed or missing tool must not be indistinguishable from "nothing to complain about"'
+		if $output !~ /\S/;
 	for my $line (split /\n/, $output) {
 		next if $line eq '';
 		# The one carved-out diagnostic, tied to the unit's OWN name so a
@@ -460,7 +476,7 @@ SKIP: {
 	for my $name (sort keys %UNIT) {
 		my ($ok, $output) = _verify_unit($UNIT{$name});
 		ok($ok, "systemd-analyze verify accepts $name (syntax), or explains a not-yet-installed ExecStart target as the only reason it did not")
-			or diag("systemd-analyze verify $UNIT{$name}:\n$output");
+			or diag("systemd-analyze verify $UNIT{$name}:\n" . (length($output) ? $output : '(no output at all)'));
 		if ($ok && $output =~ /is not executable: No such file or directory/) {
 			diag("$name: ExecStart's target is not installed on this host (expected in a dev workspace) - "
 				. "syntax and every other check still passed; not a failure of the unit file itself");
