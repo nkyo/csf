@@ -210,6 +210,17 @@ note "   scoped to Perl and shell files - see the header comment for why"
 # a perl shebang, and .sh keeps the gate pointed at the surface it exists
 # to guard - every file that could actually reach a shell - instead of
 # drowning real findings in noise from files that cannot.
+#
+# WHAT THIS LEAVES OPEN FOR TASK 11 (named so it is a decision on record,
+# not a gap someone has to rediscover): ui-src/web/*.html has NO automated
+# net from this gate, for anything - not because HTML is unimportant, but
+# because backtick/qx/system-string/eval-string are not the risk that tree
+# carries. Task 11 removes jQuery/Chosen/Fugue from it; if that removal
+# wants a CI-enforced "these strings must not reappear" check, that is a
+# DIFFERENT, TARGETED grep (e.g. for the literal strings `jquery`,
+# `chosen.jquery`, `fugue` - not this gate's four patterns), and the
+# straightforward place for it is a fifth gate here, or a check of its own
+# next to this one. This gate is not that check and was never meant to be.
 > "$WORKDIR/uisrcfiles"
 find ui-src -type f | sort > "$WORKDIR/uisrcfiles.all"
 while IFS= read -r f; do
