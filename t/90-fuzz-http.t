@@ -157,20 +157,37 @@ sub _mutate_once {
 	return $s;
 }
 
-# Every generator returns (data, must_reject). must_reject is TRUE only when
-# the generator itself guarantees the bytes exceed a frozen, checkable cap
-# ($MAX_HEADERS, $MAX_REQUEST_LINE, $MAX_HEADER_BYTES, $MAX_BODY_BYTES) - the
-# one place a fuzz case can assert MORE than "did not crash or hang" without
-# reasoning about arbitrary random content. This is what makes the generator
-# bite a guard that was silently removed, rather than shape #5 from the task
-# brief: a case that would pass whether or not the guard exists, because the
-# only thing checked was "well-formed or a fault", and oversize input from a
-# GENERIC generator can legitimately land on either side of that by chance.
+# Every generator returns (data, expected_status). expected_status is
+# defined only when the generator itself guarantees the bytes exceed a
+# frozen, checkable cap ($MAX_HEADERS, $MAX_REQUEST_LINE, $MAX_HEADER_BYTES,
+# $MAX_BODY_BYTES) - the one place a fuzz case can assert MORE than "did not
+# crash or hang" without reasoning about arbitrary random content, and it is
+# the SPECIFIC status HTTP.pm's own source documents for that cap (414 for
+# $MAX_REQUEST_LINE, 431 for $MAX_HEADER_BYTES and $MAX_HEADERS, 413 for
+# $MAX_BODY_BYTES) - not merely "some 4xx".
+#
+# Fix round 2, I1: a boolean "must_reject, any 4xx will do" is vacuous for
+# three of these four caps. $MAX_REQUEST_LINE and $MAX_HEADER_BYTES share
+# ONE enforcement site (_read_line()'s single `length($$bufref) >= $max`
+# check) - disable it and the oversize read instead asks sysread() for
+# `$max - length($buffer)` bytes, which is 0 once the buffer is already at
+# $max; a 0-byte sysread() reads as EOF, and EOF is ALSO a 4xx (400) at
+# _read_line()'s own eof branch. $MAX_BODY_BYTES's fault(413, ...) disabled
+# the same way still leaves _read_body() to hit its own read timeout/EOF,
+# also a 4xx. Measured: with each of those three guards disabled in turn,
+# every case that was supposed to prove it still produced SOME 4xx and the
+# suite stayed fully green at both seeds this report cites - a rejection
+# for the wrong reason, satisfying a check that only asked "any 4xx". Only
+# $MAX_HEADERS's own fault(431, ...) at HTTP.pm's `_read_headers()` has no
+# such fallback path, which is exactly why it was the one cap the boolean
+# version actually caught (by accident, not by design). Asserting the
+# specific status is what makes every one of the four caps load-bearing
+# rather than three vacuous placeholders and one lucky one.
 sub _mutated_corpus_case {
 	my $s = $CORPUS[int(rand(scalar @CORPUS))];
 	my $rounds = 1 + int(rand(12));
 	$s = _mutate_once($s) for (1 .. $rounds);
-	return ($s, 0);
+	return ($s, undef);
 }
 
 # _rand_garbage() can itself place a bare \r or \n (it is in the weighted
@@ -184,14 +201,46 @@ sub _mutated_corpus_case {
 # has to rule out, not merely avoid by luck. So this generator's garbage
 # excludes \r and \n specifically: every other hostile byte (NUL, other
 # control bytes, colons, high bytes) is still in play.
-sub _rand_header_garbage {
+# Fix round 2, I1: excluding \r/\n was not enough on its own. A NUL byte
+# (0x00) was still reachable through the "other control bytes" branch below
+# and _clean_line() rejects ANY NUL with its own 400 before _read_headers()
+# ever counts a header - measured: at both seeds this report cites, several
+# of the "n > MAX_HEADERS" cases faulted 400 "the line contains a NUL byte"
+# instead of 431, satisfying the OLD "any 4xx" check while proving nothing
+# about $MAX_HEADERS. \r, \n and NUL are now all remapped to a space.
+sub _rand_header_value_garbage {
 	my ($n) = @_;
 	my $out = '';
 	for (1 .. $n) {
 		my $r = rand();
 		if ($r < 0.75) { $out .= chr(32 + int(rand(95))) }
-		elsif ($r < 0.90) { my $c = int(rand(32)); $c = 32 if $c == 13 || $c == 10; $out .= chr($c) }
+		elsif ($r < 0.90) {
+			my $c = int(rand(32));
+			$c = 32 if $c == 13 || $c == 10 || $c == 0;
+			$out .= chr($c);
+		}
 		else { $out .= chr(127 + int(rand(129))) }
+	}
+	return $out;
+}
+
+# A header NAME has a stricter rule than a value: _parse_header_line()
+# rejects the WHOLE line (400, not 431) if the name contains a space or a
+# tab ANYWHERE, not only a trailing one, and a colon inside the name would
+# move index($line, ':') to a different place than the literal ': '
+# separator _header_flood_case() below writes, splitting the line
+# differently than intended either way. Measured, same two seeds: this was
+# the larger source of 400-instead-of-431 mismatches, because
+# _rand_header_value_garbage() (used for BOTH name and value before this
+# fix) puts a space in roughly 1 byte in 3. Printable ASCII minus space,
+# tab and colon, plus the occasional high byte, cannot trigger either
+# rejection.
+sub _rand_header_name_garbage {
+	my ($n) = @_;
+	my @safe = grep { $_ != 32 && $_ != 9 && $_ != 58 } (33 .. 126);
+	my $out = '';
+	for (1 .. $n) {
+		$out .= (rand() < 0.85) ? chr($safe[int(rand(scalar @safe))]) : chr(127 + int(rand(129)));
 	}
 	return $out;
 }
@@ -200,26 +249,26 @@ sub _header_flood_case {
 	my $n = 10 + int(rand(300));   # deliberately spans below and well above MAX_HEADERS (64)
 	my $data = "GET / HTTP/1.1\r\n";
 	for (1 .. $n) {
-		$data .= _rand_header_garbage(1 + int(rand(6))) . ': ' . _rand_header_garbage(int(rand(40))) . "\r\n";
+		$data .= _rand_header_name_garbage(1 + int(rand(6))) . ': ' . _rand_header_value_garbage(int(rand(40))) . "\r\n";
 	}
 	$data .= "\r\n";
-	return ($data, $n > $ConfigServer::UI::HTTP::MAX_HEADERS ? 1 : 0);
+	return ($data, $n > $ConfigServer::UI::HTTP::MAX_HEADERS ? 431 : undef);
 }
 
 sub _oversize_case {
 	my $which = int(rand(3));
 	if ($which == 0) {   # oversize request line - CAP+1 as a floor, never just "large"
 		my $len = $ConfigServer::UI::HTTP::MAX_REQUEST_LINE + 1 + int(rand($ConfigServer::UI::HTTP::MAX_REQUEST_LINE));
-		return ('GET /' . ('a' x $len) . " HTTP/1.1\r\n\r\n", 1);
+		return ('GET /' . ('a' x $len) . " HTTP/1.1\r\n\r\n", 414);
 	}
 	elsif ($which == 1) { # oversize single header value - same floor
 		my $len = $ConfigServer::UI::HTTP::MAX_HEADER_BYTES + 1 + int(rand($ConfigServer::UI::HTTP::MAX_HEADER_BYTES));
-		return ("GET / HTTP/1.1\r\nX-Big: " . ('b' x $len) . "\r\n\r\n", 1);
+		return ("GET / HTTP/1.1\r\nX-Big: " . ('b' x $len) . "\r\n\r\n", 431);
 	}
 	else {                 # Content-Length claims more than MAX_BODY_BYTES allows
 		my $claim = $ConfigServer::UI::HTTP::MAX_BODY_BYTES + 1 + int(rand(1_000_000));
 		my $body = 'x' x (10 + int(rand(200)));   # far less than claimed - must not block waiting for the rest
-		return ("POST / HTTP/1.1\r\nContent-Length: $claim\r\n\r\n$body", 1);
+		return ("POST / HTTP/1.1\r\nContent-Length: $claim\r\n\r\n$body", 413);
 	}
 }
 
@@ -234,11 +283,11 @@ sub _encoding_abuse_case {
 		$k =~ s/[=&\r\n]/_/g;
 		"$k=" . $piece[int(rand(scalar @piece))];
 	} (1 .. 1 + int(rand(6))));
-	return ("GET $path?$q HTTP/1.1\r\nHost: x\r\n\r\n", 0);
+	return ("GET $path?$q HTTP/1.1\r\nHost: x\r\n\r\n", undef);
 }
 
 sub _random_bytes_case {
-	return (_rand_bytes(int(rand(4096))), 0);
+	return (_rand_bytes(int(rand(4096))), undef);
 }
 
 my @STRATEGY = (\&_mutated_corpus_case, \&_header_flood_case, \&_oversize_case,
@@ -264,7 +313,7 @@ sub _handle_for {
 }
 
 sub _check_read_request_case {
-	my ($data, $label, $must_reject) = @_;
+	my ($data, $label, $expected_status) = @_;
 	my $fh = _handle_for($data);
 	my ($result, $blocked_err) = _bounded(5, sub {
 		return $H->can('read_request')->($fh, header_timeout => 2, body_timeout => 2);
@@ -285,14 +334,28 @@ sub _check_read_request_case {
 		ok($is_fault && $blocked_err->{status} >= 400 && $blocked_err->{status} <= 499,
 			"$label: a fault's status is always 4xx")
 			or diag('status=' . ($is_fault ? $blocked_err->{status} : '(not a fault)'));
+		if (defined $expected_status) {
+			# Fix round 2, I1: NOT "any 4xx will do". A generator that
+			# guarantees a specific cap was exceeded must see the SPECIFIC
+			# status HTTP.pm's own source documents for that cap - a 400
+			# from an unrelated code path (e.g. a 0-byte sysread() reading
+			# as EOF once the real over-length check is gone) satisfied the
+			# old "any 4xx" assertion and proved nothing about the cap this
+			# case exists to check.
+			is($is_fault ? $blocked_err->{status} : undef, $expected_status,
+				"$label: ...and it is specifically $expected_status, not merely some 4xx")
+				or diag('message=' . ($is_fault ? $blocked_err->{message} : '(not a fault)'));
+		}
 	}
 	elsif (!defined $blocked_err) {
 		my $req = $result->[0];
-		if ($must_reject) {
+		if (defined $expected_status) {
 			# The generator guaranteed this input exceeds a frozen cap - a
 			# clean parse here means the cap stopped being enforced.
-			ok(0, "$label: a case guaranteed to exceed a frozen cap must fault, not parse cleanly")
+			ok(0, "$label: a case guaranteed to exceed a frozen cap must fault ($expected_status), not parse cleanly")
 				or diag('req=' . (defined $req ? Dumper_lite($req) : 'undef'));
+			ok(0, "$label: ...and it is specifically $expected_status, not merely some 4xx")
+				or diag('(no fault at all was raised)');
 		}
 		else {
 			# Either undef (clean "nothing more to read") or a well-formed hashref.
@@ -324,8 +387,8 @@ sub Dumper_lite {
 ###############################################################################
 my $N_DIRECT = 300;
 for my $i (1 .. $N_DIRECT) {
-	my ($data, $must_reject) = _generate_case();
-	_check_read_request_case($data, "direct #$i", $must_reject);
+	my ($data, $expected_status) = _generate_case();
+	_check_read_request_case($data, "direct #$i", $expected_status);
 }
 
 ###############################################################################
@@ -348,20 +411,31 @@ my $clean_flood = "GET / HTTP/1.1\r\n";
 $clean_flood .= "X-H$_: v\r\n" for (1 .. 100);
 $clean_flood .= "\r\n";
 
+# A clean, deterministic request line one byte over $MAX_REQUEST_LINE and a
+# clean, deterministic header value one byte over $MAX_HEADER_BYTES -
+# fix round 2, I1's other two named anchors, matching the 100-header one
+# already here: ASCII-only, no randomness, so each pins its own specific
+# cap (414, 431) down on its own rather than relying on the random
+# _oversize_case generator alone to draw one.
+my $clean_long_line = 'GET /' . ('a' x ($ConfigServer::UI::HTTP::MAX_REQUEST_LINE + 1)) . " HTTP/1.1\r\n\r\n";
+my $clean_long_header = "GET / HTTP/1.1\r\nX-Big: " . ('b' x ($ConfigServer::UI::HTTP::MAX_HEADER_BYTES + 1)) . "\r\n\r\n";
+
 my @NAMED = (
-	['empty input',                          '',                                                   0],
-	['a single NUL byte',                    "\0",                                                 0],
-	['request line with embedded NUL',       "GET /\0x HTTP/1.1\r\n\r\n",                          0],
-	['header name with no colon at all',     "GET / HTTP/1.1\r\nJustAWord\r\n\r\n",                0],
-	['a body-less POST that claims a body',  "POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\n",       0],
-	['CRLF.CRLF storm in place of headers',  "GET / HTTP/1.1\r\n" . ("\r\n" x 500),                0],
-	['one line, no CRLF anywhere',           'GET / HTTP/1.1',                                     0],
-	['request line only NULs',               "\0" x 200,                                           0],
-	['100 clean headers, over MAX_HEADERS',  $clean_flood,                                         1],
+	['empty input',                          '',                                                   undef],
+	['a single NUL byte',                    "\0",                                                 undef],
+	['request line with embedded NUL',       "GET /\0x HTTP/1.1\r\n\r\n",                          undef],
+	['header name with no colon at all',     "GET / HTTP/1.1\r\nJustAWord\r\n\r\n",                undef],
+	['a body-less POST that claims a body',  "POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\n",       undef],
+	['CRLF.CRLF storm in place of headers',  "GET / HTTP/1.1\r\n" . ("\r\n" x 500),                undef],
+	['one line, no CRLF anywhere',           'GET / HTTP/1.1',                                     undef],
+	['request line only NULs',               "\0" x 200,                                           undef],
+	['100 clean headers, over MAX_HEADERS',  $clean_flood,                                         431],
+	['request line one byte over MAX_REQUEST_LINE', $clean_long_line,                              414],
+	['header value one byte over MAX_HEADER_BYTES', $clean_long_header,                             431],
 );
 for my $case (@NAMED) {
-	my ($label, $data, $must_reject) = @$case;
-	_check_read_request_case($data, "named: $label", $must_reject);
+	my ($label, $data, $expected_status) = @$case;
+	_check_read_request_case($data, "named: $label", $expected_status);
 }
 
 ###############################################################################
@@ -389,7 +463,7 @@ sub _pair {
 
 my $N_PIPELINE = 50;
 for my $i (1 .. $N_PIPELINE) {
-	my ($data, $must_reject) = _generate_case();
+	my ($data, $expected_status) = _generate_case();
 	my ($near, $far) = _pair();
 	syswrite($far, $data);
 	# Half-close $far's write side only (SHUT_WR=1): $near sees EOF right
@@ -413,15 +487,18 @@ for my $i (1 .. $N_PIPELINE) {
 		or diag("escaped with: " . (defined $blocked_err ? $blocked_err : ''));
 	close $near;   # response already sitting in the socketpair's kernel buffer for $far to read
 
-	if ($must_reject) {
+	if (defined $expected_status) {
 		my ($out) = _bounded(5, sub {
 			local $/;
 			my $text = <$far>;
 			return defined $text ? $text : '';
 		});
 		my $response_text = defined $out ? $out->[0] : '';
-		like($response_text, qr{\AHTTP/1\.[01] 4\d\d},
-			"pipeline #$i: a case guaranteed to exceed a frozen cap gets a 4xx over the wire, not 200")
+		# Fix round 2, I1: the specific status, not "some 4xx" - see
+		# _check_read_request_case()'s own header comment for why "any
+		# 4xx" was satisfied by a rejection for the wrong reason.
+		like($response_text, qr{\AHTTP/1\.[01] $expected_status\b},
+			"pipeline #$i: a case guaranteed to exceed a frozen cap gets $expected_status over the wire, not 200 or some other 4xx")
 			or diag('response(80)=' . substr((defined $response_text ? $response_text : ''), 0, 80));
 	}
 	close $far;
