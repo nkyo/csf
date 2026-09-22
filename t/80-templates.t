@@ -66,7 +66,32 @@ sub render {
 	my $dir = tempdir(CLEANUP => 1);
 	my $out = "$dir/rendered.conf";
 	my @cmd = ('sh', $RENDERER, $template, $out, @kv);
-	system(@cmd);
+	# Fix round 3: bounded. render-template.sh is `sh`+`sed` only and has
+	# never been observed to hang, but this function is called dozens of
+	# times across this file and an unbounded system() here is shape #4
+	# from the task brief (a hang with zero "not ok" lines) waiting for a
+	# future change to render-template.sh to trigger it - the same
+	# reasoning R107's sweep already applied to this file's csf-ui block
+	# just below. A signal that fires while system() is blocked in its own
+	# waitpid() propagates out through the die; the child is `sh` running
+	# `sed`, not a daemon, so a genuine hang here would already be a defect
+	# in the renderer worth surfacing loudly rather than quietly outliving
+	# this test process.
+	my $timed_out = 0;
+	eval {
+		local $SIG{ALRM} = sub { die "RENDER_ALARM\n" };
+		alarm(15);
+		system(@cmd);
+		alarm(0);
+	};
+	if ($@) {
+		$timed_out = ($@ eq "RENDER_ALARM\n") ? 1 : 0;
+		die $@ unless $timed_out;
+	}
+	if ($timed_out) {
+		diag("render(): render-template.sh did not return within 15s for $template - treating as failed rather than hanging this file");
+		return (-1, undef);
+	}
 	my $rc = $? == -1 ? -1 : ($? >> 8);
 	return ($rc, undef) unless -f $out;
 	open(my $fh, '<', $out) or return ($rc, undef);
@@ -428,8 +453,32 @@ sub _verify_unit {
 		open(STDERR, '>&', STDOUT) or POSIX::_exit(125);
 		exec('systemd-analyze', 'verify', $path) or POSIX::_exit(126);
 	}
+	# Fix round 3: bounded. A hanging systemd-analyze (or a hanging exec of
+	# it) would otherwise hang this WHOLE FILE reading to EOF with zero
+	# "not ok" lines - shape #4 from the task brief, in the very function
+	# this round's own I4 fix touched. Timeout treated as a genuine failure
+	# (not silently skipped), so an actually-hung systemd-analyze is a red
+	# test naming what happened, not a wedged prove process someone has to
+	# diagnose from the outside.
 	local $/;
-	my $output = <$fh>;
+	my $output;
+	my $timed_out = 0;
+	eval {
+		local $SIG{ALRM} = sub { die "VERIFY_ALARM\n" };
+		alarm(15);
+		$output = <$fh>;
+		alarm(0);
+	};
+	if ($@) {
+		$timed_out = ($@ eq "VERIFY_ALARM\n") ? 1 : 0;
+		die $@ unless $timed_out;
+	}
+	if ($timed_out) {
+		kill 'KILL', $pid;
+		waitpid($pid, 0);
+		close $fh;
+		return (0, "systemd-analyze verify $path did not return within 15s - treated as a failure, not a hang");
+	}
 	close $fh;
 	my $rc = $?;
 	$output = '' unless defined $output;

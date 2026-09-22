@@ -101,7 +101,20 @@ else
 	# No history to diff against (e.g. a shallow or detached checkout) -
 	# the conservative answer is every tracked file, not silence.
 	note "   no merge-base with main/origin/main was reachable - checking every tracked file instead of silently skipping this gate"
-	git ls-files > "$WORKDIR/touched"
+	git ls-files > "$WORKDIR/touched" 2>/dev/null
+	# Fix round 3 (reviewer's own finding, "shape 8 in the gate that exists
+	# to prevent this class"): in a tarball export or a non-repo checkout,
+	# `git ls-files` itself fails (or a genuinely empty repo succeeds with
+	# nothing to print), leaving this file empty - the loop below then
+	# iterates zero times, reports "checked 0 Perl file(s), 0 failed", and
+	# PASSES: exactly the silence this gate's own header promises never to
+	# produce ("every tracked file, not silence"). No merge-base AND
+	# nothing `git ls-files` could name is not "0 files to check" - it is
+	# "this gate could not determine what to check", stated as the failure
+	# of a precondition that it is.
+	if [ ! -s "$WORKDIR/touched" ]; then
+		fail "gate 1 could not determine any file to check: no merge-base with main/origin/main, AND 'git ls-files' named nothing (not a git checkout at all, or a git failure) - this is the gate finding nothing to look at, not zero files needing a look"
+	fi
 fi
 
 PERL_CHECKED=0
