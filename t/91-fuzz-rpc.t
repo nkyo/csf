@@ -297,10 +297,24 @@ sub _write { my ($p, $t) = @_; open(my $fh, '>', $p) or die $!; print $fh $t; cl
 }
 
 ###############################################################################
-# B. oversize lines and the wire cap, at Proto::read_message() over a real
-# socketpair - t/10 proves the boundary by hand; this proves it under
-# random sizes either side of it, and under garbage that never finds a
-# newline at all.
+# B. oversize lines at Proto::read_message() over a real socketpair - t/10
+# proves the boundary by hand; this proves it does not hang and never lets
+# an uncaught die escape it under random sizes either side of the cap, and
+# under garbage that never finds a newline at all.
+#
+# Fix round 2, I3. This random section does NOT, on its own, prove the
+# $MAXLINE cap specifically - disabling read_message()'s own
+# `length($buffer) >= $MAXLINE` check at Proto.pm:210 is behaviourally
+# near-harmless: with it gone, an oversize line's sysread() eventually asks
+# for 0 more bytes, reads that as EOF, and STILL faults E_PROTOCOL - same
+# code, so "any die from read_message is a controlled fault()" stays true
+# whether the explicit check exists or not, which is why the random loop
+# below is a "did not hang, never crashed" proof, not a $MAXLINE proof.
+# What DOES distinguish the two paths is the MESSAGE text
+# ("line exceeds 65536 bytes" vs "end of file before a complete request
+# line") - measured directly against both states of Proto.pm. B2, below,
+# is the deterministic case that checks the message and so actually proves
+# the cap; this random section is left as what it honestly is.
 ###############################################################################
 {
 	my $N = 40;
@@ -338,6 +352,31 @@ sub _write { my ($p, $t) = @_; open(my $fh, '>', $p) or die $!; print $fh $t; cl
 		}
 		close $near; close $far;
 	}
+}
+
+###############################################################################
+# B2. The deterministic case that actually proves $MAXLINE, per the header
+# comment above: a payload with NO newline anywhere in it, one byte over
+# $MAXLINE, so the only way read_message() can finish is via one of its two
+# EOF/cap paths - and their MESSAGES, not merely their error codes, are what
+# tells them apart.
+###############################################################################
+{
+	socketpair(my $near, my $far, Socket::AF_UNIX(), Socket::SOCK_STREAM(), Socket::PF_UNSPEC())
+		or die "socketpair: $!";
+	my $payload = 'x' x ($ConfigServer::UI::Proto::MAXLINE + 1);   # one byte over the cap, no newline anywhere in it
+	syswrite($far, $payload);
+	shutdown($far, 1);
+
+	my ($result, $err) = _bounded(5, sub { return $P->can('read_message')->($near, time() + 2) });
+	ok(!(defined $err && $err eq "FUZZ_ALARM\n"), 'B2: the deterministic over-cap case does not hang');
+	my $is_fault = defined($err) && $err ne "FUZZ_ALARM\n" && $P->can('is_fault')->($err);
+	ok($is_fault, 'B2: ...and faults, rather than parsing 65537 newline-free bytes as a request')
+		or diag(defined $err ? "err=$err" : 'no fault was raised at all');
+	like($is_fault ? $err->{message} : '', qr/\Qline exceeds\E/,
+		'B2: ...specifically with the $MAXLINE message, not the EOF fallback path\'s - this is what actually distinguishes "the cap fired" from "the read just ran out"')
+		or diag('message=' . ($is_fault ? $err->{message} : '(not a fault)'));
+	close $near; close $far;
 }
 
 ###############################################################################
