@@ -169,14 +169,20 @@ done < "$WORKDIR/shfiles"
 note "   checked $SH_CHECKED shell script(s), $SH_FAILED failed"
 
 ###############################################################################
-# GATE 3 - prove -I. t/, the whole suite.
+# GATE 3 - prove -I. -r t/, the whole suite.
+#
+# Fix round 2, Task 11 minor #1: -r (recurse), not merely `t/`'s own
+# top-level *.t files. Without it a test added in a SUBDIRECTORY of t/ runs
+# fine locally (an ordinary `prove -I. t/some/dir/x.t` finds it) and is
+# simply invisible to this gate - a green CI run proving nothing about a
+# file CI never looked at, which is worse than a red one.
 ###############################################################################
-note "== Gate 3: prove -I. t/ =="
+note "== Gate 3: prove -I. -r t/ =="
 if command -v prove >/dev/null 2>&1; then
-	if prove -I. t/; then
+	if prove -I. -r t/; then
 		:
 	else
-		fail "prove -I. t/ (see the prove output above for which file(s))"
+		fail "prove -I. -r t/ (see the prove output above for which file(s))"
 	fi
 else
 	fail "prove is not installed - cannot run the test suite at all"

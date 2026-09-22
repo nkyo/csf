@@ -92,6 +92,17 @@ sub _bounded {
 sub _write { my ($p, $t) = @_; open(my $fh, '>', $p) or die "write $p: $!"; print $fh $t; close $fh }
 sub _slurp { my ($p) = @_; open(my $fh, '<', $p) or return undef; local $/; return <$fh> }
 
+# Shared by 3c (S2.2, the helper's own peer check) and 4b (S2.4, the mode-A
+# listener's peer check) - both need a SECOND real uid connecting, and
+# computing "can this process become one" twice would drift the two
+# sections' skip reasons apart from each other for no reason.
+sub _can_switch_uid {
+	return (1, 'running as root') if $< == 0 || $> == 0;
+	my ($result, $err) = _bounded(10, sub { return system('sudo', '-n', '-u', 'nobody', 'true') == 0 ? 1 : 0 });
+	return (1, 'passwordless sudo to a second uid is available') if !defined($err) && $result->[0];
+	return (0, 'not root, and sudo -n -u nobody failed - cannot produce a second real uid to connect as');
+}
+
 ###############################################################################
 # SECTION 1 - R101: csf-ui-setup writes ui.conf, and nothing that would let
 # Mode A actually serve a request.
@@ -190,7 +201,7 @@ sub _slurp { my ($p) = @_; open(my $fh, '<', $p) or return undef; local $/; retu
 			. " decision_start=" . (defined $decision_start ? $decision_start : 'undef') . " decision_end=" . (defined $decision_end ? $decision_end : 'undef'));
 
 	SKIP: {
-		skip 'R100 extraction anchors were not found - see the failure above', 3
+		skip 'R100 extraction anchors were not found - see the failure above', 6
 			unless defined($func_start) && defined($func_end) && defined($decision_start) && defined($decision_end);
 
 		my $functions = join('', @lines[$func_start .. $func_end]);
@@ -261,17 +272,93 @@ sub _slurp { my ($p) = @_; open(my $fh, '<', $p) or return undef; local $/; retu
 		like($out, qr/not enabling Apache modules without confirmation/,
 			'R100: and the operator is told nothing was enabled, though ssl demonstrably was - the message denies what the sandbox proves happened')
 			or diag("sandbox output:\n$out");
+
+		###########################################################################
+		# R100's OTHER half - fix round 2, Task 11 minor #4. The a2enmod-
+		# partial-failure path above is only half of R100; the other half is
+		# at install-webui.sh's success path (setup_mode_a(), just after
+		# write_ui_conf()/grant_socket_group()): `clear_modules_enabled_record`
+		# runs UNCONDITIONALLY there, for every front end, not only the one
+		# that might have written the record. A successful NGINX run - nginx
+		# never touches Apache modules at all - deletes a MODULES_RECORD an
+		# EARLIER, unrelated Apache run left behind as R98's own "dead-man's
+		# note" for a crash between record-and-enable. Reproduced here by
+		# anchor-extracting that exact 3-line success snippet (not the whole
+		# function, which also calls the real write_ui_conf()/
+		# grant_socket_group() - stubbed to no-ops in this sandbox, since
+		# exercising THEM is not what this row is about and the real ones
+		# write to /etc/csf-ui) and running it with front=nginx against a
+		# MODULES_RECORD this test seeds itself, standing in for that earlier
+		# Apache run.
+		###########################################################################
+		my ($success_start) = grep { $lines[$_] =~ /^\twrite_ui_conf a "\$port" "\$allow"/ } (0 .. $#lines);
+		my ($success_end)   = grep { $lines[$_] =~ /^\tclear_modules_enabled_record\s*$/ } (0 .. $#lines);
+		ok(defined($success_start) && defined($success_end) && $success_end > $success_start,
+			'R100 (second half): the success-path anchor (write_ui_conf ... clear_modules_enabled_record) was found')
+			or diag("success_start=" . (defined $success_start ? $success_start : 'undef')
+				. " success_end=" . (defined $success_end ? $success_end : 'undef'));
+
+		SKIP: {
+			skip 'R100 (second half) anchors were not found - see the failure above', 2
+				unless defined($success_start) && defined($success_end) && $success_end > $success_start;
+
+			my $success_snippet = join('', @lines[$success_start .. $success_end]);
+			my $sandbox2 = tempdir(CLEANUP => 1);
+			_write("$sandbox2/modules-record", "ssl headers\n");   # the earlier Apache run's own dead-man's note
+
+			my $script2 = "#!/bin/sh\nset -u\n"
+				. "MODULES_RECORD=\"$sandbox2/modules-record\"\n"
+				. "front=nginx\n"                                  # THIS run is nginx - never touched a module
+				. "port=8443\nallow='10.0.0.0/8'\n"
+				. "write_ui_conf() { :; }\n"                       # real one writes to /etc/csf-ui; not what this row tests
+				. "grant_socket_group() { :; }\n"
+				. "clear_modules_enabled_record() { rm -f \"\$MODULES_RECORD\" 2>/dev/null; }\n"
+				. "success_snippet() {\n$success_snippet\n}\n"
+				. "success_snippet\n"
+				. "echo \"RECORD_EXISTS_AFTER=\" \$( [ -f \"$sandbox2/modules-record\" ] && echo yes || echo no )\n";
+			_write("$sandbox2/run2.sh", $script2);
+			chmod 0755, "$sandbox2/run2.sh";
+
+			my ($result2, $err2) = _bounded(10, sub {
+				open(my $fh, '-|', 'bash', "$sandbox2/run2.sh") or die "cannot run sandbox script: $!";
+				binmode($fh);
+				local $/;
+				my $text = <$fh>;
+				close $fh;
+				return $text;
+			});
+			ok(!defined($err2), 'R100 (second half): the sandboxed success-path snippet ran to completion')
+				or diag("error: $err2");
+			my $out2 = (defined $result2 ? $result2->[0] : '') // '';
+			like($out2, qr/RECORD_EXISTS_AFTER=\s*no/,
+				'R100 (second half): a successful NGINX run deletes a MODULES_RECORD it never wrote - '
+				. 'clear_modules_enabled_record() is unconditional on every front end\'s success path, not only Apache\'s')
+				or diag("sandbox output:\n$out2");
+		}
 	}
 
-	# R101's other half, named in the brief: five messages point the
-	# operator at csf-ui-setup to "finish" Mode A. Counted here so a future
-	# edit that adds or removes one of them is a deliberate, reviewed
-	# change rather than something this task's own citation goes stale
-	# against.
+	# R101's other half, named in the brief: five OPERATOR-FACING messages
+	# point at csf-ui-setup to "finish" Mode A. Fix round 2, Task 11 minor
+	# #3: a bare count of the substring "csf-ui-setup" is 9, not 5 - two
+	# `for bin in csf-ui csf-ui-helper csf-ui-passwd csf-ui-setup` install
+	# loops, one `csf-ui-helper|csf-ui-passwd|csf-ui-setup) : ;;` case arm,
+	# and one header comment make up the other four, and a
+	# `cmp_ok(..., '>=', 4)` deleting all FIVE real messages at once - the
+	# exact thing Task 11 will be tempted to do while rewording this file -
+	# would still pass, because "9 mentions minus 5 real ones" is still 4.
+	# Each message asserted by name below instead.
 	my $source = join('', @lines);
-	my @setup_mentions = ($source =~ /csf-ui-setup/g);
-	cmp_ok(scalar(@setup_mentions), '>=', 4,
-		'R101: install-webui.sh points the operator at csf-ui-setup multiple times to finish Mode A setup');
+	my @EXPECTED_MESSAGE = (
+		'csf-ui: when ready, then re-run this installer or run csf-ui-setup:',
+		'csf-ui:   anything else = skip for now (run csf-ui-setup later)',
+		'csf-ui: skipping WebUI setup. Run csf-ui-setup at any time to finish it.',
+		'csf-ui: no address given - leaving the WebUI unconfigured. Run csf-ui-setup later.',
+		q{csf-ui: run 'csf-ui-setup' (or re-run this installer at a terminal) to turn it on.},
+	);
+	for my $message (@EXPECTED_MESSAGE) {
+		like($source, qr/\Q$message\E/,
+			"R101: install-webui.sh still tells the operator: $message");
+	}
 }
 
 ###############################################################################
@@ -426,21 +513,10 @@ sub _stop_daemon {
 # masking each other until the read loop was fixed and this one stopped
 # matching reality. Fixed to assert what section 2.2 actually specifies.
 ###############################################################################
+our ($CAN_SWITCH_UID, $SWITCH_UID_WHY) = _can_switch_uid();
 {
-	my $can_switch_uid = 0;
-	my $why = '';
-	if ($< == 0 || $> == 0) {
-		$can_switch_uid = 1;
-		$why = 'running as root';
-	}
-	else {
-		my ($result, $err) = _bounded(10, sub { return system('sudo', '-n', '-u', 'nobody', 'true') == 0 ? 1 : 0 });
-		if (!defined($err) && $result->[0]) { $can_switch_uid = 1; $why = 'passwordless sudo to a second uid is available' }
-		else { $why = 'not root, and sudo -n -u nobody failed - cannot produce a second real uid to connect as' }
-	}
-
 	SKIP: {
-		skip "3c/3d: wrong-uid peer rejection needs a second real uid ($why)", 4 unless $can_switch_uid;
+		skip "3c/3d: wrong-uid peer rejection needs a second real uid ($SWITCH_UID_WHY)", 4 unless $CAN_SWITCH_UID;
 
 		# Every early exit prints a DISTINCT, greppable marker before it
 		# exits - a socket()/connect() failure must never look identical to
@@ -468,7 +544,7 @@ connect(\$c, Socket::pack_sockaddr_un(\$sock_path)) or do { print \$rf "PROBE_CO
 my \$out = '';
 eval {
 	local \$SIG{ALRM} = sub { die "t\\n" };
-	alarm(5);
+	alarm(10);
 	syswrite(\$c, \$line) or die "write failed: \$!\\n";
 	# NOT "1 while sysread(\$c, my \$chunk, 4096) > 0 and (...)" - a 'my'
 	# declared inside a postfix-while's own condition does not carry its
@@ -503,7 +579,7 @@ PERL
 		chmod 0755, $script_path;
 		my $line = $P->can('encode')->({ op => 'status', args => {}, id => '3c3c3c3c3c3c3c3c' });
 
-		my (undef, $err) = _bounded(15, sub {
+		my (undef, $err) = _bounded(20, sub {
 			return system('sudo', '-n', '-u', 'nobody', $^X, $script_path, $HELPER_SOCK, $line);
 		});
 		ok(!defined($err), '3c: the wrong-uid prober process returns rather than hanging') or diag("error: $err");
@@ -570,8 +646,27 @@ ok(1, 'the helper daemon was stopped');
 	my $web_pid = fork();
 	die "fork: $!" unless defined $web_pid;
 	if (!$web_pid) {
+		# admit_peer()'s own _refuse_peer() logs to STDERR (S2.4's own
+		# words: "one line per distinct refused uid goes to stderr") -
+		# captured to a file rather than left to interleave with TAP
+		# output, and surfaced via diag() only when 4b's own assertion
+		# below actually fails.
+		open(STDERR, '>', "$dir2/web-daemon.err") or POSIX::_exit(70);
 		my $server = $S->new(
 			app => $app, ui_conf_path => $web_conf, socket_path => $web_sock,
+			# Fix round 2, Task 11 minor #5: this uid is not a stand-in for
+			# a real peer - admit_peer()'s own peer_uid_allowed() already
+			# admits $self_uid (this process's own uid) unconditionally, so
+			# `$> + 0 => 1` here is redundant with that. What it is NOT
+			# redundant with is run()'s own startup refusal ("no account
+			# other than this one can reach the mode-A socket") at
+			# _no_local_peer_message() - an accepted set naming ONLY self
+			# refuses to start outright (S2.4's own words: "csf-ui refuses
+			# to start in mode A when the accepted set names nobody but
+			# itself"). A second, fictitious uid that is never actually
+			# used to connect (same device t/42-listen-loop.t's own daemon
+			# fixture uses, for the same reason) is what lets this section
+			# get past that refusal without a real second host account.
 			peer_uids => { $> + 0 => 1, 4294967294 => 1 },
 			header_timeout => 5, body_timeout => 5, write_timeout => 5, dispatch_timeout => 5,
 		);
@@ -612,6 +707,74 @@ ok(1, 'the helper daemon was stopped');
 		or diag("response(200)=" . substr($out, 0, 200));
 	like($out, qr/"role":"admin"/, 'section 4: ...carrying the role the real helper answered with, from a real crypt() verify')
 		or diag("response(300)=" . substr($out, 0, 300));
+
+	###########################################################################
+	# 4b. Fix round 2, Task 11 minor #5: S2.4's OWN peer check, on the
+	# mode-A LISTENER's socket - the whole point of this listener, and
+	# previously untested by anything in this file. Row 3c already proves
+	# S2.2 (the HELPER's peer check); this is the other one, admit_peer()
+	# in Server.pm, and the two are explicitly NOT the same rule (S2.4:
+	# "the two rules are not the same"). Chief difference proven here: S2.2
+	# answers a wrong uid with a real E_PEER JSON response; S2.4 answers
+	# with NOTHING AT ALL - "The connection is closed before a byte is
+	# read" (S2.4's own words) - so the assertion below is not "empty
+	# JSON", it is zero bytes, full stop.
+	###########################################################################
+	SKIP: {
+		skip "4b: wrong-uid S2.4 rejection needs a second real uid ($SWITCH_UID_WHY)", 3 unless $CAN_SWITCH_UID;
+
+		# The socket's own mode (0660, asserted elsewhere against
+		# $UNIX_SOCKET_MODE) would refuse 'nobody' at the filesystem layer
+		# before admit_peer() is ever reached - which would prove nothing
+		# about admit_peer() itself, only about a mode bit S2.3 already
+		# covers. Loosened here, on this test's own throwaway socket only,
+		# so the REJECTION under test is the application-level one.
+		chmod 0666, $web_sock;
+		chmod 0755, $dir2;
+
+		my $result_path4b = "/tmp/csf-ui-itest-4b-$$-" . int(rand(1_000_000)) . '.out';
+		my $prober4b = <<PERL;
+use Socket ();
+my \$sock_path = shift \@ARGV;
+open(my \$rf, '>', '$result_path4b') or exit 4;
+socket(my \$c, Socket::PF_UNIX(), Socket::SOCK_STREAM(), 0) or do { print \$rf "PROBE_SOCKET_FAILED:\$!"; exit 2 };
+connect(\$c, Socket::pack_sockaddr_un(\$sock_path)) or do { print \$rf "PROBE_CONNECT_FAILED:\$!"; exit 3 };
+my \$out = '';
+eval {
+	local \$SIG{ALRM} = sub { die "t\\n" };
+	alarm(10);
+	syswrite(\$c, "GET /api/status HTTP/1.1\\r\\nHost: x\\r\\nX-Real-IP: 10.0.0.7\\r\\n\\r\\n");
+	while (1) {
+		my \$chunk;
+		my \$n = sysread(\$c, \$chunk, 4096);
+		last unless defined \$n && \$n > 0;
+		\$out .= \$chunk;
+	}
+	alarm(0);
+};
+print \$rf "PROBE_EVAL_DIED:\$@" if \$@ && \$@ ne "t\\n";
+print \$rf \$out;
+close \$rf;
+PERL
+		my $script_path4b = "$dir2/prober4b.pl";
+		_write($script_path4b, $prober4b);
+		chmod 0755, $script_path4b;
+
+		my (undef, $probe_err) = _bounded(20, sub {
+			return system('sudo', '-n', '-u', 'nobody', $^X, $script_path4b, $web_sock);
+		});
+		ok(!defined($probe_err), '4b: the wrong-uid prober process returns rather than hanging') or diag("error: $probe_err");
+		my $out4b = _slurp($result_path4b) // '';
+		system('sudo', '-n', '-u', 'nobody', 'rm', '-f', $result_path4b);
+		unlink $result_path4b;
+
+		unlike($out4b, qr/^PROBE_(SOCKET|CONNECT)_FAILED/,
+			'4b: the prober actually reached connect() as the second uid on the WEB socket')
+			or diag("prober infra failure: $out4b");
+		is($out4b, '', '4b: S2.4 refuses a wrong-uid peer with NOTHING AT ALL - closed before a byte is read, unlike S2.2\'s real E_PEER response')
+			or diag('got: ' . length($out4b) . ' bytes: ' . substr($out4b, 0, 200)
+				. "; web-daemon.err: " . (_slurp("$dir2/web-daemon.err") // '(none)'));
+	}
 
 	kill 'TERM', $web_pid;
 	my (undef, $web_wait_err) = _bounded(10, sub { waitpid($web_pid, 0); return 1 });
