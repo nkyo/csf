@@ -191,10 +191,15 @@ sub _can_switch_uid {
 	while ($func_end < $#lines && $lines[$func_end] !~ /^\}/) { $func_end++ }
 	my ($decision_start) = grep { $lines[$_] =~ /^\tmodules_enabled_this_run=""/ } (0 .. $#lines);
 	my ($decision_end)   = grep { $lines[$_] =~ /^\tfi\n?\z/ && $_ > $decision_start } (0 .. $#lines);
-	# the SECOND top-level "\tfi" after decision_start closes the
-	# "if [ \"\$front\" = \"apache\" ]" block itself, not the inner one -
-	# walk forward from the first candidate to the next line at the same
-	# one-tab indent that is also "fi".
+	# Fix round 2 correction: `my ($decision_end) = grep {...}` takes
+	# grep's FIRST match (list-to-scalar assignment) - there is no walking
+	# forward to a second one here. What makes that first match the right
+	# one is the pattern itself: `^\tfi` is anchored to exactly ONE leading
+	# tab, and the inner "if [ -n \"\$still_missing\" ]; then ... fi" block
+	# is indented with TWO tabs, so its "fi" never matches this regex at
+	# all. The only "fi" this pattern can find, from $decision_start
+	# onward, is the outer one closing "if [ \"\$front\" = \"apache\" ]" -
+	# by exclusion, not by position.
 	ok(defined($func_start) && defined($func_end) && defined($decision_start) && defined($decision_end),
 		'R100: all four anchors were found in the real install-webui.sh (extraction targets a moving file by name, not a frozen line number)')
 		or diag("func_start=" . (defined $func_start ? $func_start : 'undef') . " func_end=" . (defined $func_end ? $func_end : 'undef')

@@ -261,15 +261,22 @@ sub _write { my ($p, $t) = @_; open(my $fh, '>', $p) or die $!; print $fh $t; cl
 
 ###############################################################################
 # A2. The deterministic claim the warning-suppression above rests on: the
-# WORST-CASE nesting depth the frozen 65536-byte wire cap (S3.1) can ever
-# deliver in one line - not a random sample of it. Each nesting level costs
-# 6 bytes ('{"a":' open, '}' close), so the line cap bounds depth to
-# floor((65536-10)/6) = 10921 levels; this builds exactly that many and
-# asserts handle_line() answers it in well under the deadline, with no
-# uncaught die, rather than merely "not the FUZZ_ALARM". If this ever stops
-# holding - a future change makes the decoder materially slower per level,
-# say - this is the one test that reddens, not a warning nobody is
-# watching for in CI's own scrollback.
+# WORST-CASE OBJECT-nesting depth the frozen 65536-byte wire cap (S3.1) can
+# ever deliver in one line - not a random sample of it. Each object nesting
+# level costs 6 bytes ('{"a":' open, '}' close), so the line cap bounds
+# object depth to floor((65536-10)/6) = 10921 levels; this builds exactly
+# that many and asserts handle_line() answers it in well under the
+# deadline, with no uncaught die, rather than merely "not the FUZZ_ALARM".
+#
+# Fix round 2 correction: 10921 is the worst case for OBJECT nesting only,
+# not the wire cap's absolute worst case - ARRAY nesting costs 2 bytes per
+# level ('[' open, ']' close), which the same 65536-byte cap permits up to
+# 32767 levels of. That deeper case was checked too (not merely asserted):
+# decodes safely in well under a second (measured here at ~0.1s), so the safety
+# conclusion below stands for the true worst case, not only the object one
+# this test happens to build. If this ever stops holding - a future change
+# makes the decoder materially slower per level, say - this is the one test
+# that reddens, not a warning nobody is watching for in CI's own scrollback.
 ###############################################################################
 {
 	my ($ctx, $peer) = fixture();
