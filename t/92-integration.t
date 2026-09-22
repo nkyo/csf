@@ -412,6 +412,19 @@ sub _stop_daemon {
 # a SECOND real uid connecting, and root is what makes that possible either
 # way. Recorded rather than silently skipped either way (one of the five
 # shapes this task's own brief warns a hollow skip can take).
+#
+# NOT silent. check_peer()'s own header comment (ui-src/bin/csf-ui-helper,
+# above sub check_peer) is explicit that $silent - "answer nothing at all" -
+# is set on exactly ONE of its four rejection rows: SO_PEERCRED itself
+# failing (the kernel won't vouch for the peer at all). The wrong-uid row
+# and the uid-0 row both return $silent undef, so the helper DOES write a
+# real {"ok":false,"error":"E_PEER",...} response for a wrong-uid peer -
+# rejected, but answered. An earlier draft of this section asserted the
+# wrong thing here (empty output) and that assertion happened to keep
+# passing through a real bug in the read loop below (see the report's
+# fix-round-1 entry) that was silently discarding real bytes - two defects
+# masking each other until the read loop was fixed and this one stopped
+# matching reality. Fixed to assert what section 2.2 actually specifies.
 ###############################################################################
 {
 	my $can_switch_uid = 0;
@@ -427,7 +440,7 @@ sub _stop_daemon {
 	}
 
 	SKIP: {
-		skip "3c/3d: wrong-uid peer rejection needs a second real uid ($why)", 3 unless $can_switch_uid;
+		skip "3c/3d: wrong-uid peer rejection needs a second real uid ($why)", 4 unless $can_switch_uid;
 
 		# Every early exit prints a DISTINCT, greppable marker before it
 		# exits - a socket()/connect() failure must never look identical to
@@ -457,7 +470,23 @@ eval {
 	local \$SIG{ALRM} = sub { die "t\\n" };
 	alarm(5);
 	syswrite(\$c, \$line) or die "write failed: \$!\\n";
-	1 while sysread(\$c, my \$chunk, 4096) > 0 and (\$out .= \$chunk, 1);
+	# NOT "1 while sysread(\$c, my \$chunk, 4096) > 0 and (...)" - a 'my'
+	# declared inside a postfix-while's own condition does not carry its
+	# value into the low-precedence 'and' clause of that SAME condition on
+	# each re-evaluation (reproduced in isolation, minimal case, outside
+	# this file entirely - see the fix-round-1 report). It silently read
+	# real bytes and then silently threw them away: \$out stayed '' even
+	# though sysread() was genuinely returning data, which is exactly what
+	# made an accepted wrong-uid connection look identical to a rejected
+	# one. An explicit while-block with \$chunk declared as its own
+	# statement is the form every other read loop in this file already
+	# uses (see \$wc's read loop below) and does not have this failure mode.
+	while (1) {
+		my \$chunk;
+		my \$n = sysread(\$c, \$chunk, 4096);
+		last unless defined \$n && \$n > 0;
+		\$out .= \$chunk;
+	}
 	alarm(0);
 };
 print \$rf "PROBE_EVAL_DIED:\$@" if \$@ && \$@ ne "t\\n";
@@ -488,8 +517,16 @@ PERL
 		unlike($out, qr/^PROBE_(SOCKET|CONNECT)_FAILED/,
 			'3c: the prober actually reached connect() as the second uid - a sandbox/permission failure here would prove nothing about check_peer()')
 			or diag("prober infra failure: $out");
-		is($out, '', '3c: a peer with the wrong uid gets NOTHING back - section 2.2\'s silent E_PEER close, over a real connection')
+		# section 2.2: the wrong-uid row is a REAL E_PEER response, not a
+		# silent close (only the SO_PEERCRED-unavailable row is silent) -
+		# see the header comment above this section for how this file's
+		# earlier, wrong assertion here (expecting nothing at all) survived
+		# undetected.
+		like($out, qr/"error":"E_PEER"/,
+			'3c: a peer with the wrong uid is answered a real E_PEER rejection over the real socket')
 			or diag("got: " . length($out) . ' bytes: ' . substr($out, 0, 200));
+		unlike($out, qr/"ok":true/,
+			'3c: ...and never ok:true - whatever it is, it is not success');
 	}
 }
 
