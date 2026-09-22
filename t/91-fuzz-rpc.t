@@ -178,17 +178,33 @@ sub _write { my ($p, $t) = @_; open(my $fh, '>', $p) or die $!; print $fh $t; cl
 	# exercise op lookup or argument validation now carries a syntactically
 	# valid id (matching Proto::validate_id's own grammar,
 	# ^[A-Za-z0-9._:-]{1,64}$) so the id check is not what stops it before
-	# it gets there - and a DEDICATED unknown-op generator (with a valid
-	# id) is added so "unknown ops" is a surface this file actually
-	# reaches, not merely names.
+	# it gets there.
+	#
+	# Fix round 3 correction, the review's own measurement confirmed
+	# against this file's own %seen_error diag (below): the generator two
+	# lines down (garbage op, valid id) and the one after it (garbage
+	# args, valid id) do NOT reliably reach op lookup or E_ARG either - a
+	# 200-case run's own diag read "E_PROTOCOL=199, E_UNKNOWN_OP=1" with no
+	# E_ARG line at all, i.e. essentially zero hits from either. Cause:
+	# _rand_garbage() freely emits '"', '\' and control bytes, and most
+	# draws land inside a JSON string (the op name, or somewhere in the
+	# args blob) where those bytes break the JSON syntax itself - so
+	# JSON::Tiny rejects the WHOLE line before handle_request() ever reads
+	# `op` or `args`, and the draw mostly re-covers surface A's own
+	# malformed-JSON case rather than the op-lookup/arg-validation
+	# surfaces the old comment here claimed for it. Kept in the pool
+	# anyway (a decodable-by-chance draw is still a real, if rare, case),
+	# but the actual coverage claim for "unknown ops is reached" has
+	# always rested on the deterministic probe further down (A's own
+	# design, unchanged) - not on either random generator's hit rate.
 	my $rand_id = sub { return sprintf('%016x', int(rand(2**32))) . sprintf('%016x', int(rand(2**32))) };
 
 	my @generators = (
 		sub { return _rand_bytes(int(rand(2000))) },
 		sub { return _rand_garbage(int(rand(500))) },
 		sub { return '{"op":"' . _rand_garbage(int(rand(50))) . '"}' },   # no id at all: E_PROTOCOL before op lookup, on purpose - the "malformed envelope" surface
-		sub { return '{"op":"' . _rand_garbage(int(rand(50))) . '","id":"' . $rand_id->() . '"}' },   # WITH a valid id: reaches op lookup, exercises E_UNKNOWN_OP
-		sub { return '{"op":"deny","args":' . _rand_garbage(int(rand(200))) . ',"id":"' . $rand_id->() . '"}' },
+		sub { return '{"op":"' . _rand_garbage(int(rand(50))) . '","id":"' . $rand_id->() . '"}' },   # a valid id, but _rand_garbage() in the op position usually breaks the JSON itself first - see the correction above
+		sub { return '{"op":"deny","args":' . _rand_garbage(int(rand(200))) . ',"id":"' . $rand_id->() . '"}' },   # same caveat, for E_ARG
 		sub { return '[' . join(',', map { int(rand(1000)) } (1 .. int(rand(20)))) . ']' },   # top-level array, not object
 		sub { return '"just a string"' },
 		sub { return int(rand(100000)) . '' },   # top-level number

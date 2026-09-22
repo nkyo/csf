@@ -252,6 +252,16 @@ sub _header_flood_case {
 		$data .= _rand_header_name_garbage(1 + int(rand(6))) . ': ' . _rand_header_value_garbage(int(rand(40))) . "\r\n";
 	}
 	$data .= "\r\n";
+	# Status 431 alone does not distinguish $MAX_HEADER_BYTES (a too-long
+	# LINE) from $MAX_HEADERS (too many lines) - see the named-anchor block
+	# below, which asserts the message for exactly that reason. Status
+	# alone IS safe here, specifically, because the value length this
+	# generator draws (0-39 bytes, `int(rand(40))` just above) can never
+	# reach $MAX_HEADER_BYTES (8192): this case can only ever be rejected
+	# for its header COUNT, never a header's length. That bound is load-
+	# bearing - widening the value-length draw anywhere near 8192 would
+	# break this assumption silently, which is exactly why it is written
+	# down here rather than left implicit.
 	return ($data, $n > $ConfigServer::UI::HTTP::MAX_HEADERS ? 431 : undef);
 }
 
@@ -313,7 +323,7 @@ sub _handle_for {
 }
 
 sub _check_read_request_case {
-	my ($data, $label, $expected_status) = @_;
+	my ($data, $label, $expected_status, $expected_message_re) = @_;
 	my $fh = _handle_for($data);
 	my ($result, $blocked_err) = _bounded(5, sub {
 		return $H->can('read_request')->($fh, header_timeout => 2, body_timeout => 2);
@@ -345,6 +355,17 @@ sub _check_read_request_case {
 			is($is_fault ? $blocked_err->{status} : undef, $expected_status,
 				"$label: ...and it is specifically $expected_status, not merely some 4xx")
 				or diag('message=' . ($is_fault ? $blocked_err->{message} : '(not a fault)'));
+			if (defined $expected_message_re) {
+				# Fix round 3: status 431 is shared by TWO distinct caps
+				# ($MAX_HEADER_BYTES and $MAX_HEADERS), so status alone is
+				# not a 1:1 discriminator between them - the same rigor I3
+				# applied to $MAXLINE (message, not just code) belongs here
+				# for the deterministic anchors that name one cap
+				# specifically.
+				like($is_fault ? $blocked_err->{message} : '', $expected_message_re,
+					"$label: ...and the message names the specific cap this case is anchoring, not merely a shared status")
+					or diag('message=' . ($is_fault ? $blocked_err->{message} : '(not a fault)'));
+			}
 		}
 	}
 	elsif (!defined $blocked_err) {
@@ -411,14 +432,29 @@ my $clean_flood = "GET / HTTP/1.1\r\n";
 $clean_flood .= "X-H$_: v\r\n" for (1 .. 100);
 $clean_flood .= "\r\n";
 
-# A clean, deterministic request line one byte over $MAX_REQUEST_LINE and a
-# clean, deterministic header value one byte over $MAX_HEADER_BYTES -
-# fix round 2, I1's other two named anchors, matching the 100-header one
+# A clean, deterministic request line one byte over $MAX_REQUEST_LINE, a
+# clean, deterministic header value one byte over $MAX_HEADER_BYTES, and
+# (fix round 3) a clean, deterministic body one byte over $MAX_BODY_BYTES -
+# fix round 2, I1's other named anchors, matching the 100-header one
 # already here: ASCII-only, no randomness, so each pins its own specific
-# cap (414, 431) down on its own rather than relying on the random
-# _oversize_case generator alone to draw one.
+# cap (414, 431, 413) down on its own rather than relying on the random
+# _oversize_case generator alone to draw one. Fix round 3's own review:
+# 413 had no deterministic anchor at all - its proof rested entirely on
+# the random generator, exactly the seed-dependence this round's own I1/I2
+# fixes exist to rule out elsewhere. Closed here.
 my $clean_long_line = 'GET /' . ('a' x ($ConfigServer::UI::HTTP::MAX_REQUEST_LINE + 1)) . " HTTP/1.1\r\n\r\n";
 my $clean_long_header = "GET / HTTP/1.1\r\nX-Big: " . ('b' x ($ConfigServer::UI::HTTP::MAX_HEADER_BYTES + 1)) . "\r\n\r\n";
+my $clean_long_body_claim = $ConfigServer::UI::HTTP::MAX_BODY_BYTES + 1;
+my $clean_long_body = "POST / HTTP/1.1\r\nContent-Length: $clean_long_body_claim\r\n\r\n" . ('x' x 20);
+
+# 431 is shared by TWO distinct caps ($MAX_HEADER_BYTES, a too-long header
+# LINE, and $MAX_HEADERS, too many header lines), so status alone does not
+# 1:1-identify which one fired - fix round 3's own review, echoing I3's
+# earlier "a status can be shared" rigor, which was applied to $MAXLINE but
+# not here. Each 431 anchor below now also asserts the specific MESSAGE
+# HTTP.pm's source gives for ITS cap, not the other one.
+my $MSG_TOO_MANY_HEADERS = qr/more than \Q$ConfigServer::UI::HTTP::MAX_HEADERS\E headers were sent/;
+my $MSG_HEADER_LINE_LONG = qr/a header line is longer than this server accepts/;
 
 my @NAMED = (
 	['empty input',                          '',                                                   undef],
@@ -429,13 +465,14 @@ my @NAMED = (
 	['CRLF.CRLF storm in place of headers',  "GET / HTTP/1.1\r\n" . ("\r\n" x 500),                undef],
 	['one line, no CRLF anywhere',           'GET / HTTP/1.1',                                     undef],
 	['request line only NULs',               "\0" x 200,                                           undef],
-	['100 clean headers, over MAX_HEADERS',  $clean_flood,                                         431],
+	['100 clean headers, over MAX_HEADERS',  $clean_flood,                                         431, $MSG_TOO_MANY_HEADERS],
 	['request line one byte over MAX_REQUEST_LINE', $clean_long_line,                              414],
-	['header value one byte over MAX_HEADER_BYTES', $clean_long_header,                             431],
+	['header value one byte over MAX_HEADER_BYTES', $clean_long_header,                             431, $MSG_HEADER_LINE_LONG],
+	['body one byte over MAX_BODY_BYTES',    $clean_long_body,                                     413],
 );
 for my $case (@NAMED) {
-	my ($label, $data, $expected_status) = @$case;
-	_check_read_request_case($data, "named: $label", $expected_status);
+	my ($label, $data, $expected_status, $expected_message_re) = @$case;
+	_check_read_request_case($data, "named: $label", $expected_status, $expected_message_re);
 }
 
 ###############################################################################
