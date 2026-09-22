@@ -1855,7 +1855,7 @@ sub _no_local_peer_message {
 		$text .= " The search for an account with gid $gid as its PRIMARY group also stopped"
 			. " after the first $MAX_PASSWD_SCAN entries of the local account database without"
 			. ' reaching the end, so such an account may exist and simply was not found.'
-			. " Check with `getent passwd | awk -F: '\$4 == $gid'` before changing anything."
+			. " Check with this before changing anything: getent passwd | awk -F: '\$4 == $gid'"
 			if $report->{scan_truncated};
 		return $text;
 	}
@@ -1870,7 +1870,7 @@ sub _no_local_peer_message {
 		$text .= ", and the search for an account with $name as its PRIMARY group stopped after"
 			. " the first $MAX_PASSWD_SCAN entries of the local account database without"
 			. ' reaching the end - so such an account may exist and simply was not found.'
-			. " Check with `getent passwd | awk -F: '\$4 == $gid'` before changing anything.";
+			. " Check with this before changing anything: getent passwd | awk -F: '\$4 == $gid'";
 		return $text;
 	}
 	if ($report->{scan_ran}) {
