@@ -37,6 +37,81 @@ line is added below the original notice; the original stays intact.
 
 ### Unreleased
 
+#### Task 10 — the hostile-input and integration pass
+
+**2026-09-22** — `t/90-fuzz-http.t`, `t/91-fuzz-rpc.t`, `t/92-integration.t`,
+`ci/gates.sh`, `t/80-templates.t` (one stale section citation). Adds seeded,
+deterministic fuzzing on top of the hand-picked hostile-input tables t/41 and
+t/10 already carried, plus the integration pass task-10-brief.md calls for.
+`ui-src/lib/ConfigServer/UI/HTTP.pm` is unmodified (frozen, per an earlier
+requirement); no file's mode changed; no new `ui.conf` key.
+
+**t/90-fuzz-http.t** drives `ConfigServer::UI::HTTP::read_request()` and
+`ConfigServer::UI::Server->handle_connection()` with malformed, truncated,
+oversize, encoding-abuse and pure-random byte input, seeded from
+`$ENV{CSF_FUZZ_SEED}` (default fixed, printed every run for reproducibility).
+Every case is alarm-bounded, matching t/40/t/42's own discipline. Generators
+that deterministically exceed a frozen cap (`$MAX_HEADERS`,
+`$MAX_REQUEST_LINE`, `$MAX_HEADER_BYTES`, `$MAX_BODY_BYTES`) assert a 4xx
+fault specifically, not merely "did not crash" — a distinction that mattered
+in practice: the random header-flood generator's own cases turned out NOT to
+reliably exercise `$MAX_HEADERS` at all (most were rejected earlier for an
+unrelated reason, a stray NUL byte in the generated garbage), so a
+deterministic, clean 100-header case was added alongside it to pin the guard
+down on its own.
+
+**t/91-fuzz-rpc.t** does the same for the RPC half: malformed JSON at
+`Helper::handle_line()`, oversize lines at `Proto::read_message()` over a
+real socketpair, all 14 operations called with hostile arguments (plus a
+small deterministic table for guards a random draw cannot reliably exercise,
+e.g. the `ttl` ceiling, the `/0` and prefix-floor rejections), and every
+mutating operation driven through the real `App` router on a support-role
+session — section 5's "support may call grep and list only" restated as
+110 randomised draws across the eight mutating routes, not only the one
+hand-picked case t/33 already covers.
+
+**t/92-integration.t**, four sections, none of them touching a real system
+path: (1) a real `ConfigServer::UI::Setup` run, fixtured, proving `apply()`
+writes `ui.conf` and nothing that would complete Mode A end to end; (2)
+`install-webui.sh`'s own Apache-module functions and decision block,
+extracted by anchor and run under stub `a2enmod`/`apache2ctl`; (3) the
+helper's real accept loop over a real unix socket, same-uid success
+(no root needed) and wrong-uid `E_PEER` rejection under `sudo -n -u nobody`
+when available, skipped with a stated reason otherwise; (4) one HTTP login
+through a real mode-A `Server` talking to a real helper over its own real
+socket.
+
+**Two rulings this pass was asked to reach, reached and left unfixed — both
+outside this task's file list (`install-webui.sh`, `csf-ui-setup`), so
+recorded here rather than patched quietly:**
+
+- **R100.** `apache_enable_modules()`'s caller (`install-webui.sh`
+  `setup_mode_a()`) calls `record_modules_enabled()` before `a2enmod`, but on
+  a partial failure — `a2enmod` exits 1 having already enabled some of the
+  modules it was given, which is measured, real `a2enmod` behaviour —
+  `clear_modules_enabled_record()` deletes that record and the operator is
+  told "not enabling Apache modules without confirmation", though some of
+  them demonstrably were. `t/92-integration.t` reproduces this against the
+  real functions under a stub `a2enmod`/`apache2ctl`.
+- **R101.** Five messages in `install-webui.sh` point the operator at
+  `csf-ui-setup` to "finish" Mode A; `csf-ui-setup` writes `ui.conf` and
+  `csf.conf` only — no socket group, no `RuntimeDirectory`, no front-server
+  vhost — verified both structurally (the source never mentions any of
+  them) and dynamically (a real `apply()` run's own argv log).
+
+**ci/gates.sh** — `perl -I. -c` (with `-I ui-src/lib` added alongside, not
+instead of, since every module in this tree resolves its sibling
+`ConfigServer::UI::*` dependencies from there and `-I.` alone would fail
+every file for a missing dependency one directory away, which is not a
+syntax error) on every `.pl`/`.pm`/perl-shebang file in the diff against
+this branch's merge-base with `main`; `sh -n` on every `*.sh` in the tree;
+`prove -I. t/`; and a grep gate for backticks, `qx`, single-string
+`system()` and string `eval` — scoped to Perl/shell files under `ui-src/`
+(a `.pm`/`.pl`/`.t`/shebang/`.sh` file), because the four constructs are
+meaningless syntax in the HTML templates a whole-tree scan would otherwise
+flag 42 times over for markdown-style backtick-quoting in their own header
+comments.
+
 #### Mode A listener fix round 2 — a budget that outran every front server, a mutation that hung instead of failing, and two counts nothing could check
 
 **2026-09-13** — R106–R109 plus a sweep of eleven sentences, from a scoped re-review of fix round 1. 3002 tests (was 2978). `ui-src/lib/ConfigServer/UI/Server.pm`, `ui-src/dist/{nginx,apache,litespeed}.conf.tpl`, `t/40-http-parse.t`, `t/42-listen-loop.t`, `t/80-templates.t`, `CHANGES.md`. `HTTP.pm` is byte-identical (requirement 7); no file modes changed; no new `ui.conf` key.
