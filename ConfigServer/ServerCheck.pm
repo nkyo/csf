@@ -129,10 +129,25 @@ sub report {
 ###############################################################################
 # start startoutput
 sub startoutput {
-	if ($config{THIS_UI} and !$config{GENERIC}) {
-		$output .= "<p align='center'><strong>Note: Internal WHM links will not work within the csf Integrated UI</strong></p>\n";
-	}
-
+	# Emptied 2026-09-24. This was:
+	#
+	#   if ($config{THIS_UI} and !$config{GENERIC}) {
+	#     $output .= "...Internal WHM links will not work within the csf
+	#                 Integrated UI...";
+	#   }
+	#
+	# THIS_UI is not a key in any shipped csf.conf and never was - it was
+	# set at run time by the three ConfigServer::Display*UI modules, to tell
+	# this report it was being rendered inside the Integrated UI rather than
+	# by csf -m. All three were deleted with that interface, so nothing sets
+	# it, %config never carries it, and the branch could not be taken. A
+	# note about a UI that no longer exists, reachable only through a
+	# variable nothing writes.
+	#
+	# The sub itself stays: report() calls it at line 108, and
+	# ConfigServer::RBLCheck's startoutput() has been an empty `return;` all
+	# along, so this is now the same shape as its sibling rather than a new
+	# one.
 	return;
 }
 # end startoutput
