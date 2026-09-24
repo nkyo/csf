@@ -78,7 +78,7 @@ This document contains:
 
 21. Port/IP address Redirection
 
-22. Integrated User Interface Feature
+22. Integrated User Interface Feature - REMOVED
 
 23. IP Block Lists
 
@@ -108,7 +108,8 @@ flexible to configure and secure with extra checks to ensure smooth operation.
 csf can be used on any (supported - see the website) generic Linux OS.
 
 The csf installation includes preconfigured configurations and control panel
-UI's for cPanel, DirectAdmin and Webmin
+plugins for cPanel, DirectAdmin and Webmin. The HTML interface those plugins
+used to render has been replaced by csf-ui - see section 22.
 
 Directory structure:
 
@@ -369,7 +370,6 @@ modify that file to maintain the correct format:
 /usr/local/csf/tpl/sshalert.txt - for SSH login emails
 /usr/local/csf/tpl/sualert.txt - for SU alert emails
 /usr/local/csf/tpl/tracking.txt - for POP3/IMAP blocking emails
-/usr/local/csf/tpl/uialert.txt - for UI alert emails
 /usr/local/csf/tpl/usertracking.txt - for user process tracking alert emails
 /usr/local/csf/tpl/watchalert.txt - for watched file and directory change alert emails
 /usr/local/csf/tpl/webminalert.txt - for Webmin login emails
@@ -1250,79 +1250,51 @@ work. csf will set this where it can, but if the kernel value cannot be set
 then the DNAT redirection many not work.
 
 
-22. Integrated User Interface Feature
-#####################################
+22. Integrated User Interface Feature - REMOVED
+##############################################
 
-Integrated User Interface. This feature provides a HTML UI to the features of
-csf and lfd, without requiring a control panel or web server. The UI runs as a
-sub process to the lfd daemon.
+The Integrated User Interface has been REMOVED. See CHANGES.md.
 
-As it runs under the root account and successful login provides root access
-to the server, great care should be taken when configuring and using this
-feature. There are additional restrictions to enhance secure access to the
-UI:
+Up to v15.00 lfd served an HTML UI itself, from a child process running as
+root, on the port set by UI in /etc/csf/csf.conf. That server is gone. lfd does
+not listen on UI_PORT in any configuration. Setting UI = "1" now does one thing
+only: it writes a line to /var/log/lfd.log saying the port is not there, so a
+server that still has it switched on is told rather than left to find out by
+connecting.
 
-  1. An SSL connection is required
-  2. Separate ban and allow files are provided to only allow access to listed
-     IP addresses
-  3. Local IP addresses cannot connect to the UI (i.e. all IP addresses
-     configured on the server NICs)
-  4. Unique sessions, session timeouts, session cookies and browser headers are
-     used to identify and restrict active sessions
+Gone with it: /etc/csf/ui/ui.allow, /etc/csf/ui/ui.ban, the certificate script
+that provisioned /etc/csf/ui/server.key and server.crt, and the uialert.txt
+alert template. On a server upgrading from an earlier version those files are
+left where they are rather than deleted - nothing reads them, and removing an
+operator's files during an upgrade is the worse mistake - but they no longer do
+anything.
 
-Requirements:
+The replacement is csf-ui. Unlike the interface it replaces, it does not run as
+root: the web tier runs as an unprivileged user behind your own web server and
+reaches root only through a small helper over a unix socket, which accepts a
+fixed list of operations and validates every argument itself.
 
-  1. openssl
-  2. Perl modules: Net::SSLeay, IO::Socket::SSL and dependent modules
-  4. SSL keys
-  5. Entries in /etc/csf/ui/ui.allow
+To set it up, as root:
 
-The SSL server uses the following files:
+  /usr/local/csf-ui/bin/csf-ui-setup
 
-  SSL Key goes into /etc/csf/ui/server.key
-  SSL Certificate goes into /etc/csf/ui/server.crt
+It asks which addresses may reach the interface, creates the first account, and
+prints the address to browse to. It is configured in /etc/csf-ui/ui.conf, not
+in /etc/csf/csf.conf, and accounts are managed with csf-ui-passwd - each with
+an admin or support role, and a $6$ password hash in /etc/csf-ui/users that
+only root can read.
 
-Preferably, real CA signed certificates should be used. You can use an
-existing domain and cert for accessing the UI by populating the two files
-mentioned. If the cert has a ca bundle, it should be appended to the server.crt
-file. lfd must be restarted after making any changes:
-http://httpd.apache.org/docs/current/ssl/ssl_faq.html#realcert
+The UI_* settings in /etc/csf/csf.conf are left in place, with whatever values
+this server had, so that an upgrade does not silently delete them. Nothing
+reads them. One of them deserves attention: UI_PASS held a plaintext password,
+and on a server where the UI was ever enabled it is a real one, still in the
+file and still in every backup of it. If that password is used anywhere else,
+change it there.
 
-Alternatively, you could generate your own self-signed certificate:
-http://httpd.apache.org/docs/current/ssl/ssl_faq.html#selfcert
-
-Any keys used must have their pass-phrase removed:
-http://httpd.apache.org/docs/current/ssl/ssl_faq.html#removepassphrase
-
-The login URL should use the domain you have listed in the self-signed cert:
-https://<yourdomain>:<port>
-
-For example: https://www.somedomain.com:6666
-
-Your browser must accept session cookies to gain access.
-
-UI_ALLOW is enabled by default, so IP addresses (or CIDRs) allowed to use this
-UI must be listed in /etc/csf/ui/ui.allow before trying to connect to the UI.
-
-Only IP addresses can be listed/used in /etc/csf/ui/ui.ban - this file should
-only be used by the UI to prevent login. Use csf blocks to prevent access to
-the configured port and only use Advanced Allow/Deny Filters for access, i.e.
-do not list the port in TCP_IN.
-
-Logging for UI events are logged to the lfd /var/log/lfd.log file. Check this
-file if you are unable to access the UI.
-
-Required Perl Modules:
-
-  For example, on Debian v6 the perl modules can be installed using:
-
-    apt-get install libio-socket-ssl-perl libcrypt-ssleay-perl \
-                    libnet-libidn-perl libio-socket-inet6-perl libsocket6-perl
-
-  For example, on CentOS v6 the perl modules can be installed using:
-
-    yum install perl-IO-Socket-SSL.noarch perl-Net-SSLeay perl-Net-LibIDN \
-                perl-IO-Socket-INET6 perl-Socket6
+The control panel plugins (cPanel, DirectAdmin, Webmin, InterWorx, CWP,
+VestaCP, CyberPanel) are all still installed and still registered. Their pages
+now say the same thing this section does and point at csf-ui, rather than
+disappearing.
 
 
 23. IP Block Lists

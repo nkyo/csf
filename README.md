@@ -78,29 +78,47 @@ git archive --format=tar --prefix=csf/ v<version> | gzip -n -9 | sha256sum
 > back to plain `http://` on servers without `IO::Socket::SSL`. That is fixed
 > here; see [CHANGES.md](CHANGES.md).
 
-## The built-in WebUI
+## The WebUI
 
-`UI = "0"` by default, and that is the right setting unless you need it.
+The interface that used to be built into `lfd` has been **removed**. It was
+5,071 lines that parsed HTTP from the network as root, stored its password in
+plaintext in `csf.conf` and had no CSRF protection. `lfd` no longer listens on
+`UI_PORT` in any configuration; leaving `UI = "1"` set now only produces a line
+in `/var/log/lfd.log` saying so.
 
-> It is being replaced. The current one is 5,071 lines that parse HTTP from the
-> network as root, store the password in plaintext and have no CSRF protection.
-> See [docs/WEBUI-PLAN.md](docs/WEBUI-PLAN.md).
+Its replacement is **csf-ui**, installed by the csf installer. The web tier runs
+as an unprivileged user (`csfui`) behind your own web server and reaches root
+only through a small helper over a unix socket, which takes a fixed list of
+operations and validates every argument itself. See
+[docs/WEBUI-RPC.md](docs/WEBUI-RPC.md) for the interface and the threat model,
+and [docs/WEBUI-PLAN.md](docs/WEBUI-PLAN.md) for the plan it was built to.
 
-If you enable it, note what was fixed here: up to v15.00 a **private key shipped
-inside the tarball** and every installer copied it into `/etc/csf/ui/`, so every
-server running the WebUI used a key anyone who downloaded csf already had. Its
-certificate had also expired in 2020. Both are gone from this source; the
-installers now generate a certificate belonging to your host alone.
-
-To rotate it, or if you are unsure what your server is serving:
+To set it up, as root:
 
 ```bash
-sh /usr/local/csf/bin/csf-ui-cert.sh --force
-openssl x509 -in /etc/csf/ui/server.crt -noout -fingerprint -sha256 -dates
+/usr/local/csf-ui/bin/csf-ui-setup
 ```
 
-If that fingerprint is `2E:AB:8C:4A:...:11:9B:B2:9A`, the server is still using
-the leaked certificate — rotate it now.
+It asks which addresses may reach it, creates the first account and prints the
+address to browse to. It is configured in `/etc/csf-ui/ui.conf`, not in
+`csf.conf`. Accounts are managed with `csf-ui-passwd`; each has an `admin` or
+`support` role and a `$6$` hash in `/etc/csf-ui/users`, readable by root only.
+
+The control panel plugins (cPanel, DirectAdmin, Webmin, InterWorx, CWP, VestaCP,
+CyberPanel) are all still installed and registered. Their pages now say the
+interface was retired and point at csf-ui, rather than 404ing.
+
+> **If you ran the old WebUI, change `UI_PASS` wherever else you used it.** The
+> `UI_*` keys are deliberately left in `csf.conf` - dropping a key from a config
+> file silently deletes the operator's setting - but `UI_PASS` is a plaintext
+> password that is still in the file, still in every backup of it, and carried
+> forward by upgrades. Nothing reads it any more; that does not make it secret.
+>
+> Also gone with the old UI: the private key that shipped inside the tarball up
+> to v15.00, which every installer copied into `/etc/csf/ui/`, so every server
+> running the WebUI used a key anyone who downloaded csf already had. Its
+> certificate had expired in 2020. `/etc/csf/ui/` is left in place on an
+> upgraded server rather than deleted, but nothing reads it now.
 
 ## Documentation
 

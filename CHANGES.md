@@ -37,6 +37,98 @@ line is added below the original notice; the original stays intact.
 
 ### Unreleased
 
+#### Task 11 — retiring the Integrated User Interface
+
+**2026-09-24** — The HTML interface `lfd` served itself is **removed**, and so
+are the three modules that rendered it, the front-end assets they loaded, and
+the runtime files only they used. The replacement, `csf-ui`, was built by Tasks
+1–10 and is documented in [docs/WEBUI-RPC.md](docs/WEBUI-RPC.md).
+
+**What it was.** `lfd.pl`'s `sub ui` forked a child that spoke HTTP on
+`UI_PORT` **as root** — 851 lines of hand-written request parsing, session
+handling and login throttling — and rendered every page from
+`ConfigServer/DisplayUI.pm` (2,935 lines), `ConfigServer/cseUI.pm` (1,042) and
+`ConfigServer/DisplayResellerUI.pm` (241). It authenticated against `UI_USER`
+and `UI_PASS`, a username and a **plaintext password in `csf.conf`**, and had
+no CSRF protection of any kind. The same three modules were also what the seven
+control-panel plugins rendered.
+
+**Removed:**
+
+- `lfd.pl`: `sub ui` and its two helpers `ui_403`/`ui_413`, the `$uiip` global,
+  the startup fork, the main-loop watchdog that restarted the child, and the
+  `require`/`import` of the display modules and `IO::Socket::SSL` that existed
+  only for it. 914 lines.
+- `ConfigServer/DisplayUI.pm`, `ConfigServer/cseUI.pm`,
+  `ConfigServer/DisplayResellerUI.pm` — deleted whole, copyright headers
+  included. That is deleting a work, not stripping its notice: no notice is
+  edited or removed from a file that survives, and the identical header remains
+  on every surviving file.
+- The front-end assets, from **five** byte-identical trees (`csf/`,
+  `ui/images/`, `da/images/`, `interworx/images/`, `webmin/csf/images/`):
+  jQuery, Bootstrap 3 with its Glyphicons fonts, Chosen, `bootstrap-chosen.css`,
+  `configserver.css`, the loaders and the unused SVG icons. Four of those trees
+  were install-time copies of `csf/` that had been committed; they are made
+  again at install time where a panel still needs one.
+- All five copies of `LICENSE.txt`. It was never a project licence: it was a
+  CC‑BY attribution for five Fugue Icons (`plus.png`, `minus.png`, `perm.png`,
+  `ip.png`, `delete.png`, © 2013 Yusuke Kamiyamane). **None of those five files
+  existed anywhere in the tree**, tracked or untracked, before this change —
+  upstream dropped them before v15.00 — so the attribution had been pointing at
+  nothing, in five places. Keeping it after the icons are gone attributes
+  something that is not there; deleting it while any of them survived would have
+  been a licence violation. Enumerated both ways, before and after.
+- `csfajaxtail.js`, `ui/ui.allow`, `ui/ui.ban`, `uialert.txt`, and `ui-cert.sh`
+  (which provisioned `/etc/csf/ui/server.{key,crt}` for the removed server, and
+  installed itself as `/usr/local/csf/bin/csf-ui-cert.sh`, one character from
+  the *new* UI's cert script). The matching lines in all seven `install.*.sh`
+  and in `migratedata.sh` went with them.
+
+**Kept, deliberately:**
+
+- **Every `UI_*` key in `csf.conf` and the six panel configs**, with its value:
+  `UI`, `UI_PORT`, `UI_IP`, `UI_USER`, `UI_PASS`, `UI_TIMEOUT`, `UI_CHILDREN`,
+  `UI_RETRY`, `UI_BAN`, `UI_ALLOW`, `UI_BLOCK`, `UI_ALERT`, `UI_CIPHER`,
+  `UI_SSL_VERSION`, `UI_CXS`, `UI_CSE`. `auto.*.pl` regenerates
+  `/etc/csf/csf.conf` from the shipped file on every upgrade, so a key dropped
+  here is an operator's setting silently deleted off a live server. The section
+  now explains that the UI is gone, where `csf-ui` is, and what each key's
+  `csf-ui` equivalent is.
+- **`if ($config{UI})` in `lfd.pl`**, which now forces it to 0 and logs one line
+  saying the port is not there and where the replacement is. A server whose
+  `csf.conf` still says `UI = "1"` is told, rather than discovering it by
+  connecting to a port that quietly stopped answering.
+- **All nine control-panel entry points, and their plugin registrations** —
+  `cpanel/csf.cgi`, `da/exec/da_csf.cgi`, `da/exec/da_csf_reseller.cgi`,
+  `webmin/csf/index.cgi`, `interworx/lib/index.pl`, `interworx/lib/reseller.pl`,
+  `cwp/csf.pl`, `vestacp/csf.pl`, `cyberpanel/cyberpanel.pl`. Each now renders a
+  short self-contained page (no external asset, no JavaScript) saying csf is
+  still running, that the built-in interface was retired, and how to set up
+  `csf-ui`; resellers get wording they can act on. Every access gate is
+  unchanged — WHM ACLs, the DirectAdmin session and parent-exe checks, the
+  reseller `USE` privilege, CyberPanel's tempfile ownership check. A plugin
+  button that 404s is not an acceptable outcome, so none of them does.
+- `csf/csf_small.png`, the one asset with a live consumer: the plugin button
+  icon named by `cpanel/csf.conf`, `install.cpanel.sh`, and DirectAdmin's
+  `da/hooks/admin_img.html` / `reseller_img.html`.
+
+**Security note for anyone upgrading.** `UI_PASS` is a plaintext password, and
+on a server where the UI was ever enabled it is a real one. Nothing reads it
+now, but it is still in `csf.conf`, still in every backup of it, and carried
+forward by the upgrade. If it is used anywhere else, change it there. `csf-ui`
+stores a `$6$` hash in `/etc/csf-ui/users` instead, readable by root only.
+
+Also in this task: `ci/gates.sh` gate 1 no longer passes silently when
+`git diff` fails on its primary path (it had a guard only on the fallback), and
+it can now compile-check files that `use` a config-loading module on a machine
+with no CSF installed, by pointing a one-line overlay of `ConfigServer/
+Config.pm` at this repo's own `csf.conf` — previously every such file failed
+`perl -c` for a missing `/etc/csf/csf.conf`, which had been true at the
+merge-base too.
+
+`ui-src/lib/ConfigServer/UI/HTTP.pm` is unmodified (frozen). No file's mode
+changed. No new `ui.conf` key.
+
 #### Task 10 — the hostile-input and integration pass
 
 **2026-09-22** — `t/90-fuzz-http.t`, `t/91-fuzz-rpc.t`, `t/92-integration.t`,
