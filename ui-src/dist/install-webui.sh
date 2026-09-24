@@ -740,8 +740,14 @@ setup_mode_b() {
 
 	write_ui_conf b "$port" "$allow"
 	echo "csf-ui: ui.conf written for Mode B (standalone) on port $port."
-	echo "csf-ui: create an admin account before relying on it:"
-	echo "csf-ui:   /usr/local/csf-ui/bin/csf-ui-passwd useradd <name> --role admin"
+	# The sub-command is `add`, and the role is a positional argument -
+	# csf-ui-passwd's run() dispatches add/passwd/delete/list and nothing
+	# else. This line said `useradd <name> --role admin`, which prints the
+	# usage block and exits 2; it is the last thing a Mode B operator reads
+	# before a UI that has no account in it.
+	echo "csf-ui: create an admin account before relying on it - there is none by"
+	echo "csf-ui: default and no way in until one exists:"
+	echo "csf-ui:   /usr/local/csf-ui/bin/csf-ui-passwd add <user> admin"
 
 	if command -v systemctl >/dev/null 2>&1; then
 		_enable_now csf-ui-helper.service
@@ -756,15 +762,25 @@ setup_mode_b() {
 # server's vhost template, but declares it configured ONLY once the
 # front server's OWN validator (and, for Apache, an actual module check)
 # says it is real - never on the strength of this script's own
-# rendering having succeeded. Never enables csf-ui.service.
+# rendering having succeeded. Enables BOTH units, the same way
+# setup_mode_b() does.
 #
-# WHY NOT ENABLE IT: this build's ConfigServer::UI::Server (Task 5) is,
-# by its own header comment, "The Mode B listener" - it refuses to start
-# at all for UI_MODE=a. Nothing anywhere in this tree yet listens on the
-# unix socket these templates proxy to; there is no frozen path for it in
-# docs/WEBUI-RPC.md S2.3 either. Enabling csf-ui.service here would start
-# a process that immediately exits with that exact refusal, on a timer
-# that keeps restarting it - a crash loop dressed up as "Mode A is on".
+# WHY BOTH UNITS (corrected: this comment said the opposite, and the
+# operator-facing block at the foot of this function said it louder).
+# The text it replaced was written when ConfigServer::UI::Server was, by
+# its own header, "The Mode B listener" and refused to start at all for
+# UI_MODE=a, so enabling csf-ui.service would have been a crash loop
+# dressed up as "Mode A is on". That stopped being true when the Mode A
+# listen path landed: Server.pm now has _open_unix_listener(), a
+# `$self->{mode} eq 'a'` arm in run(), mode_a_preflight(), and an
+# admit_peer() that identifies its peer from SO_PEERCRED instead of a
+# header - and csf-ui.service already carries the whole Mode A plumbing
+# (RuntimeDirectory=csf-ui-web, RuntimeDirectoryMode=0750,
+# Group=csf-ui-sock), which only ever existed for this. Leaving the unit
+# disabled after writing a working vhost is what actually produces the
+# failure the old comment was trying to avoid: a live HTTPS port with
+# nothing behind it, 502 on every request, and an operator told to delete
+# the one thing that was correct.
 #
 # WHY VALIDATE RATHER THAN TRUST OUR OWN RENDER (fix round 2,
 # task-9-review.md R87): this task's whole failure signature is "nothing
@@ -961,7 +977,7 @@ setup_mode_a() {
 			fi
 			if [ "$enabled_now" -ne 1 ]; then
 				echo "csf-ui: not enabling Apache modules without confirmation. Run this yourself"
-				echo "csf-ui: when ready, then re-run this installer or run csf-ui-setup:"
+				echo "csf-ui: when ready, then re-run this installer at a terminal:"
 				echo "csf-ui:   a2enmod $enable_names && systemctl reload apache2"
 				return 1
 			fi
@@ -1069,25 +1085,38 @@ setup_mode_a() {
 		echo "csf-ui:      nothing here has confirmed $out actually parses."
 	fi
 
+	echo "csf-ui: create an admin account before relying on it - there is none by"
+	echo "csf-ui: default and no way in until one exists:"
+	echo "csf-ui:   /usr/local/csf-ui/bin/csf-ui-passwd add <user> admin"
+
 	# Fix round 1 (task-9-review.md Important): say what actually happens
 	# on this host, not only what this script itself did not do. The vhost
 	# file at $out is live configuration the moment $front next reads it -
 	# which is $front's own timeline, not this script's, and this script
 	# never reloads $front itself.
-	echo "csf-ui: IMPORTANT - this build's csf-ui has no Mode A listener yet (no code"
-	echo "csf-ui: anywhere in this release binds $sock; see the Task 9 report), so"
-	echo "csf-ui: csf-ui.service is deliberately NOT enabled. But $out is otherwise"
-	echo "csf-ui: ordinary, live $front configuration: the NEXT time $front reloads or"
-	echo "csf-ui: restarts - for this or any unrelated reason - it WILL start accepting"
-	echo "csf-ui: HTTPS on port $port and WILL return 502 for every request, because"
-	echo "csf-ui: nothing listens on $sock yet. Do not reload $front expecting this to"
-	echo "csf-ui: start working; remove $out first if you do not want a 502'ing port"
-	echo "csf-ui: live before a Mode A listener ships."
-
+	#
+	# Corrected: the block here used to announce that this build had no
+	# Mode A listener, that csf-ui.service was therefore deliberately left
+	# disabled, and that the operator should delete $out to avoid a
+	# 502'ing port. All three statements were true when they were written
+	# and are false now - see this function's header - and acting on the
+	# last one deleted a working configuration.
 	if command -v systemctl >/dev/null 2>&1; then
 		_enable_now csf-ui-helper.service
+		_enable_now csf-ui.service
+		echo "csf-ui: csf-ui.service is the Mode A listener on $sock; $front proxies to it."
+		echo "csf-ui: $out is live $front configuration, but $front does not read it until"
+		echo "csf-ui: it next reloads or restarts - which this installer does not do for you."
+		echo "csf-ui: Until then port $port is not served at all. Reload $front with"
+		echo "csf-ui: whatever this system calls it (the unit name differs by distribution:"
+		echo "csf-ui: nginx, apache2, httpd, lshttpd) when you are ready."
 	else
-		echo "csf-ui: no systemctl found - csf-ui-helper.service was not started"
+		echo "csf-ui: no systemctl found - csf-ui-helper.service and csf-ui.service were"
+		echo "csf-ui: NOT started. $out is live $front configuration and port $port will"
+		echo "csf-ui: return 502 for every request until something starts the two services"
+		echo "csf-ui: this system's init would have started:"
+		echo "csf-ui:   /usr/local/csf-ui/bin/csf-ui-helper   (root; the privileged half)"
+		echo "csf-ui:   /usr/local/csf-ui/bin/csf-ui          (as the csfui user)"
 	fi
 	return 0
 }
@@ -1108,7 +1137,7 @@ interactive_setup() {
 	fi
 	echo "csf-ui:   a = behind the detected web server"
 	echo "csf-ui:   b = standalone (csf-ui serves TLS itself)"
-	echo "csf-ui:   anything else = skip for now (run csf-ui-setup later)"
+	echo "csf-ui:   anything else = skip for now (re-run this installer to set it up)"
 	printf 'csf-ui: set up the WebUI now? [a/b/N] '
 	read -r answer
 
@@ -1116,7 +1145,7 @@ interactive_setup() {
 		[Aa]) mode=a ;;
 		[Bb]) mode=b ;;
 		*)
-			echo "csf-ui: skipping WebUI setup. Run csf-ui-setup at any time to finish it."
+			echo "csf-ui: skipping WebUI setup. Re-run this installer at a terminal to set it up."
 			return 0
 			;;
 	esac
@@ -1133,7 +1162,8 @@ interactive_setup() {
 		read -r allow
 	fi
 	if [ -z "$allow" ]; then
-		echo "csf-ui: no address given - leaving the WebUI unconfigured. Run csf-ui-setup later."
+		echo "csf-ui: no address given - leaving the WebUI unconfigured. Re-run this installer"
+		echo "csf-ui: at a terminal to set it up."
 		return 0
 	fi
 
@@ -1375,7 +1405,11 @@ main() {
 
 	if [ "$noninteractive" -eq 1 ]; then
 		echo "csf-ui: non-interactive install - the WebUI is installed but NOT enabled."
-		echo "csf-ui: run 'csf-ui-setup' (or re-run this installer at a terminal) to turn it on."
+		echo "csf-ui: re-run this installer at a terminal to set it up: it is the only thing"
+		echo "csf-ui: that asks which mode to use, writes your web server's vhost, writes"
+		echo "csf-ui: /etc/csf-ui/ui.conf and enables the two services."
+		echo "csf-ui: Then create an account:"
+		echo "csf-ui:   /usr/local/csf-ui/bin/csf-ui-passwd add <user> admin"
 	else
 		interactive_setup
 	fi

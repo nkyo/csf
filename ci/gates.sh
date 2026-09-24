@@ -36,7 +36,7 @@
 # subshell under POSIX sh and every variable it sets would be lost the
 # moment the loop ends.
 #
-# Four gates, in order. Each one prints what it checked and what it found;
+# Five gates, in order. Each one prints what it checked and what it found;
 # the script's own exit status is nonzero iff at least one gate failed, and
 # every gate runs even if an earlier one failed - one call gives the whole
 # picture, not just the first thing that broke.
@@ -342,6 +342,10 @@ note "   scoped to Perl and shell files - see the header comment for why"
 # `chosen.jquery`, `fugue` - not this gate's four patterns), and the
 # straightforward place for it is a fifth gate here, or a check of its own
 # next to this one. This gate is not that check and was never meant to be.
+#
+# RESOLVED 2026-09-24: that fifth gate now exists, at the foot of this
+# file. It carries the asset strings named above AND the retired-claim
+# strings whose absence nothing was checking either.
 > "$WORKDIR/uisrcfiles"
 find ui-src -type f | sort > "$WORKDIR/uisrcfiles.all"
 while IFS= read -r f; do
@@ -411,6 +415,129 @@ while IFS= read -r f; do
 done < "$WORKDIR/uisrcfiles"
 
 note "   $GREP_FINDINGS finding(s)"
+
+###############################################################################
+note ""
+note "== Gate 5: retired claims and retired front-end assets must not reappear =="
+#
+# Added 2026-09-24. The gap Gate 4's header named explicitly ("WHAT THIS
+# LEAVES OPEN FOR TASK 11 ... if that removal wants a CI-enforced 'these
+# strings must not reappear' check, that is a DIFFERENT, TARGETED grep")
+# was never closed, and the cost of not closing it was paid by something
+# Gate 4 was never aimed at: install-webui.sh went on printing, in a
+# release where it was no longer true, that "this build's csf-ui has no
+# Mode A listener yet", that "csf-ui.service is deliberately NOT enabled",
+# and that the operator should delete the vhost this installer had just
+# written and validated. Nothing in the tree asserted those strings either
+# way, so nothing reddened when the listener landed and made them false.
+#
+# WHY A STRING GATE AND NOT A TEST. A test can only assert what the code
+# DOES. These are claims ABOUT the code, in prose, printed to an operator -
+# the failure mode is prose that outlives the fact it described. The only
+# mechanical handle on that is the string itself.
+#
+# TWO LISTS, EACH WITH ITS OWN SEARCH SCOPE, because "must not reappear"
+# means different things for the two:
+#
+#   A. RETIRED CLAIMS - sentences that were true once, are false now, and
+#      are dangerous to act on. Searched where they would reach an
+#      operator: ui-src/ (the installer and the UI itself), the manuals,
+#      the shipped csf.conf family, lfd.pl, and the panel pages.
+#
+#   B. RETIRED FRONT-END ASSETS - the jQuery/Bootstrap/Chosen/Fugue trees
+#      Task 11 deleted. Searched in the UI's own web tree and the panel
+#      pages, i.e. everywhere a page could reference one again. NOT in
+#      install.*.sh, which legitimately names these files in order to
+#      REMOVE them from a server upgrading from an earlier release.
+#
+# Both lists are fixed-string (grep -F), so nothing here needs escaping,
+# and both skip this file - a gate that flagged its own table would be
+# unable to state what it forbids.
+###############################################################################
+CLAIM_SCOPE="ui-src readme.txt README.md lfd.pl sanity.txt csf.conf csf.cwp.conf csf.cyberpanel.conf csf.directadmin.conf csf.generic.conf csf.interworx.conf csf.vesta.conf cpanel cwp cyberpanel da interworx vestacp webmin"
+ASSET_SCOPE="ui-src/web cpanel cwp cyberpanel da interworx vestacp webmin"
+
+# One forbidden string per line. Kept as a here-doc rather than a shell
+# variable so a string containing a space, a quote or a slash needs no
+# quoting rules of its own.
+cat > "$WORKDIR/forbidden.claims" <<'CLAIMS'
+no Mode A listener
+deliberately NOT enabled
+csf-ui-passwd useradd
+csf-ui-passwd add <name> --role
+CLAIMS
+
+cat > "$WORKDIR/forbidden.assets" <<'ASSETS'
+jquery
+chosen.min
+bootstrap-chosen
+bootstrap.min
+glyphicons-halflings
+configserver.css
+csfajaxtail
+fugue
+ASSETS
+
+# Whole-line comments are skipped, for the same reason Gate 4 skips them
+# and with the same limitation: this tree explains at length, in prose,
+# exactly which assets were removed and why, and nine panel pages carry
+# the sentence "the stylesheet, jQuery, Bootstrap and Chosen ... were
+# removed". A gate that flagged the explanation of a removal as the
+# removal being undone would be unusable, and would be silenced by
+# deleting the explanation - the worst available outcome. What is NOT
+# skipped is the thing that matters: a src=, href= or require that
+# actually pulls one of these back in.
+#
+# NO COMMAND SUBSTITUTION AROUND THIS FUNCTION. `n=$(_scan ...)` runs the
+# function in a SUBSHELL, so the fail() calls inside it would set FAILED=1
+# in a shell that exits immediately afterwards and this script would go on
+# to print "all gates passed" over the top of its own failures. That is
+# the exact trap this file's header warns about for `cmd | while read`,
+# and it was live in the first draft of this gate. The count comes back
+# through a file instead.
+_scan_forbidden() {
+	_list=$1
+	_scope=$2
+	_label=$3
+	_countfile=$4
+	_found=0
+	while IFS= read -r _needle; do
+		[ -n "$_needle" ] || continue
+		for _root in $_scope; do
+			[ -e "$_root" ] || continue
+			# -r walks a directory and is a file-list of one for a plain
+			# file, so the same call covers both kinds of scope entry.
+			# -I skips binaries; -i because a reference to "jQuery.min.js"
+			# is the same reference.
+			grep -rIniF -- "$_needle" "$_root" 2>/dev/null > "$WORKDIR/hits.raw" || true
+			> "$WORKDIR/hits"
+			while IFS= read -r _hit; do
+				[ -n "$_hit" ] || continue
+				# "path:lineno:text" - strip the two fields grep added
+				# before asking whether the TEXT is a whole-line comment.
+				_text=${_hit#*:}
+				_text=${_text#*:}
+				_trimmed=$(printf '%s' "$_text" | sed -e 's/^[[:space:]]*//')
+				case "$_trimmed" in
+					'#'* | '//'* | '<!--'* | '*'*) continue ;;
+				esac
+				printf '%s\n' "$_hit" >> "$WORKDIR/hits"
+			done < "$WORKDIR/hits.raw"
+			while IFS= read -r _hit; do
+				[ -n "$_hit" ] || continue
+				fail "$_label: \"$_needle\" is back, at $_hit"
+				_found=$((_found + 1))
+			done < "$WORKDIR/hits"
+		done
+	done < "$_list"
+	printf '%s\n' "$_found" > "$_countfile"
+}
+
+_scan_forbidden "$WORKDIR/forbidden.claims" "$CLAIM_SCOPE" "retired claim" "$WORKDIR/n.claims"
+_scan_forbidden "$WORKDIR/forbidden.assets" "$ASSET_SCOPE" "retired asset" "$WORKDIR/n.assets"
+CLAIM_HITS=$(cat "$WORKDIR/n.claims")
+ASSET_HITS=$(cat "$WORKDIR/n.assets")
+note "   retired claims: $CLAIM_HITS finding(s); retired assets: $ASSET_HITS finding(s)"
 
 ###############################################################################
 if [ "$FAILED" -ne 0 ]; then

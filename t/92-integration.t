@@ -352,18 +352,82 @@ sub _can_switch_uid {
 	# exact thing Task 11 will be tempted to do while rewording this file -
 	# would still pass, because "9 mentions minus 5 real ones" is still 4.
 	# Each message asserted by name below instead.
+	#
+	# CHANGED 2026-09-24, deliberately, and this list was RED for one run
+	# while the change was made. The five messages above characterised
+	# wording that was WRONG, not wording that was right: bare
+	# `csf-ui-setup` falls through every branch of run() to _usage() and
+	# exit 2, and even used correctly (--web) it enables no unit, writes
+	# no front-server vhost and creates no account - so it could not
+	# "finish" or "turn on" anything. Pinning the old strings is what a
+	# characterisation test is FOR; what it must not do is outlive the
+	# decision it recorded. The five replacements below all point at the
+	# one thing that does configure the WebUI, which is this installer.
 	my $source = join('', @lines);
 	my @EXPECTED_MESSAGE = (
-		'csf-ui: when ready, then re-run this installer or run csf-ui-setup:',
-		'csf-ui:   anything else = skip for now (run csf-ui-setup later)',
-		'csf-ui: skipping WebUI setup. Run csf-ui-setup at any time to finish it.',
-		'csf-ui: no address given - leaving the WebUI unconfigured. Run csf-ui-setup later.',
-		q{csf-ui: run 'csf-ui-setup' (or re-run this installer at a terminal) to turn it on.},
+		'csf-ui: when ready, then re-run this installer at a terminal:',
+		'csf-ui:   anything else = skip for now (re-run this installer to set it up)',
+		'csf-ui: skipping WebUI setup. Re-run this installer at a terminal to set it up.',
+		'csf-ui: no address given - leaving the WebUI unconfigured. Re-run this installer',
+		'csf-ui: re-run this installer at a terminal to set it up: it is the only thing',
 	);
 	for my $message (@EXPECTED_MESSAGE) {
 		like($source, qr/\Q$message\E/,
-			"R101: install-webui.sh still tells the operator: $message");
+			"R101: install-webui.sh tells the operator: $message");
 	}
+
+	# ...and none of them may go back to naming csf-ui-setup as the way to
+	# set the WebUI up. Asserted as an ABSENCE too, because the five
+	# positives above would all still pass if a sixth message reintroduced
+	# the claim somewhere else in the file.
+	unlike($source, qr/run csf-ui-setup (?:later|at any time)/,
+		'R101: no message tells the operator to "run csf-ui-setup" to finish WebUI setup');
+
+	###########################################################################
+	# C1 - setup_mode_a() must ENABLE the Mode A listener it just configured.
+	#
+	# This is the assertion whose absence let the defect ship. The stale
+	# text it replaces was true when Task 9 wrote it and false at the
+	# commit that added Server.pm's Mode A listen path; nothing anywhere
+	# in the branch asserted it either way, so nothing reddened. A Mode A
+	# install - the mode this installer RECOMMENDS - wrote a correct
+	# vhost, started the helper, never started the web tier, returned 502
+	# for every request, and told the operator to delete the vhost.
+	#
+	# Extracted by name, like the R100 block above, rather than by line.
+	###########################################################################
+	my ($mode_a_start) = grep { $lines[$_] =~ /^setup_mode_a\(\) \{/ } (0 .. $#lines);
+	my $mode_a_end = defined $mode_a_start ? $mode_a_start : 0;
+	while ($mode_a_end < $#lines && $lines[$mode_a_end] !~ /^\}/) { $mode_a_end++ }
+	ok(defined($mode_a_start) && $mode_a_end > $mode_a_start,
+		'C1: setup_mode_a() was located in the real install-webui.sh');
+
+	SKIP: {
+		skip 'C1: setup_mode_a() was not found - see the failure above', 5
+			unless defined($mode_a_start) && $mode_a_end > $mode_a_start;
+		my $mode_a = join('', @lines[$mode_a_start .. $mode_a_end]);
+
+		like($mode_a, qr/^\s*_enable_now csf-ui\.service$/m,
+			'C1: setup_mode_a() enables csf-ui.service - the Mode A listener Server.pm now provides');
+		like($mode_a, qr/^\s*_enable_now csf-ui-helper\.service$/m,
+			'C1: ...and the root helper, as it always did');
+		unlike($mode_a, qr/has no Mode A listener/,
+			'C1: setup_mode_a() no longer claims this build has no Mode A listener');
+		unlike($mode_a, qr/deliberately NOT enabled/,
+			'C1: ...nor that csf-ui.service is deliberately left disabled');
+		unlike($mode_a, qr/remove \$out first/,
+			'C1: ...nor tells the operator to delete the vhost it just wrote and validated');
+	}
+
+	# The premise of the C1 assertions above, measured at its source
+	# rather than assumed: Server.pm really does have a Mode A listen
+	# path. If this ever stops being true, the right answer is to stop
+	# enabling the unit again - not to leave the two disagreeing.
+	my $server_source = _slurp("$FindBin::Bin/../ui-src/lib/ConfigServer/UI/Server.pm");
+	like($server_source, qr/sub _open_unix_listener/,
+		'C1 (premise): ConfigServer::UI::Server has a unix-socket listener');
+	like($server_source, qr/sub mode_a_preflight/,
+		'C1 (premise): ...and a mode-A preflight, so mode A is a supported start, not a refusal');
 }
 
 ###############################################################################
