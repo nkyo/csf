@@ -380,8 +380,8 @@ sub _can_switch_uid {
 	# set the WebUI up. Asserted as an ABSENCE too, because the five
 	# positives above would all still pass if a sixth message reintroduced
 	# the claim somewhere else in the file.
-	unlike($source, qr/run csf-ui-setup (?:later|at any time)/,
-		'R101: no message tells the operator to "run csf-ui-setup" to finish WebUI setup');
+	unlike($source, qr/run\s+'?csf-ui-setup/i,
+		'R101: no message tells the operator to "run csf-ui-setup" to set the WebUI up');
 
 	###########################################################################
 	# C1 - setup_mode_a() must ENABLE the Mode A listener it just configured.
