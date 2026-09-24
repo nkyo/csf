@@ -241,7 +241,15 @@ sub _decode_state_file {
 # test's own pid, so that exact path can be pre-staged.
 ###############################################################################
 SKIP: {
-	skip 'needs mkfifo and F_SETPIPE_SZ, which is Linux-specific', 3
+	# 4, not 3: this block emits FOUR assertions when it runs - the two ok()s
+	# below, plus the two is()s in the nested SKIP at the end of it.
+	# Declaring 3 made the file emit 53 against its own 'tests => 54' plan
+	# on any host without mkfifo or F_SETPIPE_SZ. Measured by forcing the
+	# probe false: exit 255, "planned 54 tests but ran 53". The fixed plan
+	# turned a silent miscount into a hard failure, which is the right
+	# direction - but it made t/31 fail for a portability reason rather
+	# than a real one. Every skip in this block counts the same four.
+	skip 'needs mkfifo and F_SETPIPE_SZ, which is Linux-specific', 4
 		unless eval { POSIX::mkfifo("$FindBin::Bin/../.mkfifo-probe-$$", 0600) };
 	unlink "$FindBin::Bin/../.mkfifo-probe-$$";
 
@@ -258,11 +266,11 @@ SKIP: {
 
 	my $temp_path = "$dir/addr.state.tmp.$$";
 	unlink $temp_path;
-	POSIX::mkfifo($temp_path, 0600) or skip 'could not create the fifo', 3;
+	POSIX::mkfifo($temp_path, 0600) or skip 'could not create the fifo', 4;
 
-	pipe(my $ready_read, my $ready_write) or skip 'could not create the sync pipe', 3;
+	pipe(my $ready_read, my $ready_write) or skip 'could not create the sync pipe', 4;
 	my $pid = fork();
-	skip 'could not fork the reader', 3 unless defined $pid;
+	skip 'could not fork the reader', 4 unless defined $pid;
 	unless ($pid) {
 		close $ready_read;
 		# O_NONBLOCK so the reader attaches without waiting for the writer,

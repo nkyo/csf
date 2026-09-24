@@ -372,23 +372,65 @@ sub _check_read_request_case {
 		my $req = $result->[0];
 		if (defined $expected_status) {
 			# The generator guaranteed this input exceeds a frozen cap - a
-			# clean parse here means the cap stopped being enforced.
+			# clean parse here means the cap stopped being enforced. One
+			# failure per property the fault branch above checks, so the
+			# count matches _case_assertions() whichever way the case went.
 			ok(0, "$label: a case guaranteed to exceed a frozen cap must fault ($expected_status), not parse cleanly")
 				or diag('req=' . (defined $req ? Dumper_lite($req) : 'undef'));
+			ok(0, "$label: ...so there is no 4xx fault status to check at all")
+				or diag('(no fault at all was raised)');
 			ok(0, "$label: ...and it is specifically $expected_status, not merely some 4xx")
 				or diag('(no fault at all was raised)');
+			ok(0, "$label: ...and the message names the specific cap this case is anchoring")
+				if defined $expected_message_re;
 		}
 		else {
-			# Either undef (clean "nothing more to read") or a well-formed hashref.
-			my $shaped = !defined($req) || (ref($req) eq 'HASH' && defined($req->{method}) && length($req->{method})
-				&& defined($req->{path}) && length($req->{path}));
-			ok($shaped, "$label: result is undef or a well-formed parsed request, never a half-built one")
+			# Two assertions, not one composite: "undef or a hashref" and
+			# "if a hashref, it is fully populated" are different failures
+			# and a composite reported them as the same one. Splitting them
+			# is also what makes this branch emit the same count as the
+			# fault branch above - see _case_assertions().
+			ok(!defined($req) || ref($req) eq 'HASH',
+				"$label: result is undef or a hashref, never a half-built anything else")
+				or diag("req=" . (defined $req ? Dumper_lite($req) : 'undef'));
+			ok(!defined($req) || (defined($req->{method}) && length($req->{method})
+					&& defined($req->{path}) && length($req->{path})),
+				"$label: a parsed request always carries a non-empty method and path")
 				or diag("req=" . (defined $req ? Dumper_lite($req) : 'undef'));
 		}
 	}
 	else {
-		ok(1, "$label: alarm already recorded above");
+		# The bounding alarm fired. None of the properties below were
+		# established, so each is reported as not established rather than
+		# waved through - and the count still matches _case_assertions().
+		ok(0, "$label: hung, so 'any die is a controlled fault()' was never established");
+		ok(0, "$label: hung, so 'a fault's status is always 4xx' was never established");
+		if (defined $expected_status) {
+			ok(0, "$label: hung, so the specific $expected_status was never established");
+			ok(0, "$label: hung, so the cap-specific message was never established")
+				if defined $expected_message_re;
+		}
 	}
+}
+
+###############################################################################
+# How many assertions _check_read_request_case() emits for a case.
+#
+# Computed from the CASE, never from what happened to it, and deliberately
+# declared here rather than counted inside the function: the plan at the foot
+# of this file is built from this, so if a branch above ever stops emitting
+# one of its assertions the plan mismatches and the file fails. A count
+# derived from the emitting code itself could not do that.
+#
+# This is also why every branch above was made to emit the same number. Before
+# fix round 2 they did not: a case that faulted emitted 3, the same case
+# parsing cleanly emitted 2, so the file's total moved with the DRAW. With
+# done_testing() and no expected count, a case that silently stopped faulting
+# changed the total and nothing noticed.
+###############################################################################
+sub _case_assertions {
+	my ($expected_status, $expected_message_re) = @_;
+	return 3 + (defined $expected_status ? 1 : 0) + (defined $expected_message_re ? 1 : 0);
 }
 
 sub _hexpeek {
@@ -403,13 +445,39 @@ sub Dumper_lite {
 }
 
 ###############################################################################
-# Direct read_request() fuzz: N cases, 2 assertions apiece (the count is
-# fixed below in the plan).
+# Direct read_request() fuzz.
+#
+# The cases are GENERATED FIRST and counted before any of them runs, so the
+# plan at the foot of this file is derived from the case list rather than from
+# the assertions the run happens to emit. The old comment here claimed "2
+# assertions apiece (the count is fixed below in the plan)" and both halves
+# were false: the count was 2, 3, 4 or 5 depending on the draw AND on whether
+# the input faulted, and the file ended in a bare done_testing() with no plan
+# at all.
+#
+# WHY THE PLAN IS COMPUTED AND NOT A LITERAL. 16 of this suite's 19 files
+# carry `tests => N` and cannot vary silently. This one cannot join them
+# without changing what it fuzzes: _header_flood_case() draws a header count
+# spanning MAX_HEADERS and returns an expected status only when the draw
+# exceeded it, so the number of assertions a run owes is a property of the
+# seed. Pinning that to a literal would mean removing the conditional - i.e.
+# making the generator stop drawing cases either side of the cap, which is the
+# thing it exists to do. A plan computed from the case list is the strongest
+# gate available without that trade: it is independent of the assertion code,
+# so a branch that stops emitting is caught, and the total is still
+# seed-dependent by design.
 ###############################################################################
 my $N_DIRECT = 300;
+my $EXPECTED = 2;   # the two require_ok() calls at the head of this file
+
+my @DIRECT;
 for my $i (1 .. $N_DIRECT) {
 	my ($data, $expected_status) = _generate_case();
-	_check_read_request_case($data, "direct #$i", $expected_status);
+	push @DIRECT, [$data, "direct #$i", $expected_status];
+	$EXPECTED += _case_assertions($expected_status, undef);
+}
+for my $case (@DIRECT) {
+	_check_read_request_case(@$case);
 }
 
 ###############################################################################
@@ -472,6 +540,7 @@ my @NAMED = (
 );
 for my $case (@NAMED) {
 	my ($label, $data, $expected_status, $expected_message_re) = @$case;
+	$EXPECTED += _case_assertions($expected_status, $expected_message_re);
 	_check_read_request_case($data, "named: $label", $expected_status, $expected_message_re);
 }
 
@@ -499,8 +568,17 @@ sub _pair {
 }
 
 my $N_PIPELINE = 50;
+my @PIPELINE;
 for my $i (1 .. $N_PIPELINE) {
 	my ($data, $expected_status) = _generate_case();
+	push @PIPELINE, [$data, $expected_status];
+	# 2 always (does-not-hang, no-die-escapes), plus the over-the-wire status
+	# check when the case guarantees a cap was exceeded. Outcome-independent
+	# already, unlike _check_read_request_case() was.
+	$EXPECTED += 2 + (defined $expected_status ? 1 : 0);
+}
+for my $i (1 .. $N_PIPELINE) {
+	my ($data, $expected_status) = @{$PIPELINE[$i - 1]};
 	my ($near, $far) = _pair();
 	syswrite($far, $data);
 	# Half-close $far's write side only (SHUT_WR=1): $near sees EOF right
@@ -547,5 +625,12 @@ for my $i (1 .. $N_PIPELINE) {
 # assertions above fail for a reason it does not itself state.
 ###############################################################################
 is($BLOCKED, 0, 'no fuzz case in this file hit its bounding alarm - every case returned or died on its own');
+$EXPECTED += 1;   # the line above
 
-done_testing();
+# A PLAN, not a bare done_testing(). done_testing($n) fails the file if the
+# number of assertions actually run is not $n, and $EXPECTED was accumulated
+# from the CASE LIST - _case_assertions() and the pipeline arithmetic - never
+# from the assertions themselves. So a branch that stops emitting one of its
+# checks reddens here instead of quietly shrinking the total, which is what
+# a bare done_testing() allowed.
+done_testing($EXPECTED);
