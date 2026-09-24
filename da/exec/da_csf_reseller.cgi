@@ -27,12 +27,10 @@ use Sys::Hostname qw(hostname);
 use IPC::Open3;
 
 use lib '/usr/local/csf/lib';
-use ConfigServer::DisplayUI;
-use ConfigServer::DisplayResellerUI;
 use ConfigServer::Config;
 use ConfigServer::Slurp qw(slurp);
 
-our ($reseller, $script, $script_da, $images, %rprivs, $myv, %FORM, %daconfig);
+our ($reseller, %rprivs, $myv, %FORM, %daconfig);
 
 my $config = ConfigServer::Config->loadconfig();
 my %config = $config->config;
@@ -101,9 +99,6 @@ $myv = <$IN>;
 close ($IN);
 chomp $myv;
 
-$script = "/CMD_PLUGINS_RESELLER/csf/index.raw";
-$script_da = "/CMD_PLUGINS_RESELLER/csf/index.raw";
-$images = "/CMD_PLUGINS_RESELLER/csf/images";
 
 my $buffer = $ENV{'QUERY_STRING'};
 if ($buffer eq "") {$buffer = $ENV{POST}}
@@ -124,183 +119,43 @@ foreach my $line (@data) {
 	$daconfig{$name} = $value;
 }
 
-my $bootstrapcss = "<link rel='stylesheet' href='$images/bootstrap/css/bootstrap.min.css'>";
-my $jqueryjs = "<script src='$images/jquery.min.js'></script>";
-my $bootstrapjs = "<script src='$images/bootstrap/js/bootstrap.min.js'></script>";
-
-my @header;
-my @footer;
-my $bodytag;
-my $htmltag = " data-post='$FORM{action}' ";
-if (-e "/etc/csf/csf.header") {
-	open (my $HEADER, "<", "/etc/csf/csf.header");
-	flock ($HEADER, LOCK_SH);
-	@header = <$HEADER>;
-	close ($HEADER);
-}
-if (-e "/etc/csf/csf.footer") {
-	open (my $FOOTER, "<", "/etc/csf/csf.footer");
-	flock ($FOOTER, LOCK_SH);
-	@footer = <$FOOTER>;
-	close ($FOOTER);
-}
-if (-e "/etc/csf/csf.htmltag") {
-	open (my $HTMLTAG, "<", "/etc/csf/csf.htmltag");
-	flock ($HTMLTAG, LOCK_SH);
-	$htmltag .= <$HTMLTAG>;
-	chomp $htmltag;
-	close ($HTMLTAG);
-}
-if (-e "/etc/csf/csf.bodytag") {
-	open (my $BODYTAG, "<", "/etc/csf/csf.bodytag");
-	flock ($BODYTAG, LOCK_SH);
-	$bodytag = <$BODYTAG>;
-	chomp $bodytag;
-	close ($BODYTAG);
-}
-unless ($config{STYLE_CUSTOM}) {
-	undef @header;
-	undef @footer;
-	$htmltag = "";
-	$bodytag = "";
-}
-
-unless ($FORM{action} eq "tailcmd" or $FORM{action} =~ /^cf/ or $FORM{action} eq "logtailcmd" or $FORM{action} eq "loggrepcmd") {
-	print <<EOF;
-<!doctype html>
-<html lang='en' $htmltag>
-<head>
-	<title>ConfigServer Security &amp; Firewall</title>
-	<meta charset='utf-8'>
-	<meta name='viewport' content='width=device-width, initial-scale=1'>
-	$bootstrapcss
-	<link href='$images/configserver.css' rel='stylesheet' type='text/css'>
-	$jqueryjs
-	$bootstrapjs
-
-<style>
-.mobilecontainer {
-	display:none;
-}
-.normalcontainer {
-	display:block;
-}
-EOF
-	if ($config{STYLE_MOBILE}) {
-		print <<EOF;
-\@media (max-width: 600px) {
-	.mobilecontainer {
-		display:block;
-	}
-	.normalcontainer {
-		display:none;
-	}
-}
-EOF
-	}
-	print "</style>\n";
-	print @header;
-	print <<EOF;
-</head>
-<body $bodytag>
-<div id="loader"></div>
-<a id='toplink' class='toplink' title='Go to bottom'><span class='glyphicon glyphicon-hand-down'></span></a>
-<div class='container-fluid'>
-<br>
-<div class='panel panel-default'>
-<h4><img src='$images/csf_small.png' style='padding-left: 10px'> ConfigServer Security &amp; Firewall - csf v$myv</h4>
+###############################################################################
+# The csf pages that used to render here came from ConfigServer::DisplayUI
+# (and ConfigServer::DisplayResellerUI for the reseller view). Those modules
+# were removed - see CHANGES.md for the whole retirement.
+#
+# This entry point is deliberately KEPT, and deliberately still registered
+# with the control panel. A plugin button that 404s, or an empty frame, tells
+# an operator nothing and leaves them guessing whether csf itself is gone.
+# csf is not gone; only this interface to it is, and this page says so and
+# says where the replacement lives.
+#
+# Deliberately self-contained: the stylesheet, jQuery, Bootstrap and Chosen
+# this page used to load were deleted in the same change, so it must not
+# reference them, and it uses no JavaScript at all.
+###############################################################################
+print <<"EOF";
+<div style="font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif;line-height:1.55;max-width:44em;margin:1.5em;color:#222">
+<h2 style="margin:0 0 .15em 0">ConfigServer Security &amp; Firewall</h2>
+<p style="margin:0 0 1.25em 0;color:#666">csf v$myv</p>
+<div style="border-left:4px solid #a94442;background:#fdf6f6;padding:.75em 1em;margin:0 0 1.25em 0">
+<strong>The csf interface built into this control panel has been retired.</strong><br>
+It ran as root, rendered every page from a single 5,000-line module and had no
+CSRF protection. It was removed rather than patched.
+</div>
+<p><strong>csf itself is unaffected.</strong> The firewall, lfd and every
+command-line feature are running exactly as before. No rule, allow list, deny
+list or block has changed.</p>
+<h3 style="margin:1.6em 0 .4em 0">Where the web interface went</h3>
+<p>Its replacement is <strong>csf-ui</strong>, a separate web interface with its
+own accounts. It has a <code>support</code> role that corresponds to the reseller
+view you used here - the same blocks, allows and lookups, without the
+server-wide configuration.</p>
+<p>Ask your server administrator for its address and an account. There is
+nothing left to configure on this page.</p>
 </div>
 EOF
-}
 
-ConfigServer::DisplayResellerUI::main(\%FORM, $script, 0, $images, $myv);
-
-unless ($FORM{action} eq "tailcmd" or $FORM{action} =~ /^cf/ or $FORM{action} eq "logtailcmd" or $FORM{action} eq "loggrepcmd") {
-	print <<EOF;
-<a class='botlink' id='botlink' title='Go to top'><span class='glyphicon glyphicon-hand-up'></span></a>
-<script>
-	function getCookie(cname) {
-		var name = cname + "=";
-		var ca = document.cookie.split(';');
-		for(var i = 0; i <ca.length; i++) {
-			var c = ca[i];
-			while (c.charAt(0)==' ') {
-				c = c.substring(1);
-			}
-			if (c.indexOf(name) == 0) {
-				return c.substring(name.length,c.length);
-			}
-		}
-		return "";
-	} 
-	\$("#loader").hide();
-	\$.fn.scrollBottom = function() { 
-	  return \$(document).height() - this.scrollTop() - this.height(); 
-	};
-	\$('#botlink').on("click",function(){
-		\$('html,body').animate({ scrollTop: 0 }, 'slow', function () {});
-	});
-	\$('#toplink').on("click",function() {
-		var window_height = \$(window).height();
-		var document_height = \$(document).height();
-		\$('html,body').animate({ scrollTop: window_height + document_height }, 'slow', function () {});
-	});
-	\$('#tabAll').click(function(){
-		\$('#tabAll').addClass('active');
-		\$('.tab-pane').each(function(i,t){
-			\$('#myTabs li').removeClass('active');
-			\$(this).addClass('active');
-		});
-	});
-	\$(document).ready(function(){
-		\$('[data-tooltip="tooltip"]').tooltip();
-		\$(window).scroll(function () {
-			if (\$(this).scrollTop() > 500) {
-				\$('#botlink').fadeIn();
-			} else {
-				\$('#botlink').fadeOut();
-			}
-			if (\$(this).scrollBottom() > 500) {
-				\$('#toplink').fadeIn();
-			} else {
-				\$('#toplink').fadeOut();
-			}
-		});
-EOF
-	if ($config{STYLE_MOBILE}) {
-		print <<EOF;
-		var csfview = getCookie('csfview');
-		if (csfview == 'mobile') {
-			\$(".mobilecontainer").css('display','block');
-			\$(".normalcontainer").css('display','none');
-			\$("#csfreturn").addClass('btn-primary btn-lg btn-block').removeClass('btn-default');
-		} else if (csfview == 'desktop') {
-			\$(".mobilecontainer").css('display','none');
-			\$(".normalcontainer").css('display','block');
-			\$("#csfreturn").removeClass('btn-primary btn-lg btn-block').addClass('btn-default');
-		}
-EOF
-	}
-	print "});\n";
-	if ($config{STYLE_MOBILE}) {
-		print <<EOF;
-	\$("#NormalView").click(function(){
-		document.cookie = "csfview=desktop; path=/";
-		\$(".mobilecontainer").css('display','none');
-		\$(".normalcontainer").css('display','block');
-	});
-	\$("#MobileView").click(function(){
-		document.cookie = "csfview=mobile; path=/";
-		\$(".mobilecontainer").css('display','block');
-		\$(".normalcontainer").css('display','none');
-	});
-EOF
-	}
-	print "</script>\n";
-	print @footer;
-	print "</body>\n";
-	print "</html>\n";
-}
 sub getexe {
 	my $thispid = shift;
 	open (my $STAT, "<", "/proc/".$thispid."/stat");

@@ -25,10 +25,9 @@ use Fcntl qw(:DEFAULT :flock);
 use Sys::Hostname qw(hostname);
 use IPC::Open3;
 use lib '/usr/local/csf/lib';
-use ConfigServer::DisplayUI;
 use ConfigServer::Config;
 
-our ($script, $images, $myv, %FORM, %in);
+our ($myv, %FORM, %in);
 
 my $config = ConfigServer::Config->loadconfig();
 my %config = $config->config;
@@ -38,8 +37,6 @@ $myv = <$IN>;
 close ($IN);
 chomp $myv;
 
-$script = "index.cgi";
-$images = "csfimages";
 
 do '../web-lib.pl';      
 &init_config();         
@@ -50,200 +47,61 @@ if ($config{STYLE_CUSTOM} and $ENV{'REQUEST_URI'} =~ /xnavigation=1/ and $ENV{'H
 
 print "Content-type: text/html\r\n\r\n";
 
-my $bootstrapcss = "<link rel='stylesheet' href='$images/bootstrap/css/bootstrap.min.css'>";
-my $jqueryjs = "<script src='$images/jquery.min.js'></script>";
-my $bootstrapjs = "<script src='$images/bootstrap/js/bootstrap.min.js'></script>";
-
-my @header;
-my @body;
-my @footer;
-my $bodytag;
-my $htmltag = " data-post='$FORM{action}' ";
-if (-e "/etc/csf/csf.header") {
-	open (my $HEADER, "<", "/etc/csf/csf.header");
-	flock ($HEADER, LOCK_SH);
-	@header = <$HEADER>;
-	close ($HEADER);
-}
-if (-e "/etc/csf/csf.body") {
-	open (my $BODY, "<", "/etc/csf/csf.body");
-	flock ($BODY, LOCK_SH);
-	@body = <$BODY>;
-	close ($BODY);
-}
-if (-e "/etc/csf/csf.footer") {
-	open (my $FOOTER, "<", "/etc/csf/csf.footer");
-	flock ($FOOTER, LOCK_SH);
-	@footer = <$FOOTER>;
-	close ($FOOTER);
-}
-if (-e "/etc/csf/csf.htmltag") {
-	open (my $HTMLTAG, "<", "/etc/csf/csf.htmltag");
-	flock ($HTMLTAG, LOCK_SH);
-	$htmltag .= <$HTMLTAG>;
-	chomp $htmltag;
-	close ($HTMLTAG);
-}
-if (-e "/etc/csf/csf.bodytag") {
-	open (my $BODYTAG, "<", "/etc/csf/csf.bodytag");
-	flock ($BODYTAG, LOCK_SH);
-	$bodytag = <$BODYTAG>;
-	chomp $bodytag;
-	close ($BODYTAG);
-}
-unless ($config{STYLE_CUSTOM}) {
-	undef @header;
-	undef @body;
-	undef @footer;
-	$htmltag = "";
-	$bodytag = "";
-}
-
-unless ($FORM{action} eq "tailcmd" or $FORM{action} =~ /^cf/ or $FORM{action} eq "logtailcmd" or $FORM{action} eq "loggrepcmd") {
-	print "<!doctype html>\n";
-	print "<html lang='en' $htmltag>\n";
-	print "<head>\n";
-	print "	<title>ConfigServer Security &amp; Firewall</title>\n";
-	print "	<meta charset='utf-8'>\n";
-	print "	<meta name='viewport' content='width=device-width, initial-scale=1'>\n";
-	print "	$bootstrapcss\n";
-	print "	<link href='$images/configserver.css' rel='stylesheet' type='text/css'>\n";
-	print "	$jqueryjs\n";
-	print "	$bootstrapjs\n";
-	print "<style>\n";
-	print ".mobilecontainer {\n";
-	print "	display:none;\n";
-	print "}\n";
-	print ".normalcontainer {\n";
-	print "	display:block;\n";
-	print "}\n";
-	if ($config{STYLE_MOBILE}) {
-		print "\@media (max-width: 600px) {\n";
-		print "	.mobilecontainer {\n";
-		print "		display:block;\n";
-		print "	}\n";
-		print "	.normalcontainer {\n";
-		print "		display:none;\n";
-		print "	}\n";
-		print "}\n";
-	}
-	print "</style>\n";
-	print @header;
-	print "</head>\n";
-	print "<body $bodytag>\n";
-	print @body;
-	print "<div id='loader'></div>\n";
-	print "<a id='toplink' class='toplink' title='Go to bottom'><span class='glyphicon glyphicon-hand-down'></span></a>\n";
-	print "<div class='container-fluid'>\n";
-	print "<div class='panel panel-default'>\n";
-	print "<h4><img src='$images/csf_small.png' style='padding-left: 10px'> ConfigServer Security &amp; Firewall - csf v$myv</h4>\n";
-	print "</div>\n";
-}
-
-ConfigServer::DisplayUI::main(\%FORM, $script, 0, $images, $myv);
-
-unless ($FORM{action} eq "tailcmd" or $FORM{action} =~ /^cf/ or $FORM{action} eq "logtailcmd" or $FORM{action} eq "loggrepcmd") {
-	print "<a class='botlink' id='botlink' title='Go to top'><span class='glyphicon glyphicon-hand-up'></span></a>\n";
-	print "<script>\n";
-	print "	\$('#loader').hide();\n";
-	print "	function getCookie(cname) {\n";
-	print "		var name = cname + '=';\n";
-	print "		var ca = document.cookie.split(';');\n";
-	print "		for(var i = 0; i <ca.length; i++) {\n";
-	print "			var c = ca[i];\n";
-	print "			while (c.charAt(0)==' ') {\n";
-	print "				c = c.substring(1);\n";
-	print "			}\n";
-	print "			if (c.indexOf(name) == 0) {\n";
-	print "				return c.substring(name.length,c.length);\n";
-	print "			}\n";
-	print "		}\n";
-	print "		return '';\n";
-	print "	} \n";
-	print "	\$.fn.scrollBottom = function() { \n";
-	print "	  return \$(document).height() - this.scrollTop() - this.height(); \n";
-	print "	};\n";
-	print "	\$('#botlink').on('click',function(){\n";
-	print "		\$('html,body').animate({ scrollTop: 0 }, 'slow', function () {});\n";
-	print "	});\n";
-	print "	\$('#toplink').on('click',function() {\n";
-	print "		var window_height = \$(window).height();\n";
-	print "		var document_height = \$(document).height();\n";
-	print "		\$('html,body').animate({ scrollTop: window_height + document_height }, 'slow', function () {});\n";
-	print "	});\n";
-	print "	\$('#tabAll').click(function(){\n";
-	print "		\$('#tabAll').addClass('active');\n";
-	print "		\$('.tab-pane').each(function(i,t){\n";
-	print "			\$('#myTabs li').removeClass('active');\n";
-	print "			\$(this).addClass('active');\n";
-	print "		});\n";
-	print "	});\n";
-	print "	\$(document).ready(function(){\n";
-	print "		\$('[data-tooltip=\"tooltip\"]').tooltip();\n";
-	print "		\$(window).scroll(function () {;\n";
-	print "			if (\$(this).scrollTop() > 500) {;\n";
-	print "				\$('#botlink').fadeIn();;\n";
-	print "			} else {;\n";
-	print "				\$('#botlink').fadeOut();;\n";
-	print "			};\n";
-	print "			if (\$(this).scrollBottom() > 500) {;\n";
-	print "				\$('#toplink').fadeIn();;\n";
-	print "			} else {;\n";
-	print "				\$('#toplink').fadeOut();;\n";
-	print "			};\n";
-	print "		});\n";
-	if ($config{STYLE_MOBILE}) {
-		print "		var csfview = getCookie('csfview');\n";
-		print "		if (csfview == 'mobile') {\n";
-		print "			\$('.mobilecontainer').css('display','block');\n";
-		print "			\$('.normalcontainer').css('display','none');\n";
-		print "			\$('#csfreturn').addClass('btn-primary btn-lg btn-block').removeClass('btn-default');\n";
-		print "		} else if (csfview == 'desktop') {\n";
-		print "			\$('.mobilecontainer').css('display','none');\n";
-		print "			\$('.normalcontainer').css('display','block');\n";
-		print "			\$('#csfreturn').removeClass('btn-primary btn-lg btn-block').addClass('btn-default');\n";
-		print "		}\n";
-		print "		if (top.location == location) {\n";
-		print "			\$('#webmintr2').show();\n";
-		print "		} else {\n";
-		print "			\$('#webmintr2').hide();\n";
-		print "		}\n";
-		print "		if (\$('.mobilecontainer').css('display') == 'block' ) {\n";
-		print "			document.cookie = 'csfview=mobile; path=/';\n";
-		print "			if (top.location != location) {\n";
-		print "				top.location.href = document.location.href ;\n";
-		print "			}\n";
-		print "		}\n";
-		print "		\$(window).resize(function() {\n";
-		print "			if (\$('.mobilecontainer').css('display') == 'block' ) {\n";
-		print "				document.cookie = 'csfview=mobile; path=/';\n";
-		print "				if (top.location != location) {\n";
-		print "					top.location.href = document.location.href ;\n";
-		print "				}\n";
-		print "			}\n";
-		print "		});\n";
-	}
-	print "});\n";
-	if ($config{STYLE_MOBILE}) {
-		print "	\$('#NormalView').click(function(){\n";
-		print "		document.cookie = 'csfview=desktop; path=/';\n";
-		print "		\$('.mobilecontainer').css('display','none');\n";
-		print "		\$('.normalcontainer').css('display','block');\n";
-		print "	});\n";
-		print "	\$('#MobileView').click(function(){\n";
-		print "		document.cookie = 'csfview=mobile; path=/';\n";
-		print "	if (top.location == location) {\n";
-		print "			\$('.normalcontainer').css('display','none');\n";
-		print "			\$('.mobilecontainer').css('display','block');\n";
-		print "		} else {\n";
-		print "			top.location.href = document.location.href;\n";
-		print "		}\n";
-		print "	});\n";
-	}
-	print "</script>\n";
-	print @footer;
-	print "</body>\n";
-	print "</html>\n";
-}
+###############################################################################
+# The csf pages that used to render here came from ConfigServer::DisplayUI
+# (and ConfigServer::DisplayResellerUI for the reseller view). Those modules
+# were removed - see CHANGES.md for the whole retirement.
+#
+# This entry point is deliberately KEPT, and deliberately still registered
+# with the control panel. A plugin button that 404s, or an empty frame, tells
+# an operator nothing and leaves them guessing whether csf itself is gone.
+# csf is not gone; only this interface to it is, and this page says so and
+# says where the replacement lives.
+#
+# Deliberately self-contained: the stylesheet, jQuery, Bootstrap and Chosen
+# this page used to load were deleted in the same change, so it must not
+# reference them, and it uses no JavaScript at all.
+###############################################################################
+print <<"EOF";
+<!doctype html>
+<html lang='en'>
+<head>
+<title>ConfigServer Security &amp; Firewall</title>
+<meta charset='utf-8'>
+<meta name='viewport' content='width=device-width, initial-scale=1'>
+</head>
+<body>
+<div style="font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif;line-height:1.55;max-width:44em;margin:1.5em;color:#222">
+<h2 style="margin:0 0 .15em 0">ConfigServer Security &amp; Firewall</h2>
+<p style="margin:0 0 1.25em 0;color:#666">csf v$myv</p>
+<div style="border-left:4px solid #a94442;background:#fdf6f6;padding:.75em 1em;margin:0 0 1.25em 0">
+<strong>The csf interface built into this control panel has been retired.</strong><br>
+It ran as root, rendered every page from a single 5,000-line module and had no
+CSRF protection. It was removed rather than patched.
+</div>
+<p><strong>csf itself is unaffected.</strong> The firewall, lfd and every
+command-line feature are running exactly as before. No rule, allow list, deny
+list or block has changed.</p>
+<h3 style="margin:1.6em 0 .4em 0">Where the web interface went</h3>
+<p>Its replacement is <strong>csf-ui</strong>. It runs as an unprivileged user
+behind your own web server and reaches root only through a small helper over a
+unix socket with a fixed list of operations.</p>
+<p>On this server, as root:</p>
+<pre style="background:#f4f4f4;padding:.6em 1em;overflow:auto;margin:0 0 1em 0">/usr/local/csf-ui/bin/csf-ui-setup</pre>
+<p>It asks which addresses may reach the interface and creates the first
+account, then prints the address to browse to. If that command is not there,
+csf-ui was not installed - re-run the csf installer.</p>
+<h3 style="margin:1.6em 0 .4em 0">Or use the command line</h3>
+<p><code>csf -h</code> lists every option. The full manual is
+<code>/etc/csf/readme.txt</code>.</p>
+<h3 style="margin:1.6em 0 .4em 0">One thing worth doing now</h3>
+<p>The retired interface kept its password in plain text in
+<code>/etc/csf/csf.conf</code>, as <code>UI_PASS</code>. Nothing reads that
+setting any more, but the value is still sitting in the file. If it is a
+password you use anywhere else, change it there.</p>
+</div>
+</body>
+</html>
+EOF
 
 1;
