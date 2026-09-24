@@ -129,6 +129,67 @@ merge-base too.
 `ui-src/lib/ConfigServer/UI/HTTP.pm` is unmodified (frozen). No file's mode
 changed. No new `ui.conf` key.
 
+**2026-09-24, same task, second pass** — removing the UI left three more things
+pointing at nothing, and they are the mirror image of the failure the rest of
+this entry is about: instead of a page that 404s, **a setting and a documented
+feature that silently stop doing anything while the documentation still
+promises them.** Found by sweeping every key in the shipped `csf.conf`, and
+every `/etc/csf`, `/var/lib/csf` and `/usr/local/csf` path named by code, for
+"referenced at the merge-base, referenced by no code at HEAD".
+
+- **UI skinning and the Mobile View are gone** (`csf.conf` and the six panel
+  configs, `readme.txt` section 26). `/etc/csf/csf.header`, `csf.body`,
+  `csf.footer`, `csf.htmltag` and `csf.bodytag` were read by five code files at
+  the merge-base (`lfd.pl`, `cpanel/csf.cgi`, both DirectAdmin CGIs,
+  `webmin/csf/index.cgi`) and by none now, yet `readme.txt` still told
+  operators to create them. `STYLE_MOBILE` is read by nothing at all. Both keys
+  keep their values and gain a `Was:` note; section 26 now says the feature was
+  removed, that existing files are never opened and are not deleted either, and
+  why the replacement is deliberately not skinnable — the old mechanism pasted
+  operator-supplied text into every page's `<head>`, `<body>` and tag
+  attributes, including the login page, inside an interface running as root.
+  `STYLE_CUSTOM` is still *read*, at `webmin/csf/index.cgi`, for an unrelated
+  xnavigation redirect; the note says so.
+- **`RESTRICT_UI` no longer restricts anything**, and `ConfigServer/
+  ServerCheck.pm` has stopped claiming it does. Its nine enforcement points
+  were all in the deleted `DisplayUI.pm`, but `csf --servercheck` still carried
+  it in the brute-force option list — a security report affirming a control
+  that does not exist. Measured on the real code path: at the shipped default
+  `"1"` it emitted a green pass for a protection that had stopped protecting,
+  and at `"0"` it emitted a **red failure** telling the operator to enable
+  something inert. It is now reported explicitly and never counted either way.
+  Nothing replaces it, and nothing needs to: csf-ui's operation list is frozen
+  and closed and **no operation writes a setting**, so the strictest thing
+  `RESTRICT_UI = "2"` ever bought is now the only available behaviour.
+- **`csf.div` and `restricted.txt` deleted**, with their lines in all seven
+  installers. `csf.div` (a 230-line Dynamic Drive pagination script, carrying
+  its own third-party notice — the third such asset this task found whose only
+  consumer had been deleted) and `restricted.txt` (the 105-key list
+  `RESTRICT_UI` enforced) were read only by `DisplayUI.pm` and were still being
+  copied to `/usr/local/csf/lib` on every install.
+
+**A correction to this entry's own advice.** It said the `UI_*` keys could
+safely be deleted by hand. They cannot: `auto.pl` and the six `auto.*.pl`
+rebuild `csf.conf` from the shipped file and keep the operator's value only for
+keys they find, so a hand-deleted key is written back with the **shipped
+default** and reported as "New setting". An operator who deletes the `UI_PASS`
+line precisely to get a plaintext password out of the file gets
+`UI_PASS = "password"` restored at the next upgrade — and it looks as though
+the deletion worked until then. The comment now says that and points at the fix
+that does work.
+
+**Security fix, claimed here because a fix nobody records is one nobody can
+find later.** Rewriting the panel entry points closed a reflected-XSS vector.
+At the merge-base `webmin/csf/index.cgi`, `da/exec/da_csf.cgi` and
+`da/exec/da_csf_reseller.cgi` each built `$htmltag` from
+`" data-post='$FORM{action}' "` — `$FORM{action}` is attacker-controlled — and
+printed it **unescaped** into `<html lang='en' $htmltag>` from an interpolating
+heredoc. It was reachable only with `STYLE_CUSTOM = "1"` (not the default),
+which is why it is narrow rather than severe; `cpanel/csf.cgi` assigned
+`$htmltag` the same way but never printed it. At HEAD the only value
+interpolated into any of the nine pages' output is `$myv`, read from
+root-written `/etc/csf/version.txt` — verified across all nine.
+
 #### Task 10 — the hostile-input and integration pass
 
 **2026-09-22** — `t/90-fuzz-http.t`, `t/91-fuzz-rpc.t`, `t/92-integration.t`,

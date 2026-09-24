@@ -86,7 +86,7 @@ This document contains:
 
 25. Exim SMTP AUTH Restriction
 
-26. UI Skinning and Mobile View
+26. UI Skinning and Mobile View - REMOVED
 
 27. CloudFlare
 
@@ -1487,56 +1487,43 @@ auth_advertise_hosts = ${if match_ip{$sender_host_address}{iplsearch;/etc/exim.s
 3. Be sure to test extensively to ensure the option works as expected
 
 
-26. UI Skinning and Mobile View
-###############################
+26. UI Skinning and Mobile View - REMOVED
+#########################################
 
-The csf UI provided through cPanel, DirectAdmin, Webmin and the integrated UI
-via lfd, all user the Bootstrap and jQuery frameworks. Additional styling is
-added to complement the frameworks and the UI flow.
+UI skinning and the Mobile View have been REMOVED, along with the UI they
+applied to. See CHANGES.md.
 
-If you want to make changes to the styling or add jQuery or JavaScript code you
-can create:
+Up to v15.00 the csf pages served through cPanel, DirectAdmin, Webmin and lfd's
+own integrated UI were built on Bootstrap and jQuery, and could be restyled by
+creating files that were injected into every page:
 
-1. A text file /etc/csf/csf.header which will be included in each of
-the UI pages before the closing </head> tag
+  /etc/csf/csf.header    /etc/csf/csf.body     /etc/csf/csf.footer
+  /etc/csf/csf.htmltag   /etc/csf/csf.bodytag
 
-2. A text file /etc/csf/csf.body which will be included in each of the UI
-pages after the opening <body> tag[*]
+NO CODE READS ANY OF THOSE FIVE FILES NOW. Creating them has no effect, and on
+a server where they already exist they are simply never opened. They are not
+deleted by an upgrade - removing an operator's files is the worse mistake - but
+nothing acts on them. STYLE_CUSTOM and STYLE_MOBILE in csf.conf are annotated
+accordingly and left in place so that your setting is not silently discarded.
 
-3. A text file /etc/csf/csf.footer which will be included in each of the UI
-pages before the closing </body> tag
+The Mobile View is gone with the rest: there is no 600px breakpoint switch, no
+frameset escape, and no "csfview" session cookie remembering which view you
+last used. The replacement interface, csf-ui, is responsive without needing a
+mode to switch between.
 
-The html tag will also have a data-post field containing the internal action
-being performed by the UI.
+The replacement is not skinnable, and that is deliberate rather than an
+oversight. The old mechanism worked by pasting operator-supplied text into
+every page's <head>, <body>, <html> tag and <body> tag - including the page
+that took the login - which is an arbitrary-script-injection point by design,
+in an interface that ran as root. csf-ui serves one stylesheet of its own and
+interpolates nothing that did not come from root-written state.
 
-You can also make additions to the <html> and <body> tags by creating
-/etc/csf/csf.htmltag and /etc/csf/csf.bodytag respectively[*]. Additions made
-in these files MUST all be on a single line at the top of the file, anything
-else will be ignored. The text will then be placed within the respective tag,
-e.g. if you want <body data-name='result'> you would put the following on a
-single line in /etc/csf/csf.bodytag:
-data-name='result'
+One residue worth knowing about: STYLE_CUSTOM is still READ, at
+webmin/csf/index.cgi, where it gates an unrelated redirect for Webmin's
+xnavigation requests. That is the only remaining effect of either STYLE_*
+option, and it has nothing to do with styling.
 
-[*] This functionality is ONLY available on webmin servers
-
-The Mobile View feature has a breakpoint of 600px which will initiate the full
-browser subset of UI features. This may mean breaking out of framesets in some
-control panels, so a return to the main control panel window is included. Also
-switching back to the Desktop view will remain in the full browser display.
-
-If you switch to the Mobile View and then switch to main control panel window
-further accesses to the UI will always default to the Mobile View. If you
-switch back after returning to the Desktop View, subsequent access will default
-to that view. This reverts back to the default breakpoint behaviour in new
-browser sessions as the system uses session cookies to keep track of the chosen
-view which are reset one browser shutdown.
-
-There are options in csf.conf that control the behaviour of these options under
-STYLE_*. Any styling changes MUST respect these options.
-
-Note: We do NOT recommend reformatting the UI output as any changes in the core
-code may not be reflected in the user experience and can break the product.
-Only style changes should be made.
+See section 22 for csf-ui itself and how to set it up.
 
 
 27. CloudFlare
