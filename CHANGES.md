@@ -161,6 +161,14 @@ every `/etc/csf`, `/var/lib/csf` and `/usr/local/csf` path named by code, for
   Nothing replaces it, and nothing needs to: csf-ui's operation list is frozen
   and closed and **no operation writes a setting**, so the strictest thing
   `RESTRICT_UI = "2"` ever bought is now the only available behaviour.
+- **`csf.syslogs` annotated, not deleted.** Its own header said it listed the
+  log files for "the UI System Log Watch and Search features"; those pages are
+  gone and csf-ui has no log-viewing operation, so nothing reads it. Unlike the
+  two files above it is an operator-EDITED file under `/etc/csf`, so it is kept
+  and its header now says it is inert. One limitation stated in the file
+  itself: the installer copies it only when `/etc/csf/csf.syslogs` does not
+  already exist, so on an existing server the notice never appears - the file
+  you edited is unchanged, and equally unread.
 - **`csf.div` and `restricted.txt` deleted**, with their lines in all seven
   installers. `csf.div` (a 230-line Dynamic Drive pagination script, carrying
   its own third-party notice — the third such asset this task found whose only

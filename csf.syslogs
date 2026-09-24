@@ -16,10 +16,22 @@
 # You should have received a copy of the GNU General Public License along with
 # this program; if not, see <https://www.gnu.org/licenses>.
 ###############################################################################
-# The following is a list of log files for the UI System Log Watch and Search
-# features. IF they exists they will apear in the drop-down lists
+# NOTHING READS THIS FILE ANY MORE. See CHANGES.md.
 #
-# File globbing is supported for logs listed below
+# It listed the log files offered by the UI's System Log Watch and Search
+# features - the drop-down lists on those two pages. Those features lived in the
+# built-in UI, which was removed, and its replacement csf-ui has no log-viewing
+# operation: its operation list is frozen and closed (docs/WEBUI-RPC.md S5).
+#
+# The file is still shipped and still installed, and your edits to it are still
+# here, because a config file that vanishes takes its operator's work with it
+# and says nothing. But adding a path below now has no effect anywhere.
+#
+# Note that the installer only copies this file when /etc/csf/csf.syslogs does
+# not already exist, so on an existing server this notice will NOT appear -
+# the file you have is the one you edited, unchanged, and equally unread.
+#
+# File globbing was supported for the logs listed below
 
 # All:
 /var/log/cron
