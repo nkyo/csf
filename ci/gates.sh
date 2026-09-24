@@ -151,6 +151,75 @@ else
 	fi
 fi
 
+# ---------------------------------------------------------------------------
+# A PRECONDITION `perl -c` HAS IN THIS TREE, AND WHY IT IS NOT A SKIP.
+#
+# Task 11 brought lfd.pl and the nine control-panel entry points into this
+# gate's diff scope for the first time. Measured at the merge-base, BEFORE
+# any of Task 11's edits, every one of them already failed `perl -I. -c`:
+#
+#   *Error* File does not exist: [/etc/csf/csf.conf] at ConfigServer/Config.pm
+#   *Error* The path to iptables is either not set or incorrect for IPTABLES []
+#   BEGIN failed--compilation aborted at lfd.pl line 33.
+#
+# That is not a syntax error. Several of this tree's modules - Logger.pm,
+# Sendmail.pm, Service.pm, URLGet.pm and others - call
+# `ConfigServer::Config->loadconfig()` at FILE SCOPE, so `use`ing any of them
+# reads /etc/csf/csf.conf during BEGIN, i.e. during `perl -c` itself. On a
+# checkout with no CSF installed that file is absent and loadconfig croaks,
+# and the croak happens at the first `use` - long before the parser ever
+# reaches the code this gate exists to check. A syntax error on line 9000
+# would never be reported, because BEGIN on line 33 died first.
+#
+# Reporting those files as "skipped" would be the tenth way a check passes
+# for the wrong reason: the gate would go green having compiled nothing.
+# Instead the gate REMOVES the precondition, and removes exactly it:
+#
+#   - If /etc/csf/csf.conf is readable, nothing below happens. The check is
+#     the plain `perl -I. -Iui-src/lib -c` it has always been.
+#   - If it is not, the gate builds a one-file overlay in $WORKDIR holding a
+#     copy of this repo's OWN ConfigServer/Config.pm with a single line
+#     changed - the hard-coded `my $configfile = "/etc/csf/csf.conf";` - to
+#     point at a copy of this repo's OWN shipped csf.conf, with IPTABLES and
+#     IP6TABLES set to whatever this machine actually has. Nothing is stubbed
+#     and no behaviour is faked: Logger.pm, Sendmail.pm, Service.pm, URLGet.pm
+#     and the file under test are all the genuine article and all really do
+#     execute their load-time loadconfig() - against a genuine csf.conf that
+#     exists. The single redirection is WHERE the config file lives.
+#
+# The substitution is VERIFIED, not assumed. `sed` that silently matches
+# nothing is precisely the position-anchored-extraction hazard this project
+# has already been bitten by, so the gate asserts afterwards that the copy
+# differs from the original in exactly one line and that the line now names
+# the overlay's csf.conf. If Config.pm's shape ever changes so the match
+# fails, this gate FAILS and says so - it does not quietly fall back to a
+# check that cannot work.
+# ---------------------------------------------------------------------------
+PERLC_OVERLAY=""
+if [ -r /etc/csf/csf.conf ]; then
+	note "   /etc/csf/csf.conf is present - compiling against the installed configuration"
+elif [ ! -f csf.conf ] || [ ! -f ConfigServer/Config.pm ]; then
+	note "   /etc/csf/csf.conf is absent and this checkout has no csf.conf/ConfigServer/Config.pm to build an overlay from - compiling without one"
+else
+	mkdir -p "$WORKDIR/perlc/ConfigServer" || exit 1
+	IPT=$(command -v iptables 2>/dev/null || echo /usr/sbin/iptables)
+	IP6T=$(command -v ip6tables 2>/dev/null || echo /usr/sbin/ip6tables)
+	sed -e "s|^IPTABLES = .*|IPTABLES = \"$IPT\"|" \
+	    -e "s|^IP6TABLES = .*|IP6TABLES = \"$IP6T\"|" \
+	    csf.conf > "$WORKDIR/perlc/csf.conf"
+	sed "s|^my \$configfile = \"/etc/csf/csf.conf\";\$|my \$configfile = \"$WORKDIR/perlc/csf.conf\";|" \
+	    ConfigServer/Config.pm > "$WORKDIR/perlc/ConfigServer/Config.pm"
+
+	# Assert the redirect actually happened, and that it is the ONLY change.
+	OVERLAY_DIFF=$(diff ConfigServer/Config.pm "$WORKDIR/perlc/ConfigServer/Config.pm" | grep -c '^[<>]')
+	if [ "$OVERLAY_DIFF" -ne 2 ] || ! grep -q "^my \$configfile = \"$WORKDIR/perlc/csf.conf\";\$" "$WORKDIR/perlc/ConfigServer/Config.pm"; then
+		fail "gate 1 could not build its ConfigServer::Config overlay: the \$configfile line in ConfigServer/Config.pm did not match the expected shape (got $OVERLAY_DIFF changed line(s), wanted exactly 2: one '<' and one '>'). Without the overlay every file that 'use's a config-loading module fails 'perl -c' for a missing /etc/csf/csf.conf and NOTHING below is really checked - so this is a gate failure, not a fallback"
+	else
+		PERLC_OVERLAY="-I$WORKDIR/perlc"
+		note "   /etc/csf/csf.conf is absent - compiling against this repo's own csf.conf via a one-line ConfigServer::Config overlay (see the comment above; the redirect was verified)"
+	fi
+fi
+
 PERL_CHECKED=0
 PERL_FAILED=0
 while IFS= read -r f; do
@@ -179,7 +248,12 @@ while IFS= read -r f; do
 	# missing a dependency that is one directory away, which is not a
 	# syntax error this gate exists to catch - it is the gate finding
 	# nothing, dressed up as if it found something.
-	if out=$(perl -I. -Iui-src/lib -c -- "$f" 2>&1); then
+	# The overlay goes FIRST: perl keeps -I entries in the order given, so an
+	# overlay listed after -I. would be shadowed by the real ConfigServer/
+	# Config.pm in the current directory and would do nothing at all - a
+	# fallback that silently is not one. Verified by compiling lfd.pl both
+	# ways.
+	if out=$(perl ${PERLC_OVERLAY:+"$PERLC_OVERLAY"} -I. -Iui-src/lib -c -- "$f" 2>&1); then
 		:
 	else
 		fail "perl -c $f"
