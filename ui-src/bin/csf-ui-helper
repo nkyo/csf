@@ -295,7 +295,25 @@ sub run_argv {
 		open(STDOUT, '>&', $writer) or POSIX::_exit(127);
 		open(STDERR, '>&', $writer) or POSIX::_exit(127);
 		close $writer;
-		$SIG{CHLD} = 'DEFAULT';
+
+		# EVERY disposition this process may have changed is put back
+		# before exec, the same named list and for the same reason as
+		# ConfigServer::UI::Firewall::run() - read its header comment,
+		# which is the long form of this one.
+		#
+		# Added 2026-09-24. This line reset only CHLD. main() sets
+		# $SIG{PIPE} = 'IGNORE' process-wide, before the accept loop, and
+		# SIG_IGN is INHERITED ACROSS exec where a handler is not - so
+		# every csf -d/-a/-td/-trd/-r and every iptables -S/-D this helper
+		# runs was running AS ROOT with SIGPIPE ignored, by a program that
+		# never asked for that and cannot see it was done to it. The rule
+		# is stated and enforced everywhere else in this branch
+		# (Firewall.pm's own reset, t/70's /proc/self/status proof,
+		# t/71's grep forbidding an unscoped ignore in csf-ui-setup);
+		# Firewall.pm's survey comment enumerated three callers and left
+		# this one - the only one that runs as root - out of the list.
+		$SIG{$_} = 'DEFAULT' for qw(CHLD PIPE HUP INT TERM ALRM);
+
 		{
 			# The block form of exec cannot reach a shell, whatever the list
 			# holds - not even for a one-element list, which the string form
@@ -2137,6 +2155,15 @@ sub main {
 		}
 
 		close $listener;
+		# PIPE is deliberately NOT reset here, and that is not the defect
+		# fixed in run_argv() on 2026-09-24. This child does not exec: it
+		# answers one connection and _exits. It inherits main()'s
+		# $SIG{PIPE} = 'IGNORE' and wants it, because writing a response
+		# to a peer that has already hung up must return EPIPE to
+		# write_response()'s own error handling rather than kill this
+		# process outright. The inheritance only becomes a problem at an
+		# exec boundary, into a program that did not choose it - which is
+		# run_argv()'s child, and is reset there.
 		$SIG{CHLD} = 'DEFAULT';
 		$SIG{TERM} = 'DEFAULT';
 		$SIG{INT}  = 'DEFAULT';

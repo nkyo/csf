@@ -37,7 +37,7 @@ use File::Temp qw(tempdir);
 use Socket ();
 use Fcntl ();
 use JSON::Tiny ();
-use Test::More tests => 283;
+use Test::More tests => 289;
 
 my $HELPER_PATH = "$FindBin::Bin/../ui-src/bin/csf-ui-helper";
 my $PROTO_PATH  = "$FindBin::Bin/../ui-src/lib/ConfigServer/UI/Proto.pm";
@@ -1051,6 +1051,65 @@ SKIP: {
 	$result = $run->($fx->{ctx}, 1, '/bin/sleep', '30');
 	ok($result->{timeout} && time() - $started < 10,
 		'a child that outruns its deadline is killed rather than waited on');
+}
+
+###############################################################################
+# I5 - what this helper execs AS ROOT must not inherit an ignored signal
+#
+# main() sets $SIG{PIPE} = 'IGNORE' process-wide, for the accept loop, and
+# a signal HANDLER is reset by the kernel across exec on its own but SIG_IGN
+# is INHERITED. Until 2026-09-24 run_argv()'s child reset only $SIG{CHLD},
+# so every csf -d/-a/-td/-trd/-r and every iptables -S/-D this helper ran
+# was running as root with SIGPIPE ignored - a silent, lasting change to a
+# program this code did not write and cannot see it made.
+#
+# Measured from the exec'd child's OWN /proc/self/status, not asserted about
+# the source, and modelled on t/70-firewall-detect.t's identical proof for
+# ConfigServer::UI::Firewall::run(). Firewall.pm's survey comment listed
+# three callers of that rule and left this one - the only one that reaches
+# root - out, which is why the source-grep tests elsewhere in this suite
+# could all pass while this was true.
+###############################################################################
+SKIP: {
+	skip 'needs /proc/self/status and /bin/cat', 6
+		unless -r '/proc/self/status' && -x '/bin/cat';
+
+	my $fx = fixture();
+	my $run = $H->can('run_argv');
+
+	# Every disposition main() is capable of setting, set here the same way
+	# main() sets it - unscoped - so this proves what the real daemon does
+	# and not something narrower.
+	my %ignored;
+	{
+		local $SIG{PIPE} = 'IGNORE';
+		local $SIG{HUP}  = 'IGNORE';
+		local $SIG{INT}  = 'IGNORE';
+		local $SIG{TERM} = 'IGNORE';
+
+		my $result = $run->($fx->{ctx}, 10, '/bin/cat', '/proc/self/status');
+		my ($mask) = ($result->{output} || '') =~ /^SigIgn:\s*([0-9A-Fa-f]+)/m;
+		skip 'this kernel does not report SigIgn', 6 unless defined $mask;
+		my $bits = hex(substr($mask, -8));
+		%ignored = map { $_->[0] => (($bits & (1 << ($_->[1] - 1))) ? 1 : 0) }
+			(['PIPE', 13], ['HUP', 1], ['INT', 2], ['TERM', 15]);
+	}
+
+	is($ignored{PIPE}, 0,
+		'I5: what the helper execs as root does not inherit an ignored SIGPIPE');
+	is($ignored{HUP},  0, 'nor SIGHUP');
+	is($ignored{INT},  0, 'nor SIGINT');
+	is($ignored{TERM}, 0, 'nor SIGTERM - csf is entitled to start from the default');
+
+	# And the two halves of the rule that made this possible to miss: the
+	# helper really does set an unscoped ignore (so the risk is real, not
+	# theoretical), and run_argv() really does carry the same named reset
+	# list Firewall.pm carries (so the two cannot drift apart silently).
+	my $helper_source = _read($HELPER_PATH);
+	like($helper_source, qr/^\t\$SIG\{PIPE\} = 'IGNORE';$/m,
+		'I5 (premise): main() does set an unscoped SIGPIPE ignore - the reset above is not decoration');
+	like($helper_source, qr/\$SIG\{\$_\} = 'DEFAULT' for qw\(CHLD PIPE HUP INT TERM ALRM\);/,
+		'I5: run_argv() resets the same NAMED list ConfigServer::UI::Firewall::run() resets');
 }
 
 ###############################################################################

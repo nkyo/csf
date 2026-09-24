@@ -228,9 +228,23 @@ sub _run_argv {
 		# latter would also reset a handler this process's own caller relies
 		# on. A seventh signal changed anywhere in this codebase's callers
 		# (ConfigServer::UI::Server::run() sets PIPE/TERM/INT already
-		# covered here; csf-ui's own daemon entry point at the foot of
-		# ui-src/bin/csf-ui sets none) needs adding to this list BY HAND -
-		# nothing enforces that the two stay in sync.
+		# covered here; csf-ui-setup scopes its own PIPE ignore with local,
+		# which t/71-rollback.t asserts about the source; csf-ui's own
+		# daemon entry point at the foot of ui-src/bin/csf-ui sets none)
+		# needs adding to this list BY HAND - nothing enforces that the two
+		# stay in sync.
+		#
+		# CORRECTED 2026-09-24. The survey above listed three callers and
+		# omitted the fourth: ui-src/bin/csf-ui-helper's main(), which sets
+		# $SIG{PIPE} = 'IGNORE' process-wide for its accept loop and has
+		# its OWN fork+exec in run_argv(). It was written in Task 2, before
+		# this rule was generalised in Task 8, and was never revisited - so
+		# every csf and iptables the helper ran, AS ROOT, inherited an
+		# ignored SIGPIPE. run_argv() now resets this same named list, and
+		# t/11-helper-validate.t proves it the way t/70 proves it here:
+		# from the exec'd child's own /proc/self/status. A survey comment
+		# that names three of four callers is worse than none, because the
+		# fourth is the one nobody re-derives.
 		$SIG{$_} = 'DEFAULT' for qw(CHLD PIPE HUP INT TERM ALRM);
 
 		{
