@@ -680,6 +680,55 @@ to `ui-src/bin/csf-ui`'s own `unless (caller)` block; one comment in
   (`ConfigServer::UI::Firewall`) names what it does and does not track, since nothing
   enforces that a seventh signal disposition added elsewhere gets added here too.
 
+#### Task 8 fix round 5 — `TESTING_INTERVAL` was minutes, not seconds, and 300 lands in a cron minute field
+
+**2026-09-24** — One finding, and the one in this whole review pass able to damage something
+outside this feature.
+
+- **`$FORCED_TESTING_INTERVAL` was `'300'`**, forced onto every apply, reported to the operator
+  on the confirm page, and validated as `_check_range(5, 3600)` — a range that only makes sense
+  if the key is seconds. It is not: `csf.conf`'s own comment for it says "The interval for the
+  crontab in minutes", and `csf.pl:3380` renders the value straight into the **minute** field of
+  a line it writes to **`/etc/crontab`** — the shared system crontab, not a file this feature owns
+  alone:
+
+      */$config{TESTING_INTERVAL} * * * * root /usr/sbin/csf -f
+
+  The 300 had been chosen to match `ConfigServer::UI::Rollback`'s `$DEFAULT_WINDOW` (300
+  *seconds*) on the belief that the two settings shared a unit, so an operator watching the clock
+  would have one number instead of two. They did not: `TESTING_INTERVAL` is minutes, so the pair
+  was five minutes and five *hours* apart, not the same figure `Rollback.pm`'s own comment had
+  claimed.
+
+  MEASURED rather than reasoned about, on Ubuntu 24.04's `cron 3.0pl1-184ubuntu2` (the Debian
+  vixie-cron line): `/etc/crontab` is **not** rejected and the line is **not** dropped. cron warns
+  `Step size 300 higher than possible maximum of 59` and then sets exactly one bit — minute 0 — so
+  the flush advertised as every five minutes runs once an hour instead, and an operator who has
+  locked themselves out waits up to sixty minutes for a net that was sold as five. **This
+  measurement covers the Debian/Ubuntu cron family only. Other cron implementations are entitled
+  to reject the line outright, which does not merely misconfigure this feature — it silently
+  disables every other job already scheduled in `/etc/crontab`.**
+
+  Fixed for every new install and every new apply: the value (`5`, csf's own shipped default),
+  the validator (`_check_range(1, 60)`, taken from `sanity.txt`'s own row for this key rather than
+  invented), the confirm-page line, and `Rollback.pm`'s "the same figure" comment, which now names
+  the same *duration* the two settings share and the two units it is a duration for, instead of
+  implying they were the same number.
+
+  **This does not fix a host that already ran the wizard.** Any server where `csf-ui-setup` was
+  run at commit `f83b5e2` or earlier has `*/300` written into `/etc/crontab` right now, and
+  nothing in this branch rewrites a file it does not own on an upgrade. **If that is this host:**
+  open `/etc/crontab`, find the line added for csf (it ends `/usr/sbin/csf -f`), and correct the
+  minute field from `*/300` to `*/5` — or `*/N` for whatever `TESTING_INTERVAL` (1–60) you want —
+  by hand. If this host's cron is not the Debian/Ubuntu family measured above, also confirm the
+  rest of `/etc/crontab` is still being honoured once you are in there: a cron that rejects the
+  line outright rather than clamping it may have taken every other job in the file down with it,
+  silently, and this is the only warning that says so.
+
+`t/71-rollback.t` (line ~773): asserts `TESTING_INTERVAL = "5"` after `apply()`, and that an
+answers file naming `TESTING_INTERVAL="9000"` is refused. Test count for this file unaffected by
+this entry; see Task 11's entry above for the suite total this branch currently ships.
+
 #### Task 8 fix round 4 — a zombie that read as a living wizard, and an ignored signal that outlived the process that ignored it
 
 **2026-09-11** — Three findings and two message-quality items.
@@ -989,8 +1038,11 @@ about all three files is what they decline to do.
   address itself as well — two independent walls, so the inner one still stands if the rule
   is removed out from under it or was never as narrow as intended.
 
-- **Applying goes through csf's `TESTING=1` / `TESTING_INTERVAL=300` *and* an independent
-  systemd timer that belongs to neither csf nor lfd.** csf's own TESTING is a cron job csf
+- **Applying goes through csf's `TESTING=1` / `TESTING_INTERVAL=5` *and* an independent
+  systemd timer that belongs to neither csf nor lfd.** (This key shipped from this task as
+  `300` — a cron *minute* field, not the seconds it was mistaken for. See "Task 8 fix round 5"
+  above for what that did on a real host and what to check on a server that already applied
+  before the correction.) csf's own TESTING is a cron job csf
   installs, so it assumes csf's timer is still running — and the configurations most likely
   to lock somebody out are the ones most likely to stop lfd or leave csf unable to start. It
   also *flushes* rather than *restores*, which takes out rules csf never created (a Docker

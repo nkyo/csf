@@ -135,6 +135,22 @@ Mode A vhost and the `csfui` account. **`/etc/csf-ui` holds the account hashes
 and the TLS private key, and it is removed** — the same way `csf -u` already
 removes `/etc/csf`. The audit and access logs are kept.
 
+> **If you ran `csf-ui-setup` at commit `f83b5e2` or earlier, check `/etc/crontab`.**
+> The wizard's `TESTING_INTERVAL` was written as `300` on the mistaken belief it
+> shared a unit with the rollback window; the key is actually **minutes**, and
+> `csf.pl` renders it into the minute field of a line in `/etc/crontab` — a file
+> shared with every other system cron job on the host. On Debian/Ubuntu cron this
+> is not rejected, it is silently clamped to minute 0: the flush sold as every
+> five minutes runs once an hour, so a locked-out operator waits up to sixty
+> minutes instead of five. If `/etc/crontab` has a line ending `/usr/sbin/csf -f`
+> with `*/300` in the minute field, correct it by hand to `*/5` (or `*/N` for
+> whatever `TESTING_INTERVAL`, 1–60, you want). On a cron that is not the
+> Debian/Ubuntu family, also confirm the rest of `/etc/crontab` is still being
+> honoured — some implementations reject a line like that outright instead of
+> clamping it, taking every other job in that shared file down too. New installs
+> and new applies already write `5`; see [CHANGES.md](CHANGES.md), "Task 8 fix
+> round 5", for how this was measured.
+
 ## Documentation
 
 The upstream manual ships with the source and is still accurate:

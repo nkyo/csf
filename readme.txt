@@ -1328,6 +1328,19 @@ removed - the same way the uninstall already removes /etc/csf. The audit and
 access logs under /var/log are kept. Removing the web server's configuration
 file does not close the port on its own: reload that web server afterwards.
 
+If you ran /usr/local/csf-ui/bin/csf-ui-setup at commit f83b5e2 or earlier, check
+/etc/crontab now for a line ending "/usr/sbin/csf -f" with "*/300" in the minute
+field. That value was meant to be minutes and was written as if it were seconds;
+on Debian/Ubuntu cron it is not rejected, it is silently clamped to minute 0, so
+the flush advertised as every five minutes only runs once an hour - up to sixty
+minutes locked out instead of five. Fix the minute field by hand to */5 (or
+*/N for whatever TESTING_INTERVAL, 1-60, you want) if you find it. On a cron
+that is not the Debian/Ubuntu family, also confirm the rest of /etc/crontab is
+still being honoured: some implementations reject a line like that outright
+instead of clamping it, which takes every other job in that shared file down
+with it, not just this one. See CHANGES.md, Task 8 fix round 5, for how this
+was measured and how it was fixed for new installs.
+
 The UI_* settings in /etc/csf/csf.conf are left in place, with whatever values
 this server had, so that an upgrade does not silently delete them. Nothing acts
 on them - UI and UI_PORT are still read, but only so lfd can log the notice
