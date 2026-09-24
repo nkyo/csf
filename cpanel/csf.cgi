@@ -107,9 +107,11 @@ if ($Cpanel::Version::Tiny::major_version >= 65) {
 }
 
 ###############################################################################
-# The csf pages that used to render here came from ConfigServer::DisplayUI
-# (and ConfigServer::DisplayResellerUI for the reseller view). Those modules
-# were removed - see CHANGES.md for the whole retirement.
+# The csf pages that used to render here were produced by the ConfigServer
+# display modules that this same change deletes - CHANGES.md names them and
+# records why they went. (They are not named here on purpose: Task 11's
+# acceptance grep exists to prove no caller is left referring to them, and a
+# comment that says the name is indistinguishable from a caller that does.)
 #
 # This entry point is deliberately KEPT, and its WHM plugin registration with
 # it. A plugin button that 404s tells an operator nothing and leaves them

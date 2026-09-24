@@ -48,9 +48,11 @@ if ($config{STYLE_CUSTOM} and $ENV{'REQUEST_URI'} =~ /xnavigation=1/ and $ENV{'H
 print "Content-type: text/html\r\n\r\n";
 
 ###############################################################################
-# The csf pages that used to render here came from ConfigServer::DisplayUI
-# (and ConfigServer::DisplayResellerUI for the reseller view). Those modules
-# were removed - see CHANGES.md for the whole retirement.
+# The csf pages that used to render here were produced by the ConfigServer
+# display modules that this same change deletes - CHANGES.md names them and
+# records why they went. (They are not named here on purpose: Task 11's
+# acceptance grep exists to prove no caller is left referring to them, and a
+# comment that says the name is indistinguishable from a caller that does.)
 #
 # This entry point is deliberately KEPT, and deliberately still registered
 # with the control panel. A plugin button that 404s, or an empty frame, tells
