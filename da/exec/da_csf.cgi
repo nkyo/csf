@@ -129,11 +129,14 @@ list or block has changed.</p>
 <p>Its replacement is <strong>csf-ui</strong>. It runs as an unprivileged user
 behind your own web server and reaches root only through a small helper over a
 unix socket with a fixed list of operations.</p>
-<p>On this server, as root:</p>
-<pre style="background:#f4f4f4;padding:.6em 1em;overflow:auto;margin:0 0 1em 0">/usr/local/csf-ui/bin/csf-ui-setup</pre>
-<p>It asks which addresses may reach the interface and creates the first
-account, then prints the address to browse to. If that command is not there,
-csf-ui was not installed - re-run the csf installer.</p>
+<p>The csf installer sets it up: re-run it at a terminal, as root, and it asks
+which mode to use and which addresses may reach the interface, writes this
+server's web server configuration and enables the services. Then create an
+account - there is no default one, and nothing can log in until you do:</p>
+<pre style="background:#f4f4f4;padding:.6em 1em;overflow:auto;margin:0 0 1em 0">/usr/local/csf-ui/bin/csf-ui-passwd add &lt;user&gt; admin</pre>
+<p>The role is <code>admin</code> or <code>support</code>. If
+<code>/usr/local/csf-ui/</code> is not there at all, csf-ui was not installed -
+re-run the csf installer.</p>
 <h3 style="margin:1.6em 0 .4em 0">Or use the command line</h3>
 <p><code>csf -h</code> lists every option. The full manual is
 <code>/etc/csf/readme.txt</code>.</p>

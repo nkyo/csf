@@ -681,7 +681,7 @@ if ($config{UI}) {
 	# silently stopped answering. lfd does not listen on UI_PORT any more,
 	# in any configuration.
 	$config{UI} = 0;
-	logfile("csf Integrated UI: UI is enabled in csf.conf but the Integrated UI has been REMOVED - lfd is NOT listening on port $config{UI_PORT}. Its replacement is csf-ui, installed by the csf installer: run /usr/local/csf-ui/bin/csf-ui-setup to configure it, or re-run the csf installer. UI_USER and UI_PASS are no longer read by anything - if UI_PASS still holds a real password, treat it as disclosed and change it wherever else it is used; see the SECTION:Integrated User Interface comments in /etc/csf/csf.conf");
+	logfile("csf Integrated UI: UI is enabled in csf.conf but the Integrated UI has been REMOVED - lfd is NOT listening on port $config{UI_PORT}. Its replacement is csf-ui, installed by the csf installer: re-run the csf installer at a terminal to configure it, then create an account with /usr/local/csf-ui/bin/csf-ui-passwd add <user> admin - there is no default account. UI_USER and UI_PASS are no longer read by anything - if UI_PASS still holds a real password, treat it as disclosed and change it wherever else it is used; see the SECTION:Integrated User Interface comments in /etc/csf/csf.conf");
 }
 
 if ($config{CLUSTER_RECVFROM}) {

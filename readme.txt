@@ -1283,15 +1283,31 @@ root: the web tier runs as an unprivileged user behind your own web server and
 reaches root only through a small helper over a unix socket, which accepts a
 fixed list of operations and validates every argument itself.
 
-To set it up, as root:
+Setting it up is two commands, as root. The csf installer configures it - run
+the installer for this server's panel at a terminal, and it asks which mode to
+use and which addresses may reach the interface, writes your web server's
+configuration, writes /etc/csf-ui/ui.conf and enables the services:
 
-  /usr/local/csf-ui/bin/csf-ui-setup
+  sh install.generic.sh          (or install.cpanel.sh, install.directadmin.sh,
+                                  install.interworx.sh, install.cwp.sh,
+                                  install.cyberpanel.sh, install.vesta.sh)
 
-It asks which addresses may reach the interface, creates the first account, and
-prints the address to browse to. It is configured in /etc/csf-ui/ui.conf, not
-in /etc/csf/csf.conf, and accounts are managed with csf-ui-passwd - each with
-an admin or support role, and a $6$ password hash in /etc/csf-ui/users that
-only root can read.
+There is no default account and no default password, so nothing can log in
+until you create one:
+
+  /usr/local/csf-ui/bin/csf-ui-passwd add <user> admin
+
+The role is "admin" or "support". csf-ui is configured in /etc/csf-ui/ui.conf,
+not in /etc/csf/csf.conf, and accounts live in /etc/csf-ui/users as $6$
+password hashes that only root can read.
+
+  /usr/local/csf-ui/bin/csf-ui-setup --web
+
+is a separate thing, and is optional: a browser wizard for the FIREWALL's own
+settings in /etc/csf/csf.conf (the port lists, IPv6, TESTING), with a snapshot
+and an automatic rollback if you lock yourself out. It does not create accounts
+and does not configure the web interface. Run it with no arguments and it
+prints its own usage and exits.
 
 The UI_* settings in /etc/csf/csf.conf are left in place, with whatever values
 this server had, so that an upgrade does not silently delete them. Nothing
