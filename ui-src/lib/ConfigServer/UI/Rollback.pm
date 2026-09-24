@@ -102,11 +102,21 @@ our $UI_CONF_GROUP = 'csfui';
 our $SERVICE_UNIT = 'csf-ui-rollback.service';
 our $TIMER_UNIT   = 'csf-ui-rollback.timer';
 
-# The confirmation window. 300 seconds, the same figure the wizard writes to
-# TESTING_INTERVAL - deliberately, so an operator watching the clock has one
-# number to watch and not two. Long enough to notice SSH still works and
-# click a button; short enough that a locked-out operator is not sitting in
-# front of a dead machine for a quarter of an hour.
+# The confirmation window, in SECONDS, because that is what systemd's
+# OnActiveSec= takes. 300 seconds is five minutes, the same DURATION the
+# wizard writes to csf's own TESTING_INTERVAL - deliberately, so an operator
+# watching the clock has one number to watch and not two. Long enough to
+# notice SSH still works and click a button; short enough that a locked-out
+# operator is not sitting in front of a dead machine for a quarter of an hour.
+#
+# "the same FIGURE" is what this said, and the wizard was writing 300 into
+# TESTING_INTERVAL to make the two literals match. They are not the same
+# unit: TESTING_INTERVAL is MINUTES (csf.pl renders it into the minute field
+# of a line in /etc/crontab), so the two settings were five minutes and five
+# HOURS apart, and the sentence claiming they agreed is what made that look
+# deliberate. The wizard now writes 5 there. See $FORCED_TESTING_INTERVAL in
+# ui-src/bin/csf-ui-setup for what a step of 300 in a cron minute field was
+# measured to do.
 our $DEFAULT_WINDOW = 300;
 
 # systemd's own comment character is '#', and '%' introduces a specifier it

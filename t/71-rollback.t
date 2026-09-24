@@ -766,7 +766,11 @@ ANSWERS
 	my $csf = slurp("$w->{root}/etc/csf.conf");
 	like($csf, qr/^TCP_IN = "22,443"$/m, 'csf.conf carries the answered setting');
 	like($csf, qr/^TESTING = "1"$/m, 'TESTING is forced on, whatever the answers said');
-	like($csf, qr/^TESTING_INTERVAL = "300"$/m, 'and TESTING_INTERVAL is forced to 300');
+	# CHANGED 2026-09-24 and RED for one run while it was changed: this
+	# pinned 300, which was the rollback window in SECONDS written into a
+	# cron MINUTE field. It is 5 - the same duration, in this key's own
+	# unit, and csf's own shipped default.
+	like($csf, qr/^TESTING_INTERVAL = "5"$/m, 'and TESTING_INTERVAL is forced to 5 (minutes)');
 	like($csf, qr/^LF_ALERT_TO = ""$/m, 'and everything else in the file survived');
 
 	my $ui = slurp("$w->{root}/etc/ui.conf");

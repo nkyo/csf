@@ -75,7 +75,7 @@
 #    right there and it is strictly safer.
 #
 # 2. NOT LOCKING THE OPERATOR OUT. Applying always sets TESTING=1 and
-#    TESTING_INTERVAL=300 (and refuses an answers file that tries to set
+#    TESTING_INTERVAL=5 minutes (and refuses an answers file that tries to set
 #    TESTING to anything else), AND arms ConfigServer::UI::Rollback's
 #    independent systemd timer first. If that timer cannot be installed, the
 #    apply does not happen. Rollback.pm's header explains why csf's own
@@ -165,7 +165,31 @@ our $ACTIVE;
 
 # Forced whenever anything is applied, whatever the answers file says.
 our $FORCED_TESTING          = '1';
-our $FORCED_TESTING_INTERVAL = '300';
+
+# MINUTES, not seconds. csf.conf's own comment for this key says so ("The
+# interval for the crontab in minutes") and csf.pl renders the value
+# straight into the MINUTE field of a line it writes to /etc/crontab:
+#
+#   */$config{TESTING_INTERVAL} * * * * root /usr/sbin/csf -f
+#
+# This was '300' - the rollback window in seconds, written into a minute
+# field in the belief that the two keys took the same unit. MEASURED on
+# Ubuntu 24.04 (cron 3.0pl1-184ubuntu2, the Debian vixie-cron line): the
+# file is NOT rejected and the line is NOT dropped. cron warns "Step size
+# 300 higher than possible maximum of 59" and then sets exactly one bit -
+# minute 0 - so the flush that was meant to run every five minutes runs
+# once an hour instead, and an operator who has locked themselves out
+# waits up to sixty minutes for the net that was advertised as five. Other
+# cron implementations are entitled to reject the line, and /etc/crontab
+# is shared with every other system job on the host.
+#
+# 5 is csf's own shipped default and is the same DURATION as
+# ConfigServer::UI::Rollback::$DEFAULT_WINDOW (300 seconds), which is what
+# that module's header means when it says an operator has one number to
+# watch. sanity.txt's own row for this key is TESTING_INTERVAL=1-60=5, so
+# 300 also made a csf -r run print a *WARNING* sanity line - which the new UI
+# scrapes out of csf -r and renders (csf-ui-helper's restart op).
+our $FORCED_TESTING_INTERVAL = '5';
 
 # The default port the wizard listens on. Above 1024 because this is a
 # throwaway listener and there is no reason for it to want a privileged one,
@@ -211,7 +235,11 @@ our %ANSWER = (
 	UDP_OUT          => { dest => 'csf', check => \&_check_port_list },
 	IPV6             => { dest => 'csf', check => \&_check_boolean },
 	TESTING          => { dest => 'csf', check => \&_check_boolean, forced => $FORCED_TESTING },
-	TESTING_INTERVAL => { dest => 'csf', check => sub { _check_range($_[0], 5, 3600) },
+	# 1-60, from sanity.txt's own row for this key: it is a cron MINUTE
+	# field (see $FORCED_TESTING_INTERVAL above), and a step past 59 is
+	# meaningless in one. The range here was 5-3600, which is what this
+	# key's unit would have been if it were seconds.
+	TESTING_INTERVAL => { dest => 'csf', check => sub { _check_range($_[0], 1, 60) },
 	                      forced => $FORCED_TESTING_INTERVAL },
 );
 
@@ -726,7 +754,8 @@ sub apply {
 		return { ok => 0, reason => "csf.conf was left unchanged: $wrote->{reason}",
 			problems => ($wrote->{problems} || []), snapshot => $snapshot->{dir}, armed => 1 };
 	}
-	push @step, "csf.conf: " . scalar(keys %csf) . ' settings written (TESTING=1, TESTING_INTERVAL=' . $FORCED_TESTING_INTERVAL . ')';
+	push @step, "csf.conf: " . scalar(keys %csf) . ' settings written (TESTING=1, TESTING_INTERVAL='
+		. $FORCED_TESTING_INTERVAL . ' minutes)';
 
 	if (length $ui_text) {
 		# 0640 root:csfui - docs/WEBUI-RPC.md section 2.3, frozen, and the
