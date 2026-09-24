@@ -174,6 +174,19 @@ every `/etc/csf`, `/var/lib/csf` and `/usr/local/csf` path named by code, for
   reconcile fixes and restart the firewall. An operator whose reason for `"2"`
   was that no web interface should touch the server must now decline to install
   or configure csf-ui; the key will not do it for them.
+- **The Server Check report's "Display All Checks" view is gone**, and this is
+  the one place where removing the UI took a feature the CLI never had. Passing
+  rows in `ConfigServer::ServerCheck` are gated on `$verbose`
+  (`ServerCheck.pm:155`), whose only setter is `report()`'s argument; the UI
+  offered a "Run Again and Display All Checks" button that passed `1`, and
+  `csf -m` has always called `report()` with no argument. **`csf -m`'s output
+  is therefore unchanged** — `csf.pl` is byte-identical to the merge-base and
+  showed only failures before this release too — but the button that showed the
+  passes has no CLI equivalent, so there is now no way to see them. Adding one
+  would be new command-line surface rather than a restoration, so it is
+  recorded here rather than improvised; `$verbose` is left in place so that a
+  future flag has something to set. (`ConfigServer::RBLCheck`'s own `$verbose`
+  is unaffected: `csf.pl`'s `dorbls()` passes `1`.)
 - **`csf.syslogs` annotated, not deleted.** Its own header said it listed the
   log files for "the UI System Log Watch and Search features"; those pages are
   gone and csf-ui has no log-viewing operation, so nothing reads it. Unlike the
