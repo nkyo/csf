@@ -315,9 +315,18 @@ format of the originating file:
 /etc/csf/csf.sips
 /etc/csf/csf.smtpauth
 /etc/csf/csf.suignore
-/etc/csf/csf.syslogs
+/etc/csf/csf.syslogs [*]
 /etc/csf/csf.syslogusers
 /etc/csf/csf.uidignore
+
+[*] NOTHING READS /etc/csf/csf.syslogs ANY MORE. It listed the log files
+offered by the UI's System Log Watch and Search pages; those pages were removed
+with the UI (see section 22) and csf-ui has no log-viewing operation. The file
+is still shipped and still installed and your edits to it are still there, but
+adding a path to it - or Include-ing another file into it - now has no effect
+anywhere. The installer only copies it when /etc/csf/csf.syslogs does not
+already exist, so on an existing server the copy you have will not carry this
+notice: it is the file you edited, unchanged, and equally unread.
 
 You must specify the full path to the included file, e.g. in
 /etc/csf/csf.allow:
@@ -1513,10 +1522,12 @@ mode to switch between.
 
 The replacement is not skinnable, and that is deliberate rather than an
 oversight. The old mechanism worked by pasting operator-supplied text into
-every page's <head>, <body>, <html> tag and <body> tag - including the page
-that took the login - which is an arbitrary-script-injection point by design,
-in an interface that ran as root. csf-ui serves one stylesheet of its own and
-interpolates nothing that did not come from root-written state.
+every page's <head>, <body>, <html> tag and <body> tag, which is an
+arbitrary-script-injection point by design, in an interface that ran as root.
+(It did NOT reach the integrated UI's login page, which lfd built by hand and
+injected nothing into - that page came before the session branch where the skin
+files were read.) csf-ui serves one stylesheet of its own and interpolates
+nothing into its pages that did not come from root-written state.
 
 One residue worth knowing about: STYLE_CUSTOM is still READ, at
 webmin/csf/index.cgi, where it gates an unrelated redirect for Webmin's

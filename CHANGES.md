@@ -147,20 +147,33 @@ every `/etc/csf`, `/var/lib/csf` and `/usr/local/csf` path named by code, for
   removed, that existing files are never opened and are not deleted either, and
   why the replacement is deliberately not skinnable — the old mechanism pasted
   operator-supplied text into every page's `<head>`, `<body>` and tag
-  attributes, including the login page, inside an interface running as root.
+  attributes, inside an interface running as root. (Not the integrated UI's
+  own login page: `lfd.pl` built that by hand and injected nothing into it —
+  the skin files were read in the post-login session branch.)
   `STYLE_CUSTOM` is still *read*, at `webmin/csf/index.cgi`, for an unrelated
   xnavigation redirect; the note says so.
 - **`RESTRICT_UI` no longer restricts anything**, and `ConfigServer/
   ServerCheck.pm` has stopped claiming it does. Its nine enforcement points
-  were all in the deleted `DisplayUI.pm`, but `csf --servercheck` still carried
-  it in the brute-force option list — a security report affirming a control
-  that does not exist. Measured on the real code path: at the shipped default
-  `"1"` it emitted a green pass for a protection that had stopped protecting,
-  and at `"0"` it emitted a **red failure** telling the operator to enable
-  something inert. It is now reported explicitly and never counted either way.
-  Nothing replaces it, and nothing needs to: csf-ui's operation list is frozen
-  and closed and **no operation writes a setting**, so the strictest thing
-  `RESTRICT_UI = "2"` ever bought is now the only available behaviour.
+  were all in the deleted `DisplayUI.pm`, but `csf -m` (`--mail`, the Server
+  Check report) still carried it in the brute-force option list — a security
+  report affirming a control that does not exist. Measured on the real
+  `$output`: at the shipped default `"1"` it emitted a green pass for a
+  protection that had stopped protecting, and at `"0"` a **red failure**
+  telling the operator to enable something inert. It is now an always-rendered
+  notice that is not part of the Server Score in either direction (the
+  denominator goes 76 → 75).
+
+  Nothing replaces it, and for the restriction itself nothing needs to:
+  csf-ui's operation list is frozen and closed and **none of its fourteen
+  operations writes a setting**, so `RESTRICT_UI = "1"` — a UI that can work
+  the firewall but cannot edit `csf.conf` — is how the replacement behaves
+  whatever the key says. **That is not true of `RESTRICT_UI = "2"`**, which was
+  not a stricter restriction but *Disabled UI*: the old interface printed "csf
+  UI Disabled via the RESTRICT_UI option" and stopped. csf-ui is a working
+  interface and can add and remove denies, allows and temporary blocks, apply
+  reconcile fixes and restart the firewall. An operator whose reason for `"2"`
+  was that no web interface should touch the server must now decline to install
+  or configure csf-ui; the key will not do it for them.
 - **`csf.syslogs` annotated, not deleted.** Its own header said it listed the
   log files for "the UI System Log Watch and Search features"; those pages are
   gone and csf-ui has no log-viewing operation, so nothing reads it. Unlike the
@@ -195,8 +208,18 @@ printed it **unescaped** into `<html lang='en' $htmltag>` from an interpolating
 heredoc. It was reachable only with `STYLE_CUSTOM = "1"` (not the default),
 which is why it is narrow rather than severe; `cpanel/csf.cgi` assigned
 `$htmltag` the same way but never printed it. At HEAD the only value
-interpolated into any of the nine pages' output is `$myv`, read from
-root-written `/etc/csf/version.txt` — verified across all nine.
+interpolated into any of the nine notice pages' printed heredocs is `$myv`,
+read from root-written `/etc/csf/version.txt` — verified across all nine,
+cPanel's two indented heredocs included.
+
+That is a statement about the heredocs, and it is not a statement about
+everything those files can print. `da/exec/da_csf.cgi`'s `loginfail()` prints
+its `$message` to stdout (`:162`), and one caller (`:44`) builds it from
+`$ENV{SESSION_ID}`. It is pre-existing, untouched by this task, and it is
+**not** a second XSS: the interpolation sits inside
+`if ($ENV{SESSION_ID} =~ /^\w+$/)`, so the value that reaches the page cannot
+contain `<`, `>`, a quote or a slash. Recorded because the sentence above is
+the one a future reader will rely on, and unqualified it would be wrong.
 
 #### Task 10 — the hostile-input and integration pass
 
