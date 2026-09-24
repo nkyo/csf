@@ -1362,9 +1362,18 @@ sub _do_confirm {
 <h1>{{heading}}</h1>
 <p class="{{class}}"><strong>{{headline}}</strong></p>
 <p>{{detail}}</p>
-<p>csf is still in TESTING mode, which stops the configuration becoming
-permanent on its own. Turn it off with: csf -x, then csf -e - or set
-TESTING = "0" in /etc/csf/csf.conf and restart csf - once you are satisfied.</p>
+<p>csf is still in TESTING mode: a cron job runs <code>csf -f</code> every
+few minutes and flushes every rule, so this configuration does not become
+permanent on its own. Once you are satisfied, turn it off - as root, from a
+shell:</p>
+<pre>  set TESTING = "0" in /etc/csf/csf.conf
+  csf -r</pre>
+<p>That is the whole remedy. Do <strong>not</strong> use <code>csf -x</code>:
+it does not touch TESTING at all - it writes /etc/csf/csf.disable, stops lfd's
+service monitoring and flushes the firewall, leaving this server with no rules
+until <code>csf -e</code>, and leaving the flush cron in place. This interface
+also refuses every operation while csf.disable exists, so it cannot help you
+put things back.</p>
 HTML
 }
 
