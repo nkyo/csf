@@ -96,7 +96,41 @@ fi
 
 if [ -n "$BASE_REF" ]; then
 	note "   base: $BASE_REF"
-	git diff --name-only --diff-filter=ACMR "$BASE_REF"...HEAD > "$WORKDIR/touched" 2>/dev/null
+	# R117 (carried in from Task 10's review, fixed in Task 11): the FALLBACK
+	# branch below has guarded its empty-file-list case since fix round 3, and
+	# this primary branch had no equivalent guard and never looked at git's own
+	# exit status. A `git diff` that FAILED here - a corrupt object, an
+	# unreadable index, a $BASE_REF that resolved a moment ago and is gone now -
+	# left "$WORKDIR/touched" empty with its diagnostic swallowed by 2>/dev/null,
+	# the loop below iterated zero times, and the gate printed
+	# "checked 0 Perl file(s), 0 failed" and PASSED. That is precisely the silent
+	# pass the fallback's own guard exists to prevent, reached by the other road.
+	#
+	# The exit status is what separates the two cases, and it separates them
+	# exactly - emptiness alone does not:
+	#   git SUCCEEDED, file empty      -> HEAD is identical to $BASE_REF. A real
+	#                                     diff of nothing. Legitimate: pass.
+	#   git SUCCEEDED, file non-empty,
+	#   no .pl/.pm/perl-shebang in it  -> a real diff that genuinely touches zero
+	#                                     Perl files. Legitimate: pass, and the
+	#                                     count line below says so.
+	#   git FAILED                     -> the gate could not determine what to
+	#                                     check. Not zero files needing a look.
+	# So stderr is kept (not discarded) and printed on failure: a gate that fails
+	# without saying why makes the fix a second investigation.
+	if git diff --name-only --diff-filter=ACMR "$BASE_REF"...HEAD > "$WORKDIR/touched" 2>"$WORKDIR/touched.err"; then
+		if [ ! -s "$WORKDIR/touched" ]; then
+			note "   (git diff succeeded and named no changed file - HEAD is identical to the base; 0 files to check is the real answer here)"
+		fi
+	else
+		fail "gate 1 could not determine any file to check: 'git diff --name-only --diff-filter=ACMR $BASE_REF...HEAD' exited nonzero - this is the gate failing to look, not finding nothing to look at"
+		if [ -s "$WORKDIR/touched.err" ]; then
+			sed 's/^/    /' "$WORKDIR/touched.err"
+		fi
+		# Whatever partial output git managed is not a file list. Do not let
+		# the loop below run over half a diff and report a green count.
+		> "$WORKDIR/touched"
+	fi
 else
 	# No history to diff against (e.g. a shallow or detached checkout) -
 	# the conservative answer is every tracked file, not silence.
