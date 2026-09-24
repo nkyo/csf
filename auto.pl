@@ -740,21 +740,13 @@ if (-e "/var/lib/csf/csf.tempallow") {
 	}
 	close (IN);
 }
-if (-e "/usr/local/csf/tpl/reselleralert.txt") {
-	sysopen (IN,"/usr/local/csf/tpl/reselleralert.txt", O_RDWR | O_CREAT);
-	flock (IN, LOCK_EX);
-	my @data = <IN>;
-	chomp @data;
-	seek (IN, 0, 0);
-	truncate (IN, 0);
-	my $text = 0;
-	foreach my $line (@data) {
-		if ($line =~ /\[text\]/) {$text = 1}
-		print IN "$line\n";
-	}
-	unless ($text) {print IN "\n[text]\n"}
-	close (IN);
-}
+# The reseller-alert template's upgrade fixup used to be here. The template
+# went with the Integrated UI (see CHANGES.md): its only reader was
+# ConfigServer::DisplayResellerUI, and its subject line still advertised
+# "csf UI on [hostname]". Its sibling uialert.txt was removed in the same
+# retirement and this one was missed. Nothing is put in its place - an
+# upgraded server may still have a copy in /usr/local/csf/tpl, and rewriting
+# a file nothing will ever read is not a service to anyone.
 
 open (IN,"<", "/etc/chkserv.d/chkservd.conf");
 flock (IN, LOCK_SH);

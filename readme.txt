@@ -269,9 +269,8 @@ Both csf.allow and csf.deny can have comments after the IP address listed. The
 comments must be on the same line as the IP address otherwise the IP rotation
 of csf.deny will remove them.
 
-If editing the csf.allow or csf.deny files directly, either from shell or the
-WHM UI, you should put a <space>#<space> between the IP address and the comment
-like this:
+If editing the csf.allow or csf.deny files directly, from a shell, you should
+put a <space>#<space> between the IP address and the comment like this:
 
 11.22.33.44 # Added because I don't like them
 
@@ -1062,12 +1061,13 @@ reached then that cluster members notification will be lost.
 
 Note: You must restart csf and then lfd after making any CLUSTER_* changes
 
-lfd Cluster CLI and UI
-======================
+lfd Cluster CLI
+===============
 
-See csf --help for the list of new CLI commands. Additional options will
-automatically become available in the UI once CLUSTER_SENDTO has been
-configured.
+See csf --help for the list of cluster CLI commands. They become available
+once CLUSTER_SENDTO has been configured. There is no longer a UI half to this:
+the Integrated UI is removed (section 22) and csf-ui's operation list is fixed
+and has no cluster operation in it.
 
 Only cluster members listed in CLUSTER_RECVFROM can send out requests to those
 members listed in CLUSTER_SENDTO.
@@ -1647,8 +1647,10 @@ CLI commands
 There are also accompanying csf CLI commands available (see man) to interact
 with the Cloudflare firewall.
 
-Enabling CF_ENABLE enables two CloudFlare buttons in the UI in the "Other"
-section that mirror the CLI commands.
+Enabling CF_ENABLE makes the CloudFlare features available. The two buttons
+this used to add to the Integrated UI's "Other" section are gone with that
+interface (section 22); the CLI commands they mirrored are unchanged and are
+now the only way in.
 
 1. Using the CLI commands all, block, challenge or whitelist rules in the
 provided users CloudFlare firewall can be listed, e.g.:
@@ -1716,8 +1718,10 @@ Note: None of the apf conf files are used and are ignored by csf.
 The Firewall UI option in NodeWorx should now not be used and any changes made
 there will not be reflected in iptables.
 
-There is a UI option under "ConfigServer Services" for "ConfigServer Firewall &
-Security" that should now be used.
+There is an option under "ConfigServer Services" for "ConfigServer Firewall &
+Security". Since the Integrated UI was removed (section 22) that page shows the
+retirement notice and points at csf-ui rather than offering an interface - use
+csf-ui, or the command line.
 
 The installation will also replace the Firewall page in NodeWorx with a dummy
 page stating that csf should be used instead. lfd will replace the page upon
@@ -1729,19 +1733,21 @@ touch /etc/cxs/interworx.firewall
 The InterWorx plugin for csf is auto-enabled. Enabling or Disabling the
 InterWorx plugin has no effect on csf itself, only the UI plugin presence.
 
-NOTE: Unless you have configured a root forwarder, you should edit the csf
-configuration settings in /etc/csf/csf.conf or via the UI and set LF_ALERT_TO
-to a suitable email address. After making any changes, restart csf and then
-lfd.
+NOTE: Unless you have configured a root forwarder, you should edit
+/etc/csf/csf.conf and set LF_ALERT_TO to a suitable email address. That file is
+edited from a shell: csf-ui cannot write a csf.conf setting at all, and its
+operation list is fixed and closed. After making any changes, restart csf and
+then lfd.
 
 
 28. CentOS Web Panel (CWP)
 ##########################
 
 CWP integration is available for csf. Since CWP already has some custom
-modifications, these have been taken into account. To access the now inbuilt UI
-in CWP, there is a new menu option in CWP > ConfigServer Scripts > ConfigServer
-Firewall.
+modifications, these have been taken into account. The menu option at CWP >
+ConfigServer Scripts > ConfigServer Firewall is still registered, but since the
+Integrated UI was removed (section 22) it shows the retirement notice and
+points at csf-ui rather than offering an interface.
 
 There is now an option in /etc/csf/csf.conf for LF_CWP for login failure
 detection. However, this WILL NOT work with the default CWP installation as

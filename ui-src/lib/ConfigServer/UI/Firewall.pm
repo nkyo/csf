@@ -1183,7 +1183,18 @@ sub _close_iptables {
 	my ($argv, $problem) = _argv_from_canonical($current->{line});
 	unless ($argv) {
 		return { ok => 0, code => 'E_UNREMOVABLE', reason => $problem,
-			manual => "$binary -D " . ($spec->{chain} || 'INPUT') . ' ... (see: ' . $current->{line} . ')' };
+			# This field is printed to the operator as "remove it by hand:
+			# <manual>" (csf-ui-setup's close_temporary_port and cmd_web),
+			# so it has to be something that can be typed. It used to be
+			# "$binary -D INPUT ... (see: <line>)" - a literal ellipsis in
+			# the middle of a command. This arm is reached only when the
+			# canonical line could not be turned into an argv at all, so
+			# there IS no command to hand over; the line itself is what the
+			# operator needs, said as a description rather than dressed up
+			# as one.
+			manual => 'no removal command could be built from the rule iptables reported. '
+				. 'Find this line in "' . $binary . ' -S ' . ($spec->{chain} || 'INPUT')
+				. '" and delete it, changing the leading -A to -D: ' . $current->{line} };
 	}
 
 	my $removed = $self->run($binary, @wait, @$argv);
@@ -1244,7 +1255,14 @@ sub _close_ufw {
 	if ($current->{ambiguous}) {
 		return { ok => 0, code => 'E_UNREMOVABLE',
 			reason => $current->{ambiguous} . ' ufw rules now render identically to the one this session added; refusing to guess which index to delete',
-			manual => "$ufw status numbered" };
+			# Was: "$ufw status numbered" alone - a LISTING command, handed
+			# over under the words "remove it by hand". Running it removes
+			# nothing. Nothing can name the right index here by definition
+			# (that is what ambiguous means), so this says what to look at
+			# and what to do with what is found.
+			manual => 'run "' . $ufw . ' status numbered", identify which of the '
+				. $current->{ambiguous} . ' identical rules is the one to remove, '
+				. 'then "' . $ufw . ' --force delete <that number>"' };
 	}
 
 	# The index comes from the listing just read, never from open time -

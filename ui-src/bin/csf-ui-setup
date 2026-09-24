@@ -821,7 +821,7 @@ sub apply {
 				push @step, 'temporary port: COULD NOT be re-established after csf -r - ' . $again->{reason};
 				push @warning, 'The port you reached this wizard on is now closed, because restarting csf '
 					. 'flushed the rule and it could not be added again. Confirm from a shell instead: '
-					. 'csf-ui-setup --confirm - otherwise the rollback timer will undo this apply.';
+					. $SETUP_CLI . ' --confirm - otherwise the rollback timer will undo this apply.';
 			}
 		}
 	}
@@ -903,7 +903,7 @@ sub reassert_temporary_port {
 		# passed through here.
 		return { ok => 0, stale => 1,
 			reason => "no live wizard session owns the temporary-port record ($why_not), "
-				. 'so it has not been acted on. Run csf-ui-setup --cleanup to clear it.' };
+				. 'so it has not been acted on. Run ' . $SETUP_CLI . ' --cleanup to clear it.' };
 	}
 
 	my ($present, $why) = $self->{firewall}->rule_present($spec);
@@ -974,7 +974,7 @@ sub _arm_advice {
 	my ($code) = @_;
 	$code = '' unless defined $code;
 
-	return '. Apply from a shell you can watch instead (csf-ui-setup --answers FILE --yes), '
+	return '. Apply from a shell you can watch instead (' . $SETUP_CLI . ' --answers FILE --yes), '
 		. 'with a second session already open, so a mistake can be undone by hand.'
 		if $code eq 'E_NO_SYSTEMD';
 
@@ -1344,7 +1344,7 @@ stop a new one being made, which is exactly how a lockout hides.</p>
 </form>
 <p class="note">If you do nothing, the rollback timer restores the previous
 configuration by itself. The answers are saved at {{path}} and can be applied
-again with: csf-ui-setup --answers {{path}} --yes</p>
+again with: /usr/local/csf-ui/bin/csf-ui-setup --answers {{path}} --yes</p>
 HTML
 }
 
@@ -2065,18 +2065,31 @@ sub cleanup {
 ###############################################################################
 sub _usage {
 	print STDERR <<'USAGE';
-csf-ui-setup - set up csf and its web interface.
+csf-ui-setup - a browser wizard for THIS SERVER'S FIREWALL settings in
+/etc/csf/csf.conf, with a snapshot and an automatic rollback. It does not
+configure the web interface and does not create accounts - the csf installer
+does the first and csf-ui-passwd does the second.
 
-  csf-ui-setup --web [--port N]        run the wizard in a browser
-  csf-ui-setup --answers FILE --yes    apply an answers file (no prompts)
-  csf-ui-setup --confirm               cancel the rollback: "I still have my session"
-  csf-ui-setup --cleanup               remove what a session that died badly left behind
-  csf-ui-setup --rollback-now --snapshot DIR
+/usr/local/csf-ui/bin is not on PATH, so give the full path:
+
+  /usr/local/csf-ui/bin/csf-ui-setup --web [--port N]
+                                       run the wizard in a browser
+  /usr/local/csf-ui/bin/csf-ui-setup --answers FILE --yes
+                                       apply an answers file (no prompts)
+  /usr/local/csf-ui/bin/csf-ui-setup --confirm
+                                       cancel the rollback: "I still have my session"
+  /usr/local/csf-ui/bin/csf-ui-setup --cleanup
+                                       remove what a session that died badly left behind
+  /usr/local/csf-ui/bin/csf-ui-setup --rollback-now --snapshot DIR
                                        restore a snapshot (run by the rollback timer)
 
-The wizard listens on 127.0.0.1 and prints an ssh -L command. It writes an
-answers file and applies it through --answers, so anything done in a browser
-can be repeated from a shell.
+The wizard listens on 127.0.0.1 and prints an ssh -L command to reach it.
+If TLS material is already installed AND your address can be identified from
+this SSH session AND the firewall backend is certain, it instead opens the
+port for that ONE address, over TLS, binding 0.0.0.0 or :: and refusing every
+other peer - it says which of the two it did. It writes an answers file and
+applies it through --answers, so anything done in a browser can be repeated
+from a shell.
 USAGE
 	return 2;
 }
@@ -2161,7 +2174,7 @@ sub cmd_answers {
 	print STDERR "\nWARNING: $_\n" for @{ $result->{warnings} || [] };
 	print "\nA snapshot is at $result->{snapshot} and a rollback timer will restore it\n";
 	print "in $result->{window} seconds. Open a NEW ssh connection to check you are not\n";
-	print "locked out, then run: csf-ui-setup --confirm\n";
+	print "locked out, then run: $SETUP_CLI --confirm\n";
 	return 0;
 }
 
@@ -2252,7 +2265,7 @@ sub cmd_web {
 		print "A temporary rule now allows $plan->{peer} to reach port $self->{port}, over TLS,\n";
 		print "and this listener will talk to that address and no other. Open:\n\n";
 		printf("  https://%s:%d/\n\n", _hostname(), $self->{port});
-		print "The rule is removed when this wizard exits; csf-ui-setup --cleanup removes it\n";
+		print "The rule is removed when this wizard exits; $SETUP_CLI --cleanup removes it\n";
 		print "if this process dies without getting the chance.\n\n";
 	}
 

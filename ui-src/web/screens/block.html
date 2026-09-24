@@ -87,7 +87,7 @@ preset list is less error-prone than asking an operator to type seconds.
 			<label for="tempdeny-ports">Ports (optional)</label>
 			<input type="text" id="tempdeny-ports" name="tempdeny_ports"
 				placeholder="e.g. 22,80,443 or 1000-1010" autocomplete="off">
-			<span class="field-hint">Leave blank to block all ports. At most 20 ports/ranges, TCP only when ports are given.</span>
+			<span class="field-hint">Leave blank to block all ports. At most 20 ports in total - a range counts as every port in it, so 1000-1010 is 11 of the 20. TCP only when ports are given.</span>
 		</div>
 		<div class="form-actions">
 			<button type="submit" class="btn btn-danger">Block temporarily</button>

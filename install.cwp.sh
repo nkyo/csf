@@ -178,9 +178,6 @@ fi
 if [ ! -e "/usr/local/csf/tpl/alert.txt" ]; then
 	cp -avf alert.txt /usr/local/csf/tpl/.
 fi
-if [ ! -e "/usr/local/csf/tpl/reselleralert.txt" ]; then
-	cp -avf reselleralert.txt /usr/local/csf/tpl/.
-fi
 if [ ! -e "/usr/local/csf/tpl/logalert.txt" ]; then
 	cp -avf logalert.txt /usr/local/csf/tpl/.
 fi
@@ -369,18 +366,6 @@ if [ ! -e "/etc/csf/alerts" ]; then
 fi
 chcon -h system_u:object_r:bin_t:s0 /usr/sbin/lfd
 chcon -h system_u:object_r:bin_t:s0 /usr/sbin/csf
-
-# The per-panel images/ directories are made here, from csf/, rather than
-# shipped: they are install-time copies. Task 11 emptied csf/ down to the
-# one file that still has a consumer - csf_small.png, the button icon that
-# da/hooks/admin_img.html and da/hooks/reseller_img.html point at under
-# /CMD_PLUGINS_ADMIN/csf/images/ - so only DirectAdmin's copy is still made.
-# The ui/, webmin/csf/ and interworx/ copies held jQuery, Bootstrap, Chosen,
-# configserver.css and the Fugue attribution file, and nothing reads any of
-# them any more.
-mkdir da/images
-
-cp -avf csf/* da/images/
 
 cp -avf messenger/*.php /etc/csf/messenger/
 cp -avf uninstall.cwp.sh /usr/local/csf/bin/uninstall.sh

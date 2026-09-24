@@ -137,10 +137,37 @@ if ! "$OPENSSL" req -new -x509 -nodes -newkey rsa:2048 -sha256 \
 	exit 0
 fi
 
-# Move into place only once both halves exist, so a failure here never
-# leaves Server.pm with a key that does not match its certificate.
-cp -f "$TMP/key.pem" "$KEY" && cp -f "$TMP/cert.pem" "$CRT" || {
+# Put both halves in place only once both exist, and do the part that can
+# realistically fail - writing bytes to $SSLDIR's filesystem - BEFORE either
+# live path is touched.
+#
+# This was two sequential `cp -f` straight onto $KEY and $CRT, under a comment
+# claiming "a failure here never leaves Server.pm with a key that does not
+# match its certificate". It could: the first cp succeeding and the second
+# failing (disk full, quota, EIO) is exactly a new key beside the old
+# certificate, and Server.pm will not complete a handshake with that pair.
+# It self-healed on the next run, which is real but is not the claim that was
+# made.
+#
+# $TMP is under /tmp and may be a different filesystem from $SSLDIR, so
+# rename(2) cannot be used from there. Staging inside $SSLDIR first means the
+# two renames below move data that is already written to this filesystem:
+# neither can fail for lack of space, and rename over an existing path is
+# atomic per file. What is still NOT atomic is the pair - a crash between the
+# two renames leaves the new key with the old certificate, which is the
+# failure this comment used to deny outright. Two files cannot be replaced as
+# one without a mechanism this script has no business introducing; the honest
+# statement is that the window is now a crash rather than an ordinary write
+# error, and the next run still repairs it.
+umask 077
+cp -f "$TMP/key.pem" "$KEY.new" && cp -f "$TMP/cert.pem" "$CRT.new" || {
+	rm -f "$KEY.new" "$CRT.new"
 	echo "csf-ui: *Error* could not write to $SSLDIR"
+	exit 0
+}
+mv -f "$KEY.new" "$KEY" && mv -f "$CRT.new" "$CRT" || {
+	rm -f "$KEY.new" "$CRT.new"
+	echo "csf-ui: *Error* could not replace the certificate or key in $SSLDIR"
 	exit 0
 }
 

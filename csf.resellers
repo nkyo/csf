@@ -26,33 +26,48 @@
 # this facility.
 #
 # You should list each account, one per line, followed by a colon, then a 0 or
-# 1 depending on whether you want an email alert sent using the email template
-# reselleralter.txt whenever an ALLOW/DENY or UNBLOCK is performed, then a
-# colon, then a comma separated list of the feature codes that you want each
-# reseller to have access to.
+# 1, then a colon, then a comma separated list of the feature codes that you
+# want each reseller to have access to.
 #
-# As of writing, the following is a list of the available feature codes. More
-# may be added in the feature, in which case they will be listed in the main
-# csf readme.txt:
+# ONLY "USE" IS STILL READ. The reseller interface these codes controlled was
+# part of the Integrated UI, which has been removed - see CHANGES.md and
+# section 22 of readme.txt. What remains reads this file for one decision:
+# whether a non-root WHM/DirectAdmin/InterWorx account may open the csf page
+# at all, which is what USE meant. Everything else on the line is parsed and
+# then not consulted by anything.
 #
-# USE        - The reseller can use this facility through WHM (required)
-# UNBLOCK    - The reseller can use the Quick Unblock feature
-# GREP       - The reseller can use the Search IP feature
-# ALLOW      - The reseller can use the Quick Allow feature
-# DENY       - The reseller can use the Quick Deny feature
+# USE        - The reseller can open this facility (required). STILL READ.
+#
+# Was: the middle field, 0 or 1, sent an email alert using the template
+# reselleralert.txt whenever an ALLOW/DENY or UNBLOCK was performed. That
+# template went with the interface and is no longer shipped.
+#
+# Was: UNBLOCK    - the Quick Unblock feature
+# Was: GREP       - the Search IP feature
+# Was: ALLOW      - the Quick Allow feature
+# Was: DENY       - the Quick Deny feature
+#
+# These four are left documented rather than deleted, for the same reason the
+# UI_* keys are left in csf.conf: a line you wrote is not silently
+# reinterpreted. Listing them does nothing now, and taking them away does
+# nothing either.
 #
 # For example, to allow reseller "someuser" to unblock IP addresses and have an
 # alert email sent to root, use:
 #
 #someuser:1:USE,UNBLOCK
 #
-# For example, to allow reseller "someuser" to allow, deny and unblock IP
-# addresses, but no alert sent, use:
+# Was: to allow reseller "someuser" to allow, deny and unblock IP addresses,
+# but no alert sent:
 #
 #someuser:0:USE,ALLOW,DENY,UNBLOCK
 #
-# RECOMMEND: For security reasons, we recommend only allowing resellers USE,
-# UNBLOCK and GREP
+# That line is still accepted and still grants access, but only because of the
+# USE in it; the other three codes do nothing.
+#
+# RECOMMEND: grant this to people you trust and to nobody else. The old
+# "USE, UNBLOCK and GREP" recommendation described a narrower grant than USE
+# alone now is, and no longer has anything to narrow.
 #
 # NOTE: As of version cPanel v11.8.1 you must additionally grant resellers
 # access via "WHM > Edit Reseller Nameservers and Privileges > Third Party
