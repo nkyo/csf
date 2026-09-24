@@ -24,13 +24,15 @@
 # ConfigServer::UI::Server ($TLS_CERT_FILE/$TLS_KEY_FILE) both name:
 # /etc/csf-ui/ssl/{cert,key}.pem.
 #
-# THIS IS NOT ui-cert.sh. That script, already on main, provisions
-# /etc/csf/ui/server.{key,crt} for the OLD built-in webmin-era UI and is
-# left exactly as it is until Task 11 retires that UI - R29's whole point
-# was that the two must never share a path, so this script is a sibling,
-# not an edit. The generation logic below is deliberately the same shape
-# (self-signed, host-only, SAN not CN, config-file form for older openssl)
-# because that reasoning does not change with the path.
+# THIS IS NOT ui-cert.sh. That script provisioned
+# /etc/csf/ui/server.{key,crt} for the OLD built-in webmin-era UI. It was
+# left exactly as it was, as a sibling and never an edit, because R29's
+# whole point was that the two must never share a path - and Task 11 then
+# retired that UI and deleted it (2026-09-24, see CHANGES.md), so this is
+# now the only cert script in the tree. The generation logic below is
+# deliberately the same shape (self-signed, host-only, SAN not CN,
+# config-file form for older openssl) because that reasoning does not
+# change with the path.
 #
 #   sh csf-ui-cert.sh            generate if missing, expired, or mismatched
 #   sh csf-ui-cert.sh --force    replace whatever is there (rotate)
@@ -40,7 +42,7 @@
 # /usr/local/csf-ui/bin (t/71-rollback.t enforces that list is exactly
 # those four) - it is installer plumbing, called once from
 # ui-src/dist/install-webui.sh and not left behind as a re-runnable command
-# the way ui-cert.sh is; re-running the installer re-runs this instead.
+# the way ui-cert.sh was; re-running the installer re-runs this instead.
 ###############################################################################
 
 SSLDIR="${CSF_UI_SSL_DIR:-/etc/csf-ui/ssl}"
