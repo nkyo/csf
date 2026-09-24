@@ -41,7 +41,6 @@ cp -avf /etc/csf/csf.block.SPAMEDROP /var/lib/csf/
 cp -avf /etc/csf/csf.block.TOR /var/lib/csf/
 cp -avf /etc/csf/csf.ccignore /var/lib/csf/
 cp -avf /etc/csf/csf.cclookup /var/lib/csf/
-cp -avf /etc/csf/csf.div /usr/local/csf/lib/
 cp -avf /etc/csf/csf.dnscache /var/lib/csf/
 cp -avf /etc/csf/csf.dwdisable /var/lib/csf/
 cp -avf /etc/csf/csf.gallow /var/lib/csf/

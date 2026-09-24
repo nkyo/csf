@@ -382,7 +382,6 @@ cp -avf remove_apf_bfd.sh /usr/local/csf/bin/
 cp -avf readme.txt /etc/csf/
 cp -avf sanity.txt /usr/local/csf/lib/
 cp -avf csf.rbls /usr/local/csf/lib/
-cp -avf restricted.txt /usr/local/csf/lib/
 cp -avf changelog.txt /etc/csf/
 cp -avf downloadservers /etc/csf/
 cp -avf install.txt /etc/csf/
@@ -396,7 +395,6 @@ cp -avf Crypt /usr/local/csf/lib/
 cp -avf HTTP /usr/local/csf/lib/
 cp -avf JSON /usr/local/csf/lib/
 cp -avf version/* /usr/local/csf/lib/
-cp -avf csf.div /usr/local/csf/lib/
 cp -avf profiles /usr/local/csf/
 cp -avf csf.conf /usr/local/csf/profiles/reset_to_defaults.conf
 cp -avf cpanel.comodo.ignore /etc/csf/
