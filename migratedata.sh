@@ -79,7 +79,6 @@ cp -avf /etc/csf/nocheck /var/lib/csf/
 cp -avf /etc/csf/sanity.txt /usr/local/csf/lib/
 cp -avf /etc/csf/stats/ /var/lib/csf/
 cp -avf /etc/csf/suspicious.tar /var/lib/csf/
-cp -avf /etc/csf/ui/ui.session /var/lib/csf/ui/
 cp -avf /etc/csf/webmin/ /usr/local/csf/lib/
 cp -avf /etc/csf/zone/ /var/lib/csf/
 
@@ -169,7 +168,6 @@ cp -avf /etc/csf/sshalert.txt /usr/local/csf/tpl/
 cp -avf /etc/csf/sualert.txt /usr/local/csf/tpl/
 cp -avf /etc/csf/syslogalert.txt /usr/local/csf/tpl/
 cp -avf /etc/csf/tracking.txt /usr/local/csf/tpl/
-cp -avf /etc/csf/uialert.txt /usr/local/csf/tpl/
 cp -avf /etc/csf/uidscan.txt /usr/local/csf/tpl/
 cp -avf /etc/csf/usertracking.txt /usr/local/csf/tpl/
 cp -avf /etc/csf/watchalert.txt /usr/local/csf/tpl/

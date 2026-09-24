@@ -60,7 +60,6 @@ fi
 mkdir -v -m 0600 /var/lib/csf
 mkdir -v -m 0600 /var/lib/csf/backup
 mkdir -v -m 0600 /var/lib/csf/Geo
-mkdir -v -m 0600 /var/lib/csf/ui
 mkdir -v -m 0600 /var/lib/csf/stats
 mkdir -v -m 0600 /var/lib/csf/lock
 mkdir -v -m 0600 /var/lib/csf/webmin
@@ -220,9 +219,6 @@ fi
 if [ ! -e "/usr/local/csf/tpl/consolealert.txt" ]; then
 	cp -avf consolealert.txt /usr/local/csf/tpl/.
 fi
-if [ ! -e "/usr/local/csf/tpl/uialert.txt" ]; then
-	cp -avf uialert.txt /usr/local/csf/tpl/.
-fi
 if [ ! -e "/usr/local/csf/tpl/cpanelalert.txt" ]; then
 	cp -avf cpanelalert.txt /usr/local/csf/tpl/.
 fi
@@ -299,17 +295,6 @@ fi
 if [ ! -e "/etc/csf/messenger/index.recaptcha.html" ]; then
 	cp -avf messenger/index.recaptcha.html /etc/csf/messenger/.
 fi
-if [ ! -e "/etc/csf/ui" ]; then
-	cp -avf ui /etc/csf/.
-fi
-# Up to v15.00 the line above also copied a private key that shipped inside the
-# tarball, so every installation served the WebUI with a key anyone could read.
-# That key is gone from the source; this gives the host one of its own. Run
-# unconditionally, not only on a fresh install, so an existing server upgrading
-# from an affected version stops using the public key too.
-cp -avf ui-cert.sh /usr/local/csf/bin/csf-ui-cert.sh
-chmod 0700 /usr/local/csf/bin/csf-ui-cert.sh
-sh /usr/local/csf/bin/csf-ui-cert.sh
 if [ -e "/etc/cron.d/csfcron.sh" ]; then
 	mv -fv /etc/cron.d/csfcron.sh /etc/cron.d/csf-cron
 fi
@@ -372,15 +357,17 @@ fi
 chcon -h system_u:object_r:bin_t:s0 /usr/sbin/lfd
 chcon -h system_u:object_r:bin_t:s0 /usr/sbin/csf
 
-mkdir webmin/csf/images
-mkdir ui/images
+# The per-panel images/ directories are made here, from csf/, rather than
+# shipped: they are install-time copies. Task 11 emptied csf/ down to the
+# one file that still has a consumer - csf_small.png, the button icon that
+# da/hooks/admin_img.html and da/hooks/reseller_img.html point at under
+# /CMD_PLUGINS_ADMIN/csf/images/ - so only DirectAdmin's copy is still made.
+# The ui/, webmin/csf/ and interworx/ copies held jQuery, Bootstrap, Chosen,
+# configserver.css and the Fugue attribution file, and nothing reads any of
+# them any more.
 mkdir da/images
-mkdir interworx/images
 
-cp -avf csf/* webmin/csf/images/
-cp -avf csf/* ui/images/
 cp -avf csf/* da/images/
-cp -avf csf/* interworx/images/
 
 cp -avf messenger/*.php /etc/csf/messenger/
 cp -avf uninstall.directadmin.sh /usr/local/csf/bin/uninstall.sh
@@ -404,8 +391,6 @@ cp -avf HTTP /usr/local/csf/lib/
 cp -avf JSON /usr/local/csf/lib/
 cp -avf version/* /usr/local/csf/lib/
 cp -avf csf.div /usr/local/csf/lib/
-cp -avf csfajaxtail.js /usr/local/csf/lib/
-cp -avf ui/images /etc/csf/ui/.
 cp -avf profiles /usr/local/csf/
 cp -avf csf.conf /usr/local/csf/profiles/reset_to_defaults.conf
 cp -avf lfd.logrotate /etc/logrotate.d/lfd
