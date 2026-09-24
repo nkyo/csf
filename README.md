@@ -120,6 +120,21 @@ interface was retired and point at csf-ui, rather than 404ing.
 > certificate had expired in 2020. `/etc/csf/ui/` is left in place on an
 > upgraded server rather than deleted, but nothing reads it now.
 
+Upgrading **does** remove the retired interface's own code and bundled assets,
+so that an upgraded server and a fresh one agree about what is installed:
+`ConfigServer/{DisplayUI,cseUI,DisplayResellerUI}.pm`, `csf.div`,
+`restricted.txt`, `csfajaxtail.js`, `/var/lib/csf/ui/`, and the jQuery /
+Bootstrap / Chosen / Fugue files from every `images/` directory an earlier
+release copied them into — `/etc/csf/ui/images` included, though `/etc/csf/ui`
+itself is kept. Nothing at this release loads any of them, so nothing changes
+behaviour.
+
+Uninstalling csf (`csf -u`) now removes csf-ui too: both units are stopped and
+disabled first, then `/usr/local/csf-ui`, `/etc/csf-ui`, `/var/lib/csf-ui`, the
+Mode A vhost and the `csfui` account. **`/etc/csf-ui` holds the account hashes
+and the TLS private key, and it is removed** — the same way `csf -u` already
+removes `/etc/csf`. The audit and access logs are kept.
+
 ## Documentation
 
 The upstream manual ships with the source and is still accurate:

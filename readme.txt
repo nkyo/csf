@@ -1278,6 +1278,17 @@ left where they are rather than deleted - nothing reads them, and removing an
 operator's files during an upgrade is the worse mistake - but they no longer do
 anything.
 
+What an upgrade DOES remove, because it is this package's own code and assets
+rather than anything an operator wrote, is the machinery behind that interface:
+ConfigServer/DisplayUI.pm, ConfigServer/cseUI.pm and
+ConfigServer/DisplayResellerUI.pm; csf.div, restricted.txt and csfajaxtail.js
+from /usr/local/csf/lib; /var/lib/csf/ui; and the bundled jQuery, Bootstrap,
+Chosen and Fugue files from every images/ directory an earlier release copied
+them into, including /etc/csf/ui/images. The directory /etc/csf/ui itself is
+left alone; only that one subdirectory of it goes. Nothing at this release
+loads any of them, so the removal changes no behaviour - it just stops an
+upgraded server from disagreeing with a fresh one about what is installed.
+
 The replacement is csf-ui. Unlike the interface it replaces, it does not run as
 root: the web tier runs as an unprivileged user behind your own web server and
 reaches root only through a small helper over a unix socket, which accepts a
@@ -1309,9 +1320,18 @@ and an automatic rollback if you lock yourself out. It does not create accounts
 and does not configure the web interface. Run it with no arguments and it
 prints its own usage and exits.
 
+Uninstalling csf removes csf-ui with it. The uninstall script stops and
+disables both services first, then removes /usr/local/csf-ui, /etc/csf-ui,
+/var/lib/csf-ui, the Mode A web server configuration and the csfui account.
+/etc/csf-ui holds the account hashes and the TLS private key, and it IS
+removed - the same way the uninstall already removes /etc/csf. The audit and
+access logs under /var/log are kept. Removing the web server's configuration
+file does not close the port on its own: reload that web server afterwards.
+
 The UI_* settings in /etc/csf/csf.conf are left in place, with whatever values
-this server had, so that an upgrade does not silently delete them. Nothing
-reads them. One of them deserves attention: UI_PASS held a plaintext password,
+this server had, so that an upgrade does not silently delete them. Nothing acts
+on them - UI and UI_PORT are still read, but only so lfd can log the notice
+above naming the port that is gone. One of them deserves attention: UI_PASS held a plaintext password,
 and on a server where the UI was ever enabled it is a real one, still in the
 file and still in every backup of it. If that password is used anywhere else,
 change it there.

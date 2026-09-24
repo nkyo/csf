@@ -413,6 +413,54 @@ fi
 
 rm -fv /etc/csf/csf.spamhaus /etc/csf/csf.dshield /etc/csf/csf.tor /etc/csf/csf.bogon
 
+###############################################################################
+# Task 11 leftovers on an UPGRADED server.
+#
+# Added 2026-09-24. Every copy above is `cp -avf`, which overwrites and adds
+# but never removes, so a server upgrading from an earlier release kept every
+# file Task 11 deleted from the source tree. readme.txt and README.md
+# document three of those leftovers as deliberately kept (/etc/csf/ui/,
+# uialert.txt, ui-cert.sh - all operator-owned, all correctly left). The
+# files below are NOT operator data: they are this package's own code and
+# assets, they are inert at this release (nothing requires or references any
+# of them), and leaving them made the branch's headline claim - "it was
+# removed rather than patched", printed on nine panel pages - true of a
+# fresh install and of the tarball but not of the server actually reading
+# it. 4,218 lines of the Perl that used to render the root-run interface is
+# the part of that which matters.
+#
+# migratedata.sh is not the place for this: it predates tpl/ and only
+# touches /etc/csf/.
+###############################################################################
+rm -fv /usr/local/csf/lib/ConfigServer/DisplayUI.pm
+rm -fv /usr/local/csf/lib/ConfigServer/cseUI.pm
+rm -fv /usr/local/csf/lib/ConfigServer/DisplayResellerUI.pm
+rm -fv /usr/local/csf/lib/csf.div
+rm -fv /usr/local/csf/lib/restricted.txt
+rm -fv /usr/local/csf/lib/csfajaxtail.js
+rm -Rfv /var/lib/csf/ui
+
+# The jQuery/Bootstrap/Chosen/Fugue tree, wherever an earlier release
+# copied it. /etc/csf/ui/ ITSELF is left alone - it holds the operator's own
+# ui.allow, ui.ban and TLS material, which readme.txt says are kept - but
+# its images/ subdirectory was never anything but this package's copy of
+# those libraries. csf_small.png is NOT in the list: it is still shipped and
+# DirectAdmin's plugin buttons still point at it.
+for d in \
+    /etc/csf/ui/images \
+    /etc/csf/webmin/csf/images \
+    /usr/local/csf/lib/webmin/csf/images \
+    /usr/local/vesta/web/list/csf/images \
+; do
+    [ -d "$d" ] || continue
+    rm -Rfv "$d/bootstrap"
+    for a in LICENSE.txt admin_icon.svg reseller_icon.svg bootstrap-chosen.css \
+        chosen-sprite.png "chosen-sprite@2x.png" chosen.min.css chosen.min.js \
+        configserver.css csf-loader.gif csf.svg jquery.min.js loader.gif; do
+        rm -fv "$d/$a"
+    done
+done
+
 mkdir -p /usr/local/man/man1/
 cp -avf csf.1.txt /usr/local/man/man1/csf.1
 cp -avf csf.help /usr/local/csf/lib/
