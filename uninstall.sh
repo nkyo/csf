@@ -156,6 +156,18 @@ rm -fv /etc/apache2/conf-enabled/csf-ui.conf
 rm -fv /etc/httpd/conf.d/csf-ui.conf
 rm -Rfv /usr/local/lsws/conf/vhosts/csf-ui
 
+# Captured before the rm below, because there is nothing left to test once
+# it has run. Two things the closing message must not get wrong: whether
+# /etc/csf-ui was here at all (a host that never had csf-ui, or a second
+# run of this script, has nothing to claim was deleted), and whether it was
+# a symlink - `rm -Rfv` removes a symlink itself, not whatever it points
+# at, so the account hashes and TLS key living at the real target are
+# untouched by this script even though the path is gone.
+CSF_UI_ETC_LINK=0
+test -L /etc/csf-ui && CSF_UI_ETC_LINK=1
+CSF_UI_ETC_PRESENT=0
+{ [ -e /etc/csf-ui ] || [ "$CSF_UI_ETC_LINK" = 1 ]; } && CSF_UI_ETC_PRESENT=1
+
 rm -Rfv /usr/local/csf-ui /etc/csf-ui /var/lib/csf-ui /var/run/csf-ui /run/csf-ui-web
 
 # The unprivileged account and the two groups the installer created. Not
@@ -166,10 +178,21 @@ groupdel csfui 2>/dev/null
 groupdel csf-ui-sock 2>/dev/null
 
 echo
-echo "csf-ui: removed. /etc/csf-ui is gone, including its account hashes and"
-echo "csf-ui: TLS private key. The audit and access logs were kept:"
-echo "csf-ui:   /var/log/csf-ui-audit.log"
-echo "csf-ui:   /var/log/csf-ui-access.log"
+if [ "$CSF_UI_ETC_LINK" = 1 ]; then
+    echo "csf-ui: /etc/csf-ui was a symlink - only the link was removed, not"
+    echo "csf-ui: whatever it pointed at. If that target still holds account"
+    echo "csf-ui: hashes or a TLS private key, remove it yourself."
+elif [ "$CSF_UI_ETC_PRESENT" = 1 ]; then
+    echo "csf-ui: removed. /etc/csf-ui is gone, including its account hashes"
+    echo "csf-ui: and TLS private key."
+else
+    echo "csf-ui: nothing to remove - /etc/csf-ui was not present."
+fi
+if [ -f /var/log/csf-ui-audit.log ] || [ -f /var/log/csf-ui-access.log ]; then
+    echo "csf-ui: The audit and/or access log was kept:"
+    [ -f /var/log/csf-ui-audit.log ]  && echo "csf-ui:   /var/log/csf-ui-audit.log"
+    [ -f /var/log/csf-ui-access.log ] && echo "csf-ui:   /var/log/csf-ui-access.log"
+fi
 echo "csf-ui: If a web server was proxying to it, reload that web server -"
 echo "csf-ui: its configuration file is gone but it is still running the copy"
 echo "csf-ui: it parsed at startup."
