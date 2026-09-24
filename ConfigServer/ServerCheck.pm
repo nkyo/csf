@@ -163,6 +163,30 @@ sub addline {
 }
 # end addline
 ###############################################################################
+# start addnotice
+#
+# A row that is always rendered and never scored.
+#
+# addline() above cannot do this job: its pass branch is gated on $verbose,
+# which no reachable caller sets (report()'s only caller is csf.pl's domail(),
+# which passes nothing), and it increments $total, which is the denominator of
+# the "Server Score" endoutput() prints. A statement the operator must see, and
+# which is not a pass or a failure of anything, needs neither behaviour.
+#
+# Deliberately leaves $current alone as well, so that a section whose real
+# checks all passed still gets its "OK" marker from addtitle()/endoutput().
+sub addnotice {
+	my $check = shift;
+	my $comment = shift;
+
+	$output .= "<div style='display: flex;width: 100%;clear: both;'>\n";
+	$output .= "<div style='width: 250px;background: #FFFDD8;padding: 8px;border-bottom: 1px solid #DDDDDD;border-left: 1px solid #DDDDDD;border-right: 1px solid #DDDDDD;'>$check</div>\n";
+	$output .= "<div style='flex: 1;padding: 8px;border-bottom: 1px solid #DDDDDD;border-right: 1px solid #DDDDDD;'>$comment</div>\n";
+	$output .= "</div>\n";
+	return;
+}
+# end addnotice
+###############################################################################
 # start addtitle
 sub addtitle {
 	my $title = shift;
@@ -298,21 +322,33 @@ sub firewallcheck {
 		&addline($status,"$option option check","This option helps prevent brute force attacks on your server services or overall server stability");
 	}
 
-	# RESTRICT_UI used to be the twelfth name in the list above. It was never
-	# a brute-force protection - it restricted which csf.conf settings the
-	# built-in UI could write - and that UI was removed (see CHANGES.md), so
-	# scoring it here would be a security report affirming a control that no
-	# longer exists. Worse in both directions: with RESTRICT_UI = "1", the
-	# shipped default, the loop above emitted a green pass for a protection
-	# that had stopped protecting; with RESTRICT_UI = "0" it emitted a red
-	# failure and told the operator to enable something inert.
+	# RESTRICT_UI used to be the ELEVENTH and last name in the primary list
+	# above. It was never a brute-force protection - it restricted which
+	# csf.conf settings the built-in UI could write - and that UI was removed
+	# (see CHANGES.md), so scoring it here would be a security report
+	# affirming a control that no longer exists. It was wrong in both
+	# directions: with RESTRICT_UI = "1", the shipped default, the loop above
+	# emitted a green pass for a protection that had stopped protecting; with
+	# RESTRICT_UI = "0" it emitted a red failure telling the operator to
+	# enable something inert.
 	#
-	# It is reported explicitly instead of dropped, for the same reason the
-	# key itself stays in csf.conf: a check that silently disappears leaves
-	# an operator who used to see it wondering what happened to it. The row
-	# is informational - it never counts as a failure, whatever the value is
-	# set to, because there is no value of this key that is now a problem.
-	&addline(0,"RESTRICT_UI option check","This option no longer restricts anything and is not counted for or against this server. It limited which csf.conf settings the removed built-in UI could write; its replacement, csf-ui, has a fixed operation list that cannot write any setting at all, so the strictest thing this option used to do is now the only available behaviour. The key is left in csf.conf so that your setting is not silently discarded");
+	# WHY THIS IS NOT &addline. addline's pass branch is gated on $verbose
+	# (see :155), and $verbose has exactly one setter - report()'s argument.
+	# The only caller left is csf.pl's domail() ("csf -m"), which calls
+	# report() with no argument, so $verbose is undef on every reachable
+	# path and addline(0,...) renders to nobody. The first version of this
+	# fix used addline(0,...) and was therefore invisible: the one operator
+	# who ever saw a RESTRICT_UI row - the one with "0", who got the red
+	# failure - would have had it silently disappear, which is the exact
+	# defect this whole retirement is written to avoid.
+	#
+	# addnotice() always renders and touches no counter. Not touching
+	# $total matters: endoutput() prints "Server Score: $score/$total", so
+	# an addline here would be a guaranteed pass point padding both sides of
+	# a security score with a check that checks nothing. It leaves $current
+	# alone too, so a section whose real checks all passed still prints its
+	# "OK" marker underneath this notice.
+	&addnotice("RESTRICT_UI option check","This option no longer restricts anything, and is not part of the score above or below. It limited which csf.conf settings the removed built-in UI could write, and its replacement csf-ui has no operation that writes a setting at all - so RESTRICT_UI = \"1\", a UI that cannot edit the restricted settings, is now how the interface behaves whatever this is set to. Note that this is NOT the same as RESTRICT_UI = \"2\", which disabled the UI outright: csf-ui is a working interface and can still add and remove blocks, add and remove allows, and restart the firewall. If that is not what you want, do not install it. The key is left in csf.conf so that your setting is not silently discarded");
 
 	$status = 0;
 	unless ($config{LF_DIRWATCH}) {$status = 1}
