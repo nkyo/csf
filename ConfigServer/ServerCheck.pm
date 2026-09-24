@@ -288,15 +288,31 @@ sub firewallcheck {
 	}
 
 	$status = 0;
-	my @options = ("LF_SSHD","LF_FTPD","LF_SMTPAUTH","LF_POP3D","LF_IMAPD","LF_HTACCESS","LF_MODSEC","LF_CPANEL","LF_CPANEL_ALERT","SYSLOG_CHECK","RESTRICT_UI");
-	if ($config{GENERIC}) {@options = ("LF_SSHD","LF_FTPD","LF_SMTPAUTH","LF_POP3D","LF_IMAPD","LF_HTACCESS","LF_MODSEC","SYSLOG_CHECK","FASTSTART","RESTRICT_UI");}
-	if ($config{DNSONLY}) {@options = ("LF_SSHD","LF_CPANEL","SYSLOG_CHECK","FASTSTART","RESTRICT_UI")}
+	my @options = ("LF_SSHD","LF_FTPD","LF_SMTPAUTH","LF_POP3D","LF_IMAPD","LF_HTACCESS","LF_MODSEC","LF_CPANEL","LF_CPANEL_ALERT","SYSLOG_CHECK");
+	if ($config{GENERIC}) {@options = ("LF_SSHD","LF_FTPD","LF_SMTPAUTH","LF_POP3D","LF_IMAPD","LF_HTACCESS","LF_MODSEC","SYSLOG_CHECK","FASTSTART");}
+	if ($config{DNSONLY}) {@options = ("LF_SSHD","LF_CPANEL","SYSLOG_CHECK","FASTSTART")}
 
 	foreach my $option (@options) {
 		$status = 0;
 		unless ($config{$option}) {$status = 1}
 		&addline($status,"$option option check","This option helps prevent brute force attacks on your server services or overall server stability");
 	}
+
+	# RESTRICT_UI used to be the twelfth name in the list above. It was never
+	# a brute-force protection - it restricted which csf.conf settings the
+	# built-in UI could write - and that UI was removed (see CHANGES.md), so
+	# scoring it here would be a security report affirming a control that no
+	# longer exists. Worse in both directions: with RESTRICT_UI = "1", the
+	# shipped default, the loop above emitted a green pass for a protection
+	# that had stopped protecting; with RESTRICT_UI = "0" it emitted a red
+	# failure and told the operator to enable something inert.
+	#
+	# It is reported explicitly instead of dropped, for the same reason the
+	# key itself stays in csf.conf: a check that silently disappears leaves
+	# an operator who used to see it wondering what happened to it. The row
+	# is informational - it never counts as a failure, whatever the value is
+	# set to, because there is no value of this key that is now a problem.
+	&addline(0,"RESTRICT_UI option check","This option no longer restricts anything and is not counted for or against this server. It limited which csf.conf settings the removed built-in UI could write; its replacement, csf-ui, has a fixed operation list that cannot write any setting at all, so the strictest thing this option used to do is now the only available behaviour. The key is left in csf.conf so that your setting is not silently discarded");
 
 	$status = 0;
 	unless ($config{LF_DIRWATCH}) {$status = 1}
