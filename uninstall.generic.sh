@@ -23,6 +23,13 @@ if test `cat /proc/1/comm` = "systemd"
 then
     systemctl disable --now csf-ui.service 2>/dev/null
     systemctl disable --now csf-ui-helper.service 2>/dev/null
+    # csf-ui-rollback.timer (Rollback.pm arm()) is a THIRD independent unit -
+    # written to /etc/systemd/system, not /usr/lib/systemd/system where the
+    # two units above live. Left armed, it survives everything below: with
+    # OnBootSec=60 it re-fires on every subsequent boot, forever, once this
+    # script deletes the snapshot and setup binary its ExecStart points at.
+    # Disabled here, before /usr/sbin/csf is removed, same as the two above.
+    systemctl disable --now csf-ui-rollback.timer 2>/dev/null
 else
     # No systemd. Nothing enabled these, because install-webui.sh only
     # enables them through systemctl, but something may still have started
@@ -108,6 +115,12 @@ rm -Rfv /etc/csf /usr/local/csf /var/lib/csf
 ###############################################################################
 rm -fv /usr/lib/systemd/system/csf-ui.service
 rm -fv /usr/lib/systemd/system/csf-ui-helper.service
+# csf-ui-rollback.service/.timer (Rollback.pm arm()) live in
+# /etc/systemd/system - a different directory from the two units above.
+# Disabled already, up in the STOP FIRST block; removing the files here
+# is what stops them surviving a reboot.
+rm -fv /etc/systemd/system/csf-ui-rollback.timer
+rm -fv /etc/systemd/system/csf-ui-rollback.service
 if test `cat /proc/1/comm` = "systemd"
 then
     systemctl daemon-reload 2>/dev/null
