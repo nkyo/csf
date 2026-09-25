@@ -137,6 +137,15 @@ rm -fv /etc/apache2/conf-enabled/csf-ui.conf
 rm -fv /etc/httpd/conf.d/csf-ui.conf
 rm -Rfv /usr/local/lsws/conf/vhosts/csf-ui
 
+# The two operator commands install-webui.sh's install_path_symlinks() puts
+# on PATH, next to csf's own /usr/sbin/csf. Removed BEFORE the tree they
+# point into, so that if anything below fails there is no dangling
+# csf-ui-passwd left on an administrator's PATH. Both paths are absolute
+# and literal - no variable is interpolated into either rm - and rm -f on a
+# path that is not there is a no-op, so a re-run is harmless.
+rm -fv /usr/sbin/csf-ui-passwd
+rm -fv /usr/sbin/csf-ui-setup
+
 rm -Rfv /usr/local/csf-ui /etc/csf-ui /var/lib/csf-ui /var/run/csf-ui /run/csf-ui-web
 
 # The unprivileged account and the two groups the installer created. Not
