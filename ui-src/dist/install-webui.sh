@@ -622,12 +622,38 @@ write_ui_conf() {
 	ui_mode=$1
 	port=$2
 	allow=$3
+	# FOURTH ARGUMENT, AND WHY IT IS ALLOWED TO BE EMPTY. UI_LISTEN is a
+	# mode-B key and ONLY a mode-B key: docs/WEBUI-RPC.md S10 says a
+	# ui.conf that is mode A and mentions UI_LISTEN "contradicts itself",
+	# and Server.pm's read_ui_conf() refuses to start over it - it reads
+	# the key's PRESENCE out of %raw before any default, precisely so that
+	# "set to 127.0.0.1" and "never mentioned" stay distinguishable. So
+	# setup_mode_a() passes "" and the key is not written at all; a mode-A
+	# ui.conf is byte-for-byte what it always was.
+	#
+	# In mode B the key is now ALWAYS written, even when the value is the
+	# same 127.0.0.1 Server.pm would have defaulted to. The absent key was
+	# defect 5: the menu offered "standalone (csf-ui serves TLS itself)",
+	# the operator gave an allow address and a port, and the file said
+	#
+	#   UI_MODE="b"
+	#   UI_PORT="8443"
+	#   UI_ALLOW="115.79.213.185"
+	#
+	# which binds loopback - the one address on which a standalone remote
+	# admin UI is useless, and which makes the other two answers inert. A
+	# file that states its listen address cannot be misread by the next
+	# person to look at it, whichever address it is.
+	listen=$4
 
 	tmp="/etc/csf-ui/.ui.conf.new.$$"
 	{
 		printf '# /etc/csf-ui/ui.conf - written by the csf installer, %s\n' "$(date '+%Y-%m-%d')"
 		printf '# docs/WEBUI-RPC.md S10 is the frozen grammar and key list.\n'
 		printf 'UI_MODE="%s"\n' "$ui_mode"
+		if [ -n "$listen" ]; then
+			printf 'UI_LISTEN="%s"\n' "$listen"
+		fi
 		printf 'UI_PORT="%s"\n' "$port"
 		printf 'UI_ALLOW="%s"\n' "$allow"
 	} > "$tmp"
@@ -1080,6 +1106,103 @@ _enable_now() {
 }
 
 ###############################################################################
+# validate_ui_listen ADDRESS - is this a literal address Server.pm will
+# accept? Asked with Socket::inet_pton, which is the exact judge
+# read_ui_conf() uses (docs/WEBUI-RPC.md S10: "IPv4/IPv6 address literal
+# ... a literal only, never a hostname - no DNS at startup"), rather than
+# a shell-shaped guess at it. A value this refuses is one csf-ui would
+# refuse to start over, and catching it at the prompt is the difference
+# between retyping a line and reading journalctl.
+###############################################################################
+validate_ui_listen() {
+	candidate=$1
+	command -v perl >/dev/null 2>&1 || return 0
+	perl -e '
+		use Socket ();
+		my $text = $ARGV[0];
+		exit 1 unless defined $text && length $text;
+		my $family = ($text =~ /:/) ? Socket::AF_INET6() : Socket::AF_INET();
+		exit(defined(Socket::inet_pton($family, $text)) ? 0 : 1);
+	' -- "$candidate" >/dev/null 2>&1
+}
+
+###############################################################################
+# ask_listen_address ALLOW PORT - the question defect 5 was the absence of.
+#
+# WHY THIS IS A QUESTION AND NOT A NEW DEFAULT. Two things are both true
+# and pull in opposite directions:
+#
+#   Loopback makes every other answer in this dialogue inert. The operator
+#   chose "standalone" over "behind the detected web server", named an
+#   address that may reach it, and picked a port. A listener on 127.0.0.1
+#   satisfies none of that, and it was being chosen for them, silently, by
+#   a key nobody wrote.
+#
+#   Widening a bind is not the installer's to do quietly. UI_ALLOW gating
+#   and TLS are real, but "only your address may connect" is not a reason
+#   to put an administrative interface on every interface without saying
+#   the words - and there are operators who deliberately want loopback and
+#   an SSH tunnel.
+#
+# A prompt is what satisfies both: the widening is the answer to a question
+# with its consequence written next to it, the narrow option is offered by
+# name with the command that makes it usable, and setup_mode_b() states
+# which one was written before this installer exits either way.
+#
+# THE DEFAULT IS ALL-INTERFACES, and that is a deliberate choice rather
+# than the lazy one. Pressing enter should produce the configuration the
+# three previous answers describe; the alternative default reproduces the
+# reported defect for anyone who does not read the prompt, which is the
+# population the prompt exists for.
+#
+# ONE SOCKET. Server.pm's _open_listener() binds exactly one: the family
+# comes from whether the address contains a colon. So 0.0.0.0 is IPv4 and
+# :: is IPv6 - dual-stack only where the host's net.ipv6.bindv6only is 0,
+# which is the Linux default but is a host fact, not ours. Said at the
+# prompt rather than discovered.
+###############################################################################
+ask_listen_address() {
+	allow_for_prompt=$1
+	port_for_prompt=$2
+
+	# EVERY PROMPT LINE GOES TO STDERR. This function's stdout is the
+	# answer, and the caller reads it with $(...) - a prompt printed on
+	# stdout would be captured into the value instead of shown to the
+	# person being asked, which is a silent-failure shape this tree has
+	# already paid for once. stderr is the same terminal in the only
+	# situation this function is ever reached from (interactive_setup(),
+	# which main() calls only when stdin AND stdout are a tty), and read
+	# still takes the terminal because command substitution does not
+	# redirect stdin.
+	echo >&2
+	echo "csf-ui: Mode B binds the port itself, so it needs a listen address." >&2
+	echo "csf-ui: UI_ALLOW ($allow_for_prompt) gates who may connect whichever you pick, and" >&2
+	echo "csf-ui: TLS is on either way - neither is an alternative to this choice." >&2
+	echo "csf-ui:   a = all IPv4 interfaces (0.0.0.0) - reachable over the network" >&2
+	echo "csf-ui:   l = loopback only (127.0.0.1) - reachable ONLY from this machine," >&2
+	echo "csf-ui:       i.e. through an SSH tunnel" >&2
+	echo "csf-ui:   or type one literal address to bind - e.g. 203.0.113.7, or :: for all" >&2
+	echo "csf-ui:       IPv6 interfaces. csf-ui binds ONE socket, so 0.0.0.0 is IPv4 only" >&2
+	echo "csf-ui:       and :: is IPv6 (plus IPv4 where net.ipv6.bindv6only is 0)." >&2
+	printf 'csf-ui: listen address for port %s [a]: ' "$port_for_prompt" >&2
+	read -r listen_answer
+
+	case "$listen_answer" in
+		'' | [Aa]) printf '0.0.0.0\n' ;;
+		[Ll]) printf '127.0.0.1\n' ;;
+		*)
+			if validate_ui_listen "$listen_answer"; then
+				printf '%s\n' "$listen_answer"
+			else
+				echo "csf-ui: '$listen_answer' is not a literal IPv4 or IPv6 address (Socket::inet_pton" >&2
+				echo "csf-ui: refuses it, and so would csf-ui at startup) - using 0.0.0.0" >&2
+				printf '0.0.0.0\n'
+			fi
+			;;
+	esac
+}
+
+###############################################################################
 # setup_mode_b - standalone: csf-ui terminates TLS itself
 # (ConfigServer::UI::Server, Task 5). Both units are meaningful here, so
 # both are enabled.
@@ -1087,14 +1210,40 @@ _enable_now() {
 setup_mode_b() {
 	port=$1
 	allow=$2
+	listen=$3
 
 	if ! validate_ui_allow "$allow"; then
 		echo "csf-ui: leaving the WebUI unconfigured."
 		return 1
 	fi
 
-	write_ui_conf b "$port" "$allow"
+	# A caller that passed nothing gets the value Server.pm would have
+	# defaulted to, WRITTEN OUT rather than left implicit - so even that
+	# path produces a file that states its own listen address.
+	[ -n "$listen" ] || listen=127.0.0.1
+
+	write_ui_conf b "$port" "$allow" "$listen"
 	echo "csf-ui: ui.conf written for Mode B (standalone) on port $port."
+
+	# SAY WHICH ONE THEY GOT, BEFORE THIS INSTALLER EXITS. Defect 5 was not
+	# only that loopback was chosen for the operator - it was that nothing
+	# told them, so a service that had started correctly answered nothing
+	# and there was no line anywhere to explain it.
+	if [ "$listen" = "127.0.0.1" ] || [ "$listen" = "::1" ]; then
+		echo "csf-ui: UI_LISTEN=\"$listen\" - LOOPBACK ONLY. Nothing off this machine can reach"
+		echo "csf-ui: it, by design. Reach it with an SSH tunnel from your own machine:"
+		echo "csf-ui:   ssh -N -L $port:$listen:$port root@<this-server>"
+		echo "csf-ui: then browse to https://$listen:$port/"
+		echo "csf-ui: (UI_ALLOW must contain the address csf-ui sees, which through a tunnel is"
+		echo "csf-ui: $listen - if it does not, add it to /etc/csf-ui/ui.conf and restart csf-ui.)"
+	elif [ "$listen" = "0.0.0.0" ] || [ "$listen" = "::" ]; then
+		echo "csf-ui: UI_LISTEN=\"$listen\" - listening on ALL interfaces. Only UI_ALLOW ($allow)"
+		echo "csf-ui: may connect, and the connection is TLS, but the port is open to the network:"
+		echo "csf-ui:   https://<this server's address>:$port/"
+	else
+		echo "csf-ui: UI_LISTEN=\"$listen\" - listening on that address only:"
+		echo "csf-ui:   https://$listen:$port/"
+	fi
 	# The sub-command is `add`, and the role is a positional argument -
 	# csf-ui-passwd's run() dispatches add/passwd/delete/list and nothing
 	# else. This line said `useradd <name> --role admin`, which prints the
@@ -1425,7 +1574,8 @@ setup_mode_a() {
 		verified_note="verified with its own configuration test"
 	fi
 
-	write_ui_conf a "$port" "$allow"
+	# "" - mode A must NOT carry UI_LISTEN; see write_ui_conf().
+	write_ui_conf a "$port" "$allow" ""
 	grant_socket_group "$front"
 	clear_modules_enabled_record
 
@@ -1600,8 +1750,267 @@ interactive_setup() {
 	if [ "$mode" = "a" ]; then
 		setup_mode_a "$front" "$port" "$allow"
 	else
-		setup_mode_b "$port" "$allow"
+		listen=$(ask_listen_address "$allow" "$port")
+		setup_mode_b "$port" "$allow" "$listen"
 	fi
+}
+
+###############################################################################
+# csf_conf_value KEY - one KEY="value" out of the LIVE /etc/csf/csf.conf.
+#
+# Reading csf's config is not writing it - see check_firewall_port() below
+# for why this script reads that file and does not touch it.
+###############################################################################
+csf_conf_value() {
+	key=$1
+	# The path is an argument with a default, not a constant, for the same
+	# reason check_installed_perl_deps() takes its two: t/93 can then drive
+	# this against a fixture instead of against this host's real firewall
+	# configuration, and main() still passes nothing and gets the real one.
+	conf_path=${2:-/etc/csf/csf.conf}
+	[ -r "$conf_path" ] || return 1
+	sed -n "s/^[[:space:]]*$key[[:space:]]*=[[:space:]]*\"\(.*\)\"[[:space:]]*\$/\1/p" \
+		"$conf_path" | head -n1
+}
+
+###############################################################################
+# port_in_list PORT LIST - is PORT in one of csf's comma-separated port
+# lists? Handles csf's own "lo:hi" range syntax as well as bare numbers,
+# because TCP_IN = "...,2020:2030,..." is ordinary in the wild and reading
+# it as a literal string would report a port as closed when it is open.
+###############################################################################
+port_in_list() {
+	want=$1
+	list=$2
+	old_ifs=$IFS
+	IFS=,
+	for item in $list; do
+		IFS=$old_ifs
+		item=$(printf '%s' "$item" | sed 's/^[ \t]*//; s/[ \t]*$//')
+		case "$item" in
+			'')
+				;;
+			*:*)
+				lo=${item%%:*}
+				hi=${item##*:}
+				case "$lo$hi" in
+					*[!0-9]*) ;;
+					*)
+						if [ "$want" -ge "$lo" ] 2>/dev/null && [ "$want" -le "$hi" ] 2>/dev/null; then
+							IFS=$old_ifs
+							return 0
+						fi
+						;;
+				esac
+				;;
+			*)
+				if [ "$item" = "$want" ]; then
+					IFS=$old_ifs
+					return 0
+				fi
+				;;
+		esac
+		IFS=,
+	done
+	IFS=$old_ifs
+	return 1
+}
+
+###############################################################################
+# check_firewall_port PORT - defect 6: the installer that ships WITH the
+# firewall was configuring a service the firewall then drops.
+#
+# MEASURED, not assumed: only ONE of the seven shipped configurations has
+# the default 8443 in its port list. csf.conf (the cPanel one) does;
+# csf.generic.conf, csf.cwp.conf, csf.cyberpanel.conf, csf.directadmin.conf,
+# csf.interworx.conf and csf.vesta.conf do not. So on six of seven
+# platforms - including the plain generic install - a Mode B UI on the
+# default port is unreachable out of the box, and on all seven it is
+# unreachable on any port the operator chose instead.
+#
+# WHY THIS PRINTS THE EDIT AND DOES NOT MAKE IT. The option of doing it
+# with consent was real and is declined, for reasons that are about blast
+# radius rather than about tidiness:
+#
+#   TCP_IN is the single line in csf.conf that can lock an administrator
+#   out of their own server. An automated edit of it, from the OPTIONAL
+#   half of a firewall installer, inverts this script's own first rule -
+#   "a failure to set up the UI must not fail the install". Getting the UI
+#   wrong should cost the UI, never SSH.
+#
+#   Applying it means `csf -r` on a live box. Reloading a production
+#   firewall is not a side effect an operator should discover in the
+#   scrollback of a UI setup step.
+#
+#   The correct new value is not always "current list plus this port".
+#   TCP_IN is managed by configuration management on plenty of servers, is
+#   deliberately minimal on others, and is regenerated from the shipped
+#   file by auto.*.pl on every upgrade. An edit this script makes can be
+#   silently reverted later, which is worse than never making it: the UI
+#   would work until the next upgrade and then stop for no visible reason.
+#
+#   csf-ui itself has no operation that writes a setting - that is the
+#   stated reason RESTRICT_UI stopped restricting anything. The installer
+#   is a different actor from the web tier and csf's own install.*.sh does
+#   write csf.conf, so "the installer may not" would be too strong an
+#   argument. The one above is the argument: not "may not", but "the cost
+#   of being wrong here is paid in SSH access, and a printed line costs
+#   one paste".
+#
+# What it does instead is leave nothing to infer: it reads the live file,
+# says whether the port is in TCP_IN and TCP6_IN, and prints the complete
+# replacement line plus the command. And it is counted as a PROBLEM by
+# verify_install(), because a UI nothing can connect to is not a
+# successful install - reporting otherwise is the exact defect class this
+# branch exists to close.
+#
+# Return: 0 open - 1 closed (and said so) - 2 could not tell.
+###############################################################################
+check_firewall_port() {
+	port=$1
+	conf_path=${2:-/etc/csf/csf.conf}
+
+	if [ ! -r "$conf_path" ]; then
+		echo "csf-ui: $conf_path is not readable here - cannot say whether port $port is"
+		echo "csf-ui: open in csf's own firewall. Check TCP_IN yourself before trusting the UI."
+		return 2
+	fi
+
+	tcp_in=$(csf_conf_value TCP_IN "$conf_path")
+	tcp6_in=$(csf_conf_value TCP6_IN "$conf_path")
+	if [ -z "$tcp_in" ]; then
+		echo "csf-ui: could not read TCP_IN out of $conf_path - cannot say whether port"
+		echo "csf-ui: $port is open in csf's own firewall. Check it yourself."
+		return 2
+	fi
+
+	v4_open=0
+	v6_open=0
+	port_in_list "$port" "$tcp_in" && v4_open=1
+	if [ -n "$tcp6_in" ]; then
+		port_in_list "$port" "$tcp6_in" && v6_open=1
+	fi
+
+	if [ "$v4_open" -eq 1 ] && { [ -z "$tcp6_in" ] || [ "$v6_open" -eq 1 ]; }; then
+		echo "csf-ui: port $port is already in csf's TCP_IN (and TCP6_IN) - nothing to open."
+		return 0
+	fi
+
+	echo "csf-ui: *** Port $port is NOT open in csf's own firewall. ***"
+	echo "csf-ui: csf will drop every connection to it, so the WebUI is running and"
+	echo "csf-ui: unreachable until you open it. This installer does not edit"
+	echo "csf-ui: $conf_path - TCP_IN is the one line there that can lock you out of"
+	echo "csf-ui: your own server, and an optional UI step is the wrong place to risk it."
+	echo "csf-ui: Set these in $conf_path:"
+	echo "csf-ui:"
+	if [ "$v4_open" -eq 0 ]; then
+		echo "csf-ui:   TCP_IN = \"$tcp_in,$port\""
+	fi
+	if [ -n "$tcp6_in" ] && [ "$v6_open" -eq 0 ]; then
+		echo "csf-ui:   TCP6_IN = \"$tcp6_in,$port\""
+	fi
+	echo "csf-ui:"
+	echo "csf-ui: then apply them:"
+	echo "csf-ui:   csf -r"
+
+	testing=$(csf_conf_value TESTING "$conf_path")
+	if [ "$testing" = "1" ]; then
+		interval=$(csf_conf_value TESTING_INTERVAL "$conf_path")
+		echo "csf-ui: ($conf_path also has TESTING = \"1\": lfd will not start, and a cron job"
+		echo "csf-ui: clears the firewall every ${interval:-5} minutes, so what the port list says"
+		echo "csf-ui: is only true between a csf start and the next clear. Set TESTING = \"0\""
+		echo "csf-ui: once you are satisfied you will not be locked out.)"
+	fi
+	return 1
+}
+
+###############################################################################
+# probe_listener ADDRESS [PORT] - connect to the thing that was just
+# configured, and report what actually happened.
+#
+# WHY THIS EXISTS. Six defects have now come out of one real install, and
+# the last two got past every check in this file because THE SERVICE WAS
+# HEALTHY. _enable_now() watched csf-ui.service start, stay up and never
+# restart - all true - while the listener was on 127.0.0.1 and the port
+# was closed in the firewall. "Starts" and "works" are different claims,
+# and nothing here had ever made the second one.
+#
+# WHAT A SUCCESSFUL CONNECT PROVES, EXACTLY: that a process on THIS host
+# is accepting connections on that address and port. That is the half of
+# the question this script can answer, and it is the half defect 5 fell
+# through - a loopback-only listener still answers a loopback connect, but
+# a listener that is not there at all does not, and neither does one whose
+# bind() failed on an address the host does not have.
+#
+# WHAT IT DOES NOT PROVE, and the caller says so out loud: anything at all
+# about the operator's browser. This connection never leaves the machine,
+# so it does not cross csf's own INPUT chain in any meaningful way, any
+# upstream firewall, a cloud security group, or routing. check_firewall_port()
+# above is the other half, and it is a READ OF A CONFIG FILE rather than a
+# test of the path. Neither of them, together or apart, is a substitute
+# for the operator opening the URL - and no message here claims they are.
+#
+# UI_ALLOW is enforced BEFORE TLS (Server.pm's accept loop calls
+# admit_peer() first, deliberately, so no handshake is spent on an address
+# the administrator never listed). A local probe is therefore expected to
+# connect and then be closed without a byte, which is a pass here: the
+# TCP-level connect is the whole of what is being asked.
+#
+# Return: 0 connected - 1 refused/unreachable - 2 could not test.
+###############################################################################
+probe_listener() {
+	target=$1
+	target_port=$2
+
+	command -v perl >/dev/null 2>&1 || return 2
+
+	probe_out=$(perl -e '
+		use Socket ();
+		my ($addr, $port) = @ARGV;
+		my ($family, $sockaddr);
+		if ($addr =~ m{^/}) {
+			$family   = Socket::AF_UNIX();
+			$sockaddr = Socket::pack_sockaddr_un($addr);
+		}
+		elsif ($addr =~ /:/) {
+			$family = Socket::AF_INET6();
+			my $packed = Socket::inet_pton($family, $addr);
+			unless (defined $packed) { print "BADADDR\n"; exit 2 }
+			$sockaddr = Socket::pack_sockaddr_in6($port, $packed);
+		}
+		else {
+			$family = Socket::AF_INET();
+			my $packed = Socket::inet_pton($family, $addr);
+			unless (defined $packed) { print "BADADDR\n"; exit 2 }
+			$sockaddr = Socket::pack_sockaddr_in($port, $packed);
+		}
+		my $s;
+		unless (socket($s, $family, Socket::SOCK_STREAM(), 0)) {
+			print "NOSOCKET: $!\n";
+			exit 2;
+		}
+		$SIG{ALRM} = sub { print "TIMEOUT\n"; exit 1 };
+		alarm(5);
+		if (connect($s, $sockaddr)) {
+			alarm(0);
+			close $s;
+			print "CONNECTED\n";
+			exit 0;
+		}
+		alarm(0);
+		print "REFUSED: $!\n";
+		exit 1;
+	' -- "$target" "${target_port:-0}" 2>/dev/null)
+	probe_rc=$?
+
+	case "$probe_rc" in
+		0) return 0 ;;
+		1)
+			probe_reason=$probe_out
+			return 1
+			;;
+		*) return 2 ;;
+	esac
 }
 
 ###############################################################################
@@ -1849,6 +2258,96 @@ verify_install() {
 				echo "csf-ui:   already been restarted was not re-checked here (it was watched at start)"
 			fi
 		done
+	fi
+
+	# DOES THE THING THAT WAS CONFIGURED ACTUALLY ANSWER? Defects 5 and 6
+	# got past every check above because the SERVICE WAS HEALTHY: enabled,
+	# active, never restarted - and bound to loopback behind a closed
+	# firewall port. "Starts" and "works" are different claims, and until
+	# now only the first was ever made.
+	#
+	# Read out of the ui.conf that was actually written, not out of this
+	# run's variables, so it checks the installed state rather than this
+	# script's intentions.
+	if [ -f /etc/csf-ui/ui.conf ]; then
+		installed_mode=$(sed -n 's/^UI_MODE="\(.*\)"$/\1/p' /etc/csf-ui/ui.conf | head -n1)
+		installed_port=$(sed -n 's/^UI_PORT="\(.*\)"$/\1/p' /etc/csf-ui/ui.conf | head -n1)
+		installed_listen=$(sed -n 's/^UI_LISTEN="\(.*\)"$/\1/p' /etc/csf-ui/ui.conf | head -n1)
+		[ -n "$installed_port" ] || installed_port=8443
+
+		if [ "$installed_mode" = "b" ]; then
+			# UI_LISTEN absent means Server.pm's own default, 127.0.0.1 -
+			# reported as such rather than guessed at, because "absent"
+			# and "loopback" being the same thing is exactly what made
+			# defect 5 invisible.
+			if [ -z "$installed_listen" ]; then
+				echo "csf-ui: *VERIFY FAILED* /etc/csf-ui/ui.conf is mode B with no UI_LISTEN, so"
+				echo "csf-ui:   csf-ui will bind 127.0.0.1 only and nothing off this machine can"
+				echo "csf-ui:   reach it. Add UI_LISTEN=\"0.0.0.0\" (or a literal address) and"
+				echo "csf-ui:   restart csf-ui.service, or re-run this installer."
+				problems=$((problems + 1))
+				installed_listen=127.0.0.1
+			fi
+
+			# You cannot usefully connect TO 0.0.0.0 or ::; the wildcard
+			# bind is reached through a real local address. Which one was
+			# probed is printed, so the result cannot be read as a claim
+			# about a different address.
+			case "$installed_listen" in
+				0.0.0.0) probe_target=127.0.0.1 ;;
+				::)      probe_target=::1 ;;
+				*)       probe_target=$installed_listen ;;
+			esac
+
+			probe_reason=""
+			probe_listener "$probe_target" "$installed_port"
+			case $? in
+				0)
+					echo "csf-ui: connected to $probe_target:$installed_port from this host - csf-ui is listening."
+					echo "csf-ui:   (That is all this proves. It says nothing about whether your browser can"
+					echo "csf-ui:   reach it: this connection never left the machine, so it did not cross"
+					echo "csf-ui:   csf's own rules, any upstream firewall or security group, or routing.)"
+					;;
+				1)
+					echo "csf-ui: *VERIFY FAILED* nothing is accepting connections on $probe_target:$installed_port"
+					echo "csf-ui:   ${probe_reason:-no further detail} - csf-ui.service may be up, but the"
+					echo "csf-ui:   configured listener is not answering. 'journalctl -u csf-ui.service'"
+					problems=$((problems + 1))
+					;;
+				*)
+					echo "csf-ui: could not test the listener on $probe_target:$installed_port (no usable perl here)"
+					;;
+			esac
+		elif [ "$installed_mode" = "a" ]; then
+			# Mode A's transport is the unix socket, and its failure looks
+			# like a 502 from the front server rather than a dead service.
+			probe_reason=""
+			probe_listener /run/csf-ui-web/csf-ui.sock
+			case $? in
+				0)
+					echo "csf-ui: connected to /run/csf-ui-web/csf-ui.sock - the Mode A listener is up."
+					echo "csf-ui:   (This says nothing about the front web server's own port, which it does"
+					echo "csf-ui:   not serve until it is reloaded, nor about reaching that port remotely.)"
+					;;
+				1)
+					echo "csf-ui: *VERIFY FAILED* nothing is accepting connections on"
+					echo "csf-ui:   /run/csf-ui-web/csf-ui.sock - ${probe_reason:-no further detail}."
+					echo "csf-ui:   Every request through the front server will be a 502 until it is."
+					problems=$((problems + 1))
+					;;
+				*)
+					echo "csf-ui: could not test the Mode A socket (no usable perl here)"
+					;;
+			esac
+		fi
+
+		# csf's own firewall, for whichever mode: in Mode B csf-ui serves
+		# the port itself, in Mode A the front server does, and csf drops
+		# it just the same either way.
+		check_firewall_port "$installed_port"
+		if [ $? -eq 1 ]; then
+			problems=$((problems + 1))
+		fi
 	fi
 
 	for d in /etc/csf /var/lib/csf /usr/local/csf; do
