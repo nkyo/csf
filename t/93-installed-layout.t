@@ -718,4 +718,322 @@ STUB
 	}
 }
 
+###############################################################################
+# SECTION 9 - defect 5: Mode B bound loopback because UI_LISTEN was never
+# written, and nothing said so.
+#
+# Server.pm:514 - `my $listen_text = defined $raw{UI_LISTEN} ? $raw{UI_LISTEN}
+# : '127.0.0.1';` - so an absent key IS loopback. write_ui_conf() wrote
+# UI_MODE, UI_PORT and UI_ALLOW and stopped, which meant the menu offered
+# "standalone (csf-ui serves TLS itself)", the operator named an address
+# that may connect and a port, and the result served the one address on
+# which none of that is reachable.
+#
+# The file is driven for real here, with /etc/csf-ui redirected into a
+# sandbox and chown neutralised, and the result is handed to the actual
+# Server.pm read_ui_conf() rather than pattern-matched - because the
+# question is not "does it contain a line", it is "does the library that
+# reads this file agree with what the installer wrote".
+###############################################################################
+{
+	my $installer = slurp($INSTALLER);
+	my ($fn) = $installer =~ /^(write_ui_conf\(\) \{\n.*?^\})$/ms;
+	ok(defined($fn), 'write_ui_conf() was located in the real install-webui.sh');
+
+	# The mode-A call must pass an empty listen, and the mode-B call must
+	# pass a real one - checked as the actual call sites, because a
+	# write_ui_conf() that can write UI_LISTEN and two callers that never
+	# give it one is the same defect with more code.
+	like($installer, qr/^\twrite_ui_conf a "\$port" "\$allow" ""$/m,
+		'setup_mode_a() passes an EMPTY listen - a mode-A ui.conf must not carry UI_LISTEN at all');
+	like($installer, qr/^\twrite_ui_conf b "\$port" "\$allow" "\$listen"$/m,
+		'setup_mode_b() passes a listen address through to write_ui_conf()');
+	like($installer, qr/^\t\tlisten=\$\(ask_listen_address "\$allow" "\$port"\)$/m,
+		'interactive_setup() ASKS for the listen address before configuring Mode B');
+
+	SKIP: {
+		skip 'write_ui_conf() could not be extracted', 10 unless defined $fn;
+
+		my $sandbox = tempdir(CLEANUP => 1);
+		make_path("$sandbox/etc/csf-ui");
+		my $body = $fn;
+		my $want_hits = () = $body =~ m{/etc/csf-ui}g;
+		cmp_ok($want_hits, '>=', 3, 'write_ui_conf() names /etc/csf-ui enough times for the redirect to be real');
+		$body =~ s{/etc/csf-ui}{$sandbox/etc/csf-ui}g;
+		$body =~ s{^(\s*)chown }{$1: chown }mg;
+		my $got_hits = () = $body =~ m{\Q$sandbox/etc/csf-ui\E}g;
+		is($got_hits, $want_hits, 'every /etc/csf-ui in write_ui_conf() was redirected (substitution verified)');
+
+		my $conf = "$sandbox/etc/csf-ui/ui.conf";
+		my $read_conf = sub {
+			require ConfigServer::UI::Server;
+			my ($c, $problems) = ConfigServer::UI::Server::read_ui_conf($conf);
+			return ($c, $problems);
+		};
+
+		# MODE B, all interfaces.
+		run_sh($sandbox, 'wb.sh', "$body\nwrite_ui_conf b 8443 '198.51.100.4' '0.0.0.0'\n");
+		my $text = -f $conf ? slurp($conf) : '';
+		like($text, qr/^UI_LISTEN="0\.0\.0\.0"$/m,
+			'mode B: write_ui_conf() writes UI_LISTEN - the key whose absence bound loopback');
+		my ($c, $problems) = $read_conf->();
+		is_deeply($problems, [], 'mode B: the real Server.pm read_ui_conf() accepts the file the installer wrote')
+			or diag(join("\n", @$problems));
+		is($c ? $c->{UI_LISTEN} : undef, '0.0.0.0',
+			'mode B: and reads back the all-interfaces address, not the 127.0.0.1 default');
+
+		# MODE B, loopback on purpose - still WRITTEN, never left implicit.
+		run_sh($sandbox, 'wb2.sh', "$body\nwrite_ui_conf b 8443 '198.51.100.4' '127.0.0.1'\n");
+		like(slurp($conf), qr/^UI_LISTEN="127\.0\.0\.1"$/m,
+			'mode B, loopback: the key is written anyway, so the file states its own listen address either way');
+
+		# MODE A: the key must be ABSENT, not empty. Server.pm refuses a
+		# mode-A file that mentions it at all (S10: "the config contradicts
+		# itself"), and read_ui_conf() reads presence from %raw before any
+		# default precisely so the two cases stay distinguishable.
+		run_sh($sandbox, 'wa.sh', "$body\nwrite_ui_conf a 8443 '198.51.100.4' ''\n");
+		unlike(slurp($conf), qr/UI_LISTEN/,
+			'mode A: UI_LISTEN is not written at all - not even empty');
+		my (undef, $a_problems) = $read_conf->();
+		is_deeply($a_problems, [], 'mode A: Server.pm accepts the mode-A file unchanged')
+			or diag(join("\n", @$a_problems));
+
+		# And the proof that the mode-A rule is real rather than cargo:
+		# add the key and watch the same library refuse it.
+		spew($conf, qq{UI_MODE="a"\nUI_LISTEN="0.0.0.0"\nUI_PORT="8443"\nUI_ALLOW="198.51.100.4"\n});
+		my (undef, $bad) = $read_conf->();
+		ok(scalar(grep { /UI_LISTEN must not be set when UI_MODE is "a"/ } @$bad),
+			'...and Server.pm really does refuse a mode-A ui.conf that carries UI_LISTEN, which is why setup_mode_a() passes ""');
+	}
+}
+
+###############################################################################
+# SECTION 10 - the listen-address prompt itself.
+###############################################################################
+{
+	my $installer = slurp($INSTALLER);
+	my ($ask) = $installer =~ /^(ask_listen_address\(\) \{\n.*?^\})$/ms;
+	my ($val) = $installer =~ /^(validate_ui_listen\(\) \{\n.*?^\})$/ms;
+	ok(defined($ask) && defined($val),
+		'ask_listen_address() and validate_ui_listen() were located in the real install-webui.sh');
+
+	SKIP: {
+		skip 'the prompt functions could not be extracted', 11 unless defined($ask) && defined($val);
+		my $sandbox = tempdir(CLEANUP => 1);
+		spew("$sandbox/fn.sh", "$val\n$ask\n");
+
+		# THE ANSWER GOES TO STDOUT AND THE PROMPT DOES NOT. The caller
+		# reads this function with $(...), so a prompt line on stdout is
+		# captured into the value instead of shown to the operator - a
+		# silent-failure shape worth one assertion of its own.
+		for my $case (
+			[ '',            '0.0.0.0',     'pressing enter takes the default' ],
+			[ 'a',           '0.0.0.0',     'a = all IPv4 interfaces' ],
+			[ 'l',           '127.0.0.1',   'l = loopback only' ],
+			[ 'L',           '127.0.0.1',   'the answer is case-insensitive' ],
+			[ '203.0.113.7', '203.0.113.7', 'a literal address is taken as given' ],
+			[ '::',          '::',          ':: is accepted for all IPv6 interfaces' ],
+			[ 'example.com', '0.0.0.0',     'a hostname is refused (Socket::inet_pton is the judge) and the default stands' ],
+		) {
+			my ($answer, $want, $label) = @$case;
+			spew("$sandbox/answer", "$answer\n");
+			my ($out) = run_sh($sandbox, 'ask.sh',
+				". \"$sandbox/fn.sh\"\nexec < \"$sandbox/answer\"\nresult=\$(ask_listen_address 198.51.100.4 8443 2>/dev/null)\nprintf 'RESULT=%s\\n' \"\$result\"\n");
+			like($out, qr/^RESULT=\Q$want\E$/m, "ask_listen_address: $label")
+				or diag($out);
+		}
+
+		# The consequence of each choice has to be at the prompt, not only
+		# in the commit message.
+		like($ask, qr/reachable over the network/,
+			'the all-interfaces option says it is reachable over the network');
+		like($ask, qr/reachable ONLY from this machine/,
+			'the loopback option says it is reachable only from this machine');
+		like($ask, qr/UI_ALLOW \(\$allow_for_prompt\) gates who may connect/,
+			'the prompt names the allowlist rather than letting it be assumed to be the whole answer');
+	}
+
+	# And the operator must be told which one they got before the installer
+	# exits - for BOTH answers, not only the surprising one.
+	like($installer, qr/LOOPBACK ONLY\. Nothing off this machine can reach/,
+		'setup_mode_b() states plainly when the listener is loopback-only');
+	like($installer, qr/ssh -N -L \$port:\$listen:\$port root@/,
+		'...and gives the SSH tunnel command that makes that choice usable');
+	like($installer, qr/listening on ALL interfaces\. Only UI_ALLOW/,
+		'setup_mode_b() states plainly when the listener is on every interface');
+}
+
+###############################################################################
+# SECTION 11 - defect 6: nothing opened the port in csf's own firewall.
+#
+# Driven against the SHIPPED configuration files rather than a fixture,
+# because the measurement is the point: only one of the seven has the
+# default 8443 in its port list.
+###############################################################################
+{
+	my $installer = slurp($INSTALLER);
+	my ($fn)  = $installer =~ /^(check_firewall_port\(\) \{\n.*?^\})$/ms;
+	my ($val) = $installer =~ /^(csf_conf_value\(\) \{\n.*?^\})$/ms;
+	my ($lst) = $installer =~ /^(port_in_list\(\) \{\n.*?^\})$/ms;
+	ok(defined($fn) && defined($val) && defined($lst),
+		'check_firewall_port(), csf_conf_value() and port_in_list() were located in the real install-webui.sh');
+
+	# It must not edit csf.conf. Stated as an assertion because "the
+	# installer does not write another component's config" is a decision,
+	# and a decision nothing checks is a decision that gets reversed by
+	# accident.
+	unlike($installer, qr/sed[^\n]*-i[^\n]*csf\.conf/,
+		'install-webui.sh never edits /etc/csf/csf.conf in place');
+	# "Runs it" means the command begins a statement. A `csf -r` inside an
+	# echo is the opposite of the thing being forbidden, so the anchor is
+	# the start of a line (optionally indented), not the string anywhere.
+	unlike($installer, qr{^\s*(?:/usr/sbin/)?csf\s+-r\b}m,
+		'install-webui.sh never RUNS csf -r - it prints it for the operator');
+	unlike($installer, qr{^\s*(?:/usr/sbin/)?csf\s+(?:-a|-d|-x|-e|-tr)\b}m,
+		'install-webui.sh never runs any other csf sub-command either');
+	like($installer, qr/csf -r/,
+		'...and it does print it, so the operator has the exact command');
+
+	SKIP: {
+		skip 'the firewall-check functions could not be extracted', 8
+			unless defined($fn) && defined($val) && defined($lst);
+		my $sandbox = tempdir(CLEANUP => 1);
+		spew("$sandbox/fn.sh", "$val\n$lst\n$fn\n");
+
+		my $call = sub {
+			my ($port, $conf) = @_;
+			my ($out) = run_sh($sandbox, 'fw.sh',
+				". \"$sandbox/fn.sh\"\ncheck_firewall_port $port \"$conf\"\necho \"RC=\$?\"\n");
+			return $out;
+		};
+
+		# MEASURED, on the shipped files. csf.conf (cPanel) carries 8443;
+		# csf.generic.conf - the plain server, and what the owner ran -
+		# does not.
+		my $generic = $call->(8443, "$ROOT/csf.generic.conf");
+		like($generic, qr/^RC=1$/m,
+			'the shipped csf.generic.conf does NOT have 8443 in TCP_IN - check_firewall_port() says so');
+		like($generic, qr/is NOT open in csf's own firewall/,
+			'...in words, prominently');
+		like($generic, qr/^csf-ui:   TCP_IN = "[^"]*,8443"$/m,
+			'...printing the complete replacement TCP_IN line, ready to paste');
+		like($generic, qr/^csf-ui:   TCP6_IN = "[^"]*,8443"$/m,
+			'...and TCP6_IN, which is a separate list and a separate way to be unreachable');
+		like($generic, qr/TESTING = "1"/,
+			'...and flags TESTING = "1", under which the port list is only true between a csf start and the next cron clear');
+
+		my $cpanel = $call->(8443, "$ROOT/csf.conf");
+		like($cpanel, qr/^RC=0$/m,
+			'the shipped csf.conf (cPanel) DOES carry 8443 - the check does not cry wolf where the port is already open');
+
+		# A port nobody ships open, on the file that is otherwise fine.
+		my $odd = $call->(9443, "$ROOT/csf.conf");
+		like($odd, qr/^RC=1$/m,
+			'a non-default port is closed even on the one configuration that ships 8443 open');
+
+		my $missing = $call->(8443, "$sandbox/no-such-csf.conf");
+		like($missing, qr/^RC=2$/m,
+			'an unreadable csf.conf is "could not tell" (2), never silently "open"');
+	}
+
+	# port_in_list must understand csf's own lo:hi ranges, or it reports an
+	# open port as closed and sends the operator to edit a line that is
+	# already correct.
+	SKIP: {
+		skip 'port_in_list() could not be extracted', 4 unless defined $lst;
+		my $sandbox = tempdir(CLEANUP => 1);
+		spew("$sandbox/fn.sh", "$lst\n");
+		for my $case ([22, 1], [2025, 1], [8443, 0], [2031, 0]) {
+			my ($port, $want) = @$case;
+			my ($out) = run_sh($sandbox, 'pil.sh',
+				". \"$sandbox/fn.sh\"\nif port_in_list $port '20,21,22,2020:2030,443'; then echo YES; else echo NO; fi\n");
+			like($out, $want ? qr/YES/ : qr/NO/,
+				"port_in_list: $port is " . ($want ? 'inside' : 'outside') . " '20,21,22,2020:2030,443'");
+		}
+	}
+}
+
+###############################################################################
+# SECTION 12 - the connect check: does the configured thing actually answer?
+#
+# This is the gap all six defects fell through. _enable_now() proves a unit
+# starts and stays up; nothing proved anything was listening. Driven here
+# against a REAL listener this test owns and shuts down, not a stub - a
+# connect check verified with a mock would be exactly the shape it exists
+# to replace.
+###############################################################################
+{
+	my $installer = slurp($INSTALLER);
+	my ($fn) = $installer =~ /^(probe_listener\(\) \{\n.*?^\})$/ms;
+	ok(defined($fn), 'probe_listener() was located in the real install-webui.sh');
+
+	# The honesty requirement, asserted: a local connect must not be
+	# reported as reachability.
+	like($installer, qr/it did not cross/,
+		'the success message says what the probe did NOT cross (csf rules, upstream firewall, routing)');
+	like($installer, qr/That is all this proves/,
+		'...and bounds its own claim in as many words');
+
+	SKIP: {
+		skip 'probe_listener() could not be extracted', 5 unless defined $fn;
+		my $sandbox = tempdir(CLEANUP => 1);
+		spew("$sandbox/fn.sh", "$fn\n");
+
+		# A real listener, in a child this process owns, on a unix socket -
+		# no TCP port, so nothing here can collide with anything else on a
+		# shared host.
+		my $sockpath = "$sandbox/probe.sock";
+		my $pid = fork();
+		die "fork: $!" unless defined $pid;
+		unless ($pid) {
+			socket(my $srv, Socket::AF_UNIX(), Socket::SOCK_STREAM(), 0) or POSIX::_exit(1);
+			bind($srv, Socket::pack_sockaddr_un($sockpath)) or POSIX::_exit(1);
+			listen($srv, 5) or POSIX::_exit(1);
+            sleep 60;
+			POSIX::_exit(0);
+		}
+		# Wait for the child to bind rather than sleeping a guessed amount.
+		my $waited = 0;
+		while (!-e $sockpath && $waited < 100) { Time::HiRes::sleep(0.05); $waited++ }
+		ok(-e $sockpath, 'the test listener bound its socket');
+
+		my ($live) = run_sh($sandbox, 'p1.sh',
+			". \"$sandbox/fn.sh\"\nprobe_listener \"$sockpath\"\necho \"RC=\$?\"\n");
+		like($live, qr/^RC=0$/m, 'probe_listener() CONNECTS to a real listener')
+			or diag($live);
+
+		kill('TERM', $pid);
+		waitpid($pid, 0);
+		unlink $sockpath;
+
+		my ($dead) = run_sh($sandbox, 'p2.sh',
+			". \"$sandbox/fn.sh\"\nprobe_listener \"$sockpath\"\necho \"RC=\$?\"\necho \"REASON=\$probe_reason\"\n");
+		like($dead, qr/^RC=1$/m, 'probe_listener() FAILS once that listener is gone - the state defects 5 and 6 produced')
+			or diag($dead);
+		like($dead, qr/REASON=REFUSED/, '...and reports the reason rather than only the verdict');
+
+		my ($bad) = run_sh($sandbox, 'p3.sh',
+			". \"$sandbox/fn.sh\"\nprobe_listener not-an-address 8443\necho \"RC=\$?\"\n");
+		like($bad, qr/^RC=2$/m, 'an address that will not parse is "could not test" (2), never "connected"');
+	}
+
+	# verify_install() must act on both halves, and must not be able to
+	# print its success sentence over either.
+	# EACH OF THESE THREE PINS THE GUARD TO ITS CONSEQUENCE, not the
+	# message on its own. Measured while writing them: an assertion that
+	# only looked for the wording stayed GREEN when the condition above it
+	# was replaced with `if false` - the same presence-only hazard this
+	# tree already recorded for apache_check_modules(), reached again from
+	# a different direction. What has to survive is the pairing.
+	my $listen_guard = 'if [ -z "$installed_listen" ]; then';
+	like($installer, qr/\Q$listen_guard\E[\s\S]{0,600}?\Qis mode B with no UI_LISTEN\E[\s\S]{0,600}?\Qproblems=$((problems + 1))\E/,
+		'verify_install() treats a mode-B ui.conf with no UI_LISTEN as a problem in its own right - and COUNTS it');
+	my $dead_msg = 'nothing is accepting connections on $probe_target:$installed_port';
+	like($installer, qr/\Q$dead_msg\E[\s\S]{0,400}?\Qproblems=$((problems + 1))\E/,
+		'verify_install() counts a listener that does not answer as a problem, not merely mentions it');
+	my $fw_gate = 'check_firewall_port "$installed_port"';
+	like($installer, qr/\Q$fw_gate\E\s*\n\s*if \[ \$\? -eq 1 \]; then\s*\n\s*\Qproblems=$((problems + 1))\E/,
+		'verify_install() asks the firewall question AND gates on its answer - a closed port is a problem, so "verified OK" cannot be printed over it');
+}
+
 done_testing();
