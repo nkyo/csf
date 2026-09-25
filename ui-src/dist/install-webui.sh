@@ -55,6 +55,11 @@ DIST_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd) || {
 	exit 0
 }
 UI_SRC="$DIST_DIR/.."
+# The csf source tree this WebUI ships inside, i.e. the directory every
+# install.*.sh runs from. Needed for exactly one file: the vendored
+# JSON/Tiny.pm at its root, which install_files() copies into the WebUI's
+# own lib (see that function, and the four binaries' "use lib" comment).
+SRC_ROOT="$DIST_DIR/../.."
 
 ###############################################################################
 # create_account - the csfui system account (task-9-brief.md: "no login
@@ -119,6 +124,12 @@ setup_directories() {
 	install -d -m 0755 -o root  -g root  /usr/local/csf-ui/lib
 	install -d -m 0755 -o root  -g root  /usr/local/csf-ui/lib/ConfigServer
 	install -d -m 0755 -o root  -g root  /usr/local/csf-ui/lib/ConfigServer/UI
+	# JSON::Tiny is the one non-core module this WebUI loads, and the only
+	# reason the four binaries ever named /usr/local/csf/lib in their
+	# "use lib" - a directory csf holds at 0600, which the unprivileged
+	# csfui account therefore cannot search at all. It gets a home inside
+	# the WebUI's own lib instead; install_files() puts the file there.
+	install -d -m 0755 -o root  -g root  /usr/local/csf-ui/lib/JSON
 	install -d -m 0755 -o root  -g root  /usr/local/csf-ui/web
 	install -d -m 0755 -o root  -g root  /usr/local/csf-ui/web/screens
 
@@ -159,6 +170,32 @@ install_files() {
 	cp -a "$UI_SRC/lib/ConfigServer/UI/." /usr/local/csf-ui/lib/ConfigServer/UI/
 	cp -a "$UI_SRC/web/." /usr/local/csf-ui/web/
 
+	# JSON::Tiny - the ONE non-core module the WebUI loads. It is vendored
+	# in csf's own source root (JSON/Tiny.pm, Artistic 2.0, (c) David
+	# Oswald - copied verbatim, never edited here) and csf installs its own
+	# copy into /usr/local/csf/lib/JSON/Tiny.pm. That copy is unreachable
+	# for this UI: csf's installer chmods that whole tree to 0600 and lfd
+	# re-clamps the directory to 0600 on every pass of its main loop, and a
+	# 0600 directory has no search bit for anyone (docs/WEBUI-RPC.md
+	# S13.2). Until now the four binaries reached for it anyway, via a
+	# second "use lib" entry, and the unprivileged csfui process died with
+	# EACCES before it could load even core Fcntl - measured on a real
+	# install, 52 restarts. The file belongs on THIS side of the R11 line,
+	# so it is copied here and the "use lib" names only csf-ui's own lib.
+	#
+	# `cp -f` (not `cp -a -n`): a re-run of the installer must REFRESH this
+	# file the same way it refreshes every other one above, or an upgrade
+	# would ship new binaries against a stale vendored module. The mode and
+	# owner are not preserved from the source - the find/chown pass below
+	# sets them to the same 0644 root:root every other file under lib gets,
+	# which is what makes it readable by csfui.
+	if [ -f "$SRC_ROOT/JSON/Tiny.pm" ]; then
+		cp -f "$SRC_ROOT/JSON/Tiny.pm" /usr/local/csf-ui/lib/JSON/Tiny.pm
+	else
+		echo "csf-ui: *Error* $SRC_ROOT/JSON/Tiny.pm not found - JSON::Tiny will be missing"
+		echo "csf-ui:   from /usr/local/csf-ui/lib and neither csf-ui nor csf-ui-helper will start."
+	fi
+
 	chown -R root:root /usr/local/csf-ui
 	find /usr/local/csf-ui -type d -exec chmod 0755 {} \;
 	find /usr/local/csf-ui/lib -type f -exec chmod 0644 {} \;
@@ -173,6 +210,213 @@ install_files() {
 			echo "csf-ui: *Error* /usr/local/csf-ui/bin/$bin did not install - the WebUI will not run"
 		fi
 	done
+}
+
+###############################################################################
+# install_path_symlinks - puts the two OPERATOR commands on $PATH.
+#
+# WHY THIS EXISTS AT ALL. Creating an account is not optional and it is not
+# deferrable: there is no default account and no way into the WebUI until
+# one exists (docs/WEBUI-RPC.md S5.14, "No default account and no default
+# password"). So the very first thing an operator does after this installer
+# finishes is run csf-ui-passwd - and on the owner's real install that
+# first command was `csf-ui-passwd add admin`, which answered `command not
+# found`, because /usr/local/csf-ui/bin is on nobody's PATH and nothing
+# drops a profile.d fragment that would put it there.
+#
+# An earlier review filed that as Minor (M8) and closed it by making the
+# MESSAGES print the full path. That is a real improvement and those
+# messages stay, but it only helps an operator who copies the line out of
+# the installer's output; it does nothing for the one who reads the manual,
+# remembers the command name, or types it from habit tomorrow. The command
+# being mandatory is what makes "discoverable only by copy-paste" the wrong
+# answer.
+#
+# WHY /usr/sbin AND WHY A SYMLINK. /usr/sbin is where csf itself already
+# lives (install.*.sh: `ln -sf /usr/local/csf/bin/csf.pl /usr/sbin/csf`), so
+# an operator who can type `csf` can type `csf-ui-passwd`, and this adds no
+# mechanism this tree does not already use - no profile.d fragment (which
+# only affects login shells, not sudo, cron or a non-interactive ssh), no
+# PATH edit in a file belonging to the distribution. Both targets are 0750
+# root:csfui, so the symlink grants nothing: a non-root caller that finds
+# the name still cannot execute it, which is correct for both of these.
+#
+# csf-ui and csf-ui-helper are NOT linked. They are units' ExecStart
+# targets, not commands an operator runs by hand - the one time the
+# installer wants a human to know where they are (the no-systemctl path in
+# setup_mode_a) it prints the absolute path on purpose.
+#
+# All seven uninstall.*.sh remove both links, by absolute literal path.
+###############################################################################
+install_path_symlinks() {
+	# -s -f -n: replace whatever is there, and never follow an existing
+	# symlink-to-a-directory (which would silently create the link INSIDE
+	# it). Re-running the installer refreshes both.
+	for cmd in csf-ui-passwd csf-ui-setup; do
+		if [ -f "/usr/local/csf-ui/bin/$cmd" ]; then
+			ln -sfn "/usr/local/csf-ui/bin/$cmd" "/usr/sbin/$cmd" 2>/dev/null \
+				|| echo "csf-ui: could not link /usr/sbin/$cmd - run it as /usr/local/csf-ui/bin/$cmd"
+		fi
+	done
+}
+
+###############################################################################
+# check_installed_perl_deps [BIN_DIR] [USER] - can the account that will
+# actually run this code load it?
+#
+# THE CHECK THIS INSTALLER DID NOT HAVE, AND WHAT IT COST. The WebUI's
+# first real install crash-looped 52 times on:
+#
+#   Can't locate Fcntl.pm:   /usr/local/csf/lib/Fcntl.pm: Permission denied
+#
+# - the four binaries' "use lib" named csf's own 0600 lib ahead of core
+# Perl, so the unprivileged csfui process could not search it and died in
+# BEGIN. Every gate in this tree was green throughout, for one reason worth
+# stating plainly: the test suite runs from the repository with `-I.`, so
+# @INC never resembles the installed layout, and nothing had ever run as
+# csfui. A defect that lives in the difference between those two things is
+# invisible to any test that only exercises the repository.
+#
+# This is the smallest check that closes exactly that gap, and it closes it
+# where the operator is still watching: compile the binaries that were just
+# installed, from the paths they were installed to, AS the account systemd
+# will run them as. `perl -c` resolves the whole `use` graph - JSON::Tiny,
+# every ConfigServer::UI module, every core module - through the real @INC
+# those files declare, under the real credentials. If any of it is
+# unreachable, unreadable, or not there, this says so in the installer's own
+# output with perl's own message, instead of leaving it to be dug out of
+# journalctl after the unit has been restarted fifty times.
+#
+# WHAT IT DOES NOT CATCH, said here rather than discovered later. `perl -c`
+# sees only what is loaded at COMPILE time. IO::Socket::SSL is loaded by a
+# runtime `require` inside ConfigServer::UI::Server (it is not core, and it
+# is needed only in mode B), so a host without it passes this check and
+# still cannot run mode B - which is why mode_b_tls_problem() below is a
+# separate check, asked before mode B is offered, and why _enable_now()
+# watches the unit after starting it rather than trusting either.
+#
+# The two arguments exist so t/93-installed-layout.t can drive this against
+# a sandbox tree and a second real uid; main() passes neither and gets the
+# frozen S2.3 paths.
+#
+# Return: 0 everything compiled - 1 something did not (a REAL failure the
+# caller must act on) - 2 the check could not be performed at all (no perl,
+# no su), which is not the same answer and must not be treated as one.
+###############################################################################
+check_installed_perl_deps() {
+	bin_dir=${1:-/usr/local/csf-ui/bin}
+	as_user=${2:-csfui}
+
+	if ! command -v perl >/dev/null 2>&1; then
+		echo "csf-ui: no perl on PATH - cannot check what the installed WebUI can load"
+		return 2
+	fi
+
+	# docs/WEBUI-RPC.md S11.7: "the floor is Perl >= 5.14 with Socket >=
+	# 1.94, checked by version at helper startup AND at install time".
+	# The install-time half is this line; before it, nothing here checked
+	# it and S11.7's sentence was describing a check that did not exist.
+	if ! perl -e 'require 5.014; require Socket; Socket->VERSION(1.94); exit 0' >/dev/null 2>&1; then
+		echo "csf-ui: *Error* this host does not meet the WebUI's Perl floor"
+		echo "csf-ui:   (Perl >= 5.14 with Socket >= 1.94 - docs/WEBUI-RPC.md S11.7)."
+		perl -e 'printf("csf-ui:   this perl is %vd", $^V); if (eval { require Socket; 1 }) { printf(" with Socket %s", Socket->VERSION) } print "\n"' 2>/dev/null
+		echo "csf-ui:   Neither csf-ui nor csf-ui-helper will start on it."
+		return 1
+	fi
+
+	if ! command -v su >/dev/null 2>&1; then
+		echo "csf-ui: 'su' not found - cannot compile the installed WebUI as '$as_user',"
+		echo "csf-ui: which is the only account whose @INC access actually matters here."
+		return 2
+	fi
+	if ! getent passwd "$as_user" >/dev/null 2>&1; then
+		echo "csf-ui: account '$as_user' does not exist - cannot compile the installed WebUI as it"
+		return 2
+	fi
+
+	dep_problems=0
+	for bin in csf-ui csf-ui-helper csf-ui-passwd csf-ui-setup; do
+		if [ ! -f "$bin_dir/$bin" ]; then
+			# install_files() already said so, loudly, for this exact name.
+			dep_problems=$((dep_problems + 1))
+			continue
+		fi
+		# PERL5LIB is cleared deliberately: an operator's own PERL5LIB is
+		# not present for a systemd unit, so a check that inherited it
+		# could pass on a host where the service cannot start.
+		if out=$(su -s /bin/sh -c "PERL5LIB= perl -c -- '$bin_dir/$bin'" "$as_user" 2>&1); then
+			:
+		else
+			echo "csf-ui: *Error* $bin_dir/$bin does not compile as the '$as_user' account:"
+			printf '%s\n' "$out" | sed 's/^/csf-ui:     /'
+			dep_problems=$((dep_problems + 1))
+		fi
+	done
+
+	if [ "$dep_problems" -gt 0 ]; then
+		echo "csf-ui: $dep_problems of the four WebUI binaries cannot be loaded by '$as_user'."
+		echo "csf-ui: Enabling a unit in this state produces a restart loop, not a running UI,"
+		echo "csf-ui: so nothing further is configured or started by this run."
+		return 1
+	fi
+
+	echo "csf-ui: the four WebUI binaries compile as the '$as_user' account."
+	return 0
+}
+
+###############################################################################
+# mode_b_tls_problem [LIB_DIR] - may mode B be offered on this host?
+#
+# Mode B means csf-ui terminates TLS itself, which it does with
+# IO::Socket::SSL - not core, not vendored here, and deliberately never
+# degraded to plain HTTP. ConfigServer::UI::Server's preflight() already
+# refuses cleanly and names the distribution package to install. What was
+# missing is that the INSTALLER never asked: it offered mode B, wrote
+# ui.conf with UI_MODE="b", checked that cert.pem and key.pem existed and
+# were non-empty, and enabled the unit - verifying the certificate but not
+# the thing that reads the certificate. On a host without the module that
+# is a guaranteed restart loop (measured: 81 restarts and climbing), and
+# the operator's only route to the one-line explanation was journalctl.
+#
+# HOW THE ANSWER IS OBTAINED, AND WHY NOT A SECOND COPY OF IT. This shells
+# out to Server.pm's OWN preflight() and prints the problem(s) it reports
+# that mention IO::Socket::SSL. Nothing here restates the package names, so
+# they cannot drift from the ones the service itself will print; and the
+# decision is made by the same code that will make it at start time, so
+# this cannot say "fine" about a host that code will refuse. ui_conf_path
+# is pointed at a path that does not exist ON PURPOSE: preflight() falls
+# back to mode B's preconditions when the file cannot tell it a mode, which
+# is exactly the set being asked about here, and no ui.conf has been written
+# at this point in the run anyway.
+#
+# Mode A is NOT checked against this, and that is not an oversight: read
+# preflight() and mode_a_preflight() in ConfigServer/UI/Server.pm - the
+# IO::Socket::SSL requirement sits inside `if ($mode eq 'b')`, and an
+# earlier fix round specifically corrected a bug where a mode-A host was
+# told to install it. Mode A's front web server terminates TLS; csf-ui
+# binds a unix socket and speaks no TLS at all.
+#
+# Return: 0 mode B can start - 1 it cannot, and the reason is on stdout -
+# 2 the question could not be asked (no perl, Server.pm not installed, or
+# the module tree is broken - which check_installed_perl_deps() above
+# reports properly and this must not duplicate as a TLS problem).
+###############################################################################
+mode_b_tls_problem() {
+	lib_dir=${1:-/usr/local/csf-ui/lib}
+
+	command -v perl >/dev/null 2>&1 || return 2
+	[ -f "$lib_dir/ConfigServer/UI/Server.pm" ] || return 2
+
+	out=$(PERL5LIB= perl "-I$lib_dir" -e '
+		require ConfigServer::UI::Server;
+		my @problem = ConfigServer::UI::Server::preflight(
+			ui_conf_path => "/nonexistent/csf-ui-mode-b-precheck.conf");
+		print "$_\n" for grep { /IO::Socket::SSL/ } @problem;
+	' 2>/dev/null) || return 2
+
+	[ -n "$out" ] || return 0
+	printf '%s\n' "$out"
+	return 1
 }
 
 ###############################################################################
@@ -709,19 +953,130 @@ front_disable_vhost() {
 # `is-active` are asked afterwards rather than inferred from the enable
 # call's own exit status.
 ###############################################################################
+#
+# FIX (2026-09-25): a ONE-SHOT `is-active` CANNOT TELL "running" FROM "dying
+# and being restarted". Both shipped units carry Restart=on-failure with
+# RestartSec=5, so a unit that fails at startup spends most of every five
+# seconds in `activating`/`active` and only a moment in `failed`. A single
+# instantaneous sample lands wherever it lands. Measured on the owner's own
+# install, this function printed
+#
+#   csf-ui: csf-ui.service: enabled=enabled active=active
+#
+# and verify_install() went on to print "WebUI install verified OK", while
+# the unit's restart counter was climbing past 50 and the UI had never once
+# served a request. That is the same defect class this whole branch exists
+# to hunt - a message asserting something the code never established - and
+# it is what turned a one-line "Permission denied" into a mystery.
+#
+# So the unit is now WATCHED rather than sampled. Two independent signals,
+# either of which is conclusive, checked every few seconds across a window
+# longer than RestartSec:
+#
+#   NRestarts. systemd resets this to 0 when a unit is started and
+#   increments it on every automatic restart. `enable --now` just started
+#   this unit, so ANY increase within the window is the unit having already
+#   died once. This is the decisive signal and it is exact.
+#
+#   ExecMainStartTimestampMonotonic. When the main process was last started.
+#   It changes on every restart, and unlike NRestarts it has been there
+#   since systemd's early days - NRestarts arrived in 235, and on an older
+#   host `systemctl show` simply prints nothing for it, which is why every
+#   comparison below requires BOTH samples to be non-empty before it
+#   believes either. Two independent properties means the check does not
+#   quietly switch itself off on the hosts most likely to have old software.
+#
+#   is-failed / is-active. Catches the case where the unit gave up
+#   altogether (systemd stops restarting once StartLimitBurst is exceeded),
+#   which neither counter above would report as a CHANGE if the sampling
+#   window opened after it had already stopped.
+#
+# The cost is up to _SETTLE_SECONDS of wall clock per unit on an install
+# that is already interactive and already waiting for the operator. A
+# failing unit is usually caught on the first sample after RestartSec, so
+# the bad case is the FAST one; only a healthy unit pays the full window.
+###############################################################################
+# How long to watch a just-started unit, and how often to look. RestartSec=5
+# in both shipped units: a window shorter than that can sit entirely inside
+# one `active` phase and see nothing at all, which is precisely the bug.
+_SETTLE_SECONDS=10
+_SETTLE_STEP=2
+
+###############################################################################
+# _unit_prop UNIT PROPERTY - one systemd property, or the empty string.
+#
+# `systemctl show -p X --value` would be shorter and is not used: --value
+# arrived in systemd 230 and this tree supports hosts older than that, where
+# it is an unknown option and the call fails with no output - indistinguishable
+# here from "the property does not exist", and silently disabling the check
+# that matters most. Parsing "X=value" works on every version.
+###############################################################################
+_unit_prop() {
+	systemctl show -p "$2" "$1" 2>/dev/null | sed -n "s/^$2=//p" | head -n1
+}
+
 _enable_now() {
 	unit=$1
 	systemctl enable --now "$unit" >/dev/null 2>&1
 
 	enabled=$(systemctl is-enabled "$unit" 2>/dev/null)
-	active=$(systemctl is-active "$unit" 2>/dev/null)
 	[ -n "$enabled" ] || enabled=unknown
-	[ -n "$active" ] || active=unknown
 
-	echo "csf-ui: $unit: enabled=$enabled active=$active"
+	restarts_before=$(_unit_prop "$unit" NRestarts)
+	started_before=$(_unit_prop "$unit" ExecMainStartTimestampMonotonic)
+
+	flapping=0
+	waited=0
+	while [ "$waited" -lt "$_SETTLE_SECONDS" ]; do
+		sleep "$_SETTLE_STEP"
+		waited=$((waited + _SETTLE_STEP))
+
+		restarts_now=$(_unit_prop "$unit" NRestarts)
+		if [ -n "$restarts_before" ] && [ -n "$restarts_now" ] \
+			&& [ "$restarts_now" != "$restarts_before" ]; then
+			flapping=1
+			break
+		fi
+
+		started_now=$(_unit_prop "$unit" ExecMainStartTimestampMonotonic)
+		if [ -n "$started_before" ] && [ -n "$started_now" ] \
+			&& [ "$started_now" != "$started_before" ]; then
+			flapping=1
+			break
+		fi
+
+		if systemctl is-failed --quiet "$unit" 2>/dev/null; then
+			flapping=1
+			break
+		fi
+	done
+
+	active=$(systemctl is-active "$unit" 2>/dev/null)
+	[ -n "$active" ] || active=unknown
+	restarts_now=$(_unit_prop "$unit" NRestarts)
+
+	echo "csf-ui: $unit: enabled=$enabled active=$active (still, ${waited}s after starting it)"
+
+	if [ "$flapping" -eq 1 ]; then
+		echo "csf-ui: *Error* $unit is NOT running. It starts, exits, and systemd restarts it."
+		echo "csf-ui:   restart count went $restarts_before -> $restarts_now in ${waited}s; Result=$(_unit_prop "$unit" Result)"
+		echo "csf-ui:   A one-shot 'is-active' reports 'active' for a unit in this state - that is"
+		echo "csf-ui:   how this was previously reported as a successful install. The unit's own"
+		echo "csf-ui:   last words, which say what is actually wrong:"
+		if command -v journalctl >/dev/null 2>&1; then
+			journalctl -u "$unit" -n 20 --no-pager 2>/dev/null | sed 's/^/csf-ui:     /'
+		else
+			echo "csf-ui:     (no journalctl here - run 'systemctl status $unit')"
+		fi
+		return 1
+	fi
+
 	if [ "$active" != "active" ]; then
 		echo "csf-ui:   (not running - check 'systemctl status $unit' and 'journalctl -u $unit')"
+		return 1
 	fi
+
+	return 0
 }
 
 ###############################################################################
@@ -747,7 +1102,9 @@ setup_mode_b() {
 	# before a UI that has no account in it.
 	echo "csf-ui: create an admin account before relying on it - there is none by"
 	echo "csf-ui: default and no way in until one exists:"
-	echo "csf-ui:   /usr/local/csf-ui/bin/csf-ui-passwd add <user> admin"
+	echo "csf-ui:   csf-ui-passwd add <user> admin"
+	echo "csf-ui: (that is /usr/local/csf-ui/bin/csf-ui-passwd; install_path_symlinks() puts"
+	echo "csf-ui: it on PATH as /usr/sbin/csf-ui-passwd, next to csf itself.)"
 
 	if command -v systemctl >/dev/null 2>&1; then
 		_enable_now csf-ui-helper.service
@@ -1087,7 +1444,9 @@ setup_mode_a() {
 
 	echo "csf-ui: create an admin account before relying on it - there is none by"
 	echo "csf-ui: default and no way in until one exists:"
-	echo "csf-ui:   /usr/local/csf-ui/bin/csf-ui-passwd add <user> admin"
+	echo "csf-ui:   csf-ui-passwd add <user> admin"
+	echo "csf-ui: (that is /usr/local/csf-ui/bin/csf-ui-passwd; install_path_symlinks() puts"
+	echo "csf-ui: it on PATH as /usr/sbin/csf-ui-passwd, next to csf itself.)"
 
 	# Fix round 1 (task-9-review.md Important): say what actually happens
 	# on this host, not only what this script itself did not do. The vhost
@@ -1103,8 +1462,13 @@ setup_mode_a() {
 	# last one deleted a working configuration.
 	if command -v systemctl >/dev/null 2>&1; then
 		_enable_now csf-ui-helper.service
-		_enable_now csf-ui.service
-		echo "csf-ui: csf-ui.service is the Mode A listener on $sock; $front proxies to it."
+		if _enable_now csf-ui.service; then
+			echo "csf-ui: csf-ui.service is the Mode A listener on $sock; $front proxies to it."
+		else
+			echo "csf-ui: csf-ui.service is the Mode A listener $front proxies to, and it is NOT"
+			echo "csf-ui: running (see above) - port $port will answer 502 for every request"
+			echo "csf-ui: until it is. The vhost itself is correct and validated; leave it."
+		fi
 		echo "csf-ui: $out is live $front configuration, but $front does not read it until"
 		echo "csf-ui: it next reloads or restarts - which this installer does not do for you."
 		echo "csf-ui: Until then port $port is not served at all. Reload $front with"
@@ -1128,6 +1492,19 @@ setup_mode_a() {
 interactive_setup() {
 	front=$(detect_frontend)
 
+	# Mode B's OWN precondition, asked before mode B is offered rather than
+	# after it has been configured and enabled. mode_b_tls_problem() gets
+	# the answer, and the wording, out of Server.pm's preflight() - the code
+	# that will refuse at start time if this is wrong. Return 2 ("could not
+	# ask") deliberately leaves mode B on offer: an installer that withdrew
+	# an option because it could not run a check would be refusing on its
+	# own ignorance, and Server.pm still fails closed either way.
+	mode_b_ok=1
+	tls_problem=$(mode_b_tls_problem)
+	if [ $? -eq 1 ]; then
+		mode_b_ok=0
+	fi
+
 	echo
 	echo "csf-ui: the replacement WebUI (docs/WEBUI-PLAN.md) can be set up now."
 	if [ -n "$front" ]; then
@@ -1136,7 +1513,12 @@ interactive_setup() {
 		echo "csf-ui: no supported front web server (nginx/Apache/LiteSpeed) detected."
 	fi
 	echo "csf-ui:   a = behind the detected web server"
-	echo "csf-ui:   b = standalone (csf-ui serves TLS itself)"
+	if [ "$mode_b_ok" -eq 1 ]; then
+		echo "csf-ui:   b = standalone (csf-ui serves TLS itself)"
+	else
+		echo "csf-ui:   b = standalone - NOT AVAILABLE on this host:"
+		printf '%s\n' "$tls_problem" | sed 's/^/csf-ui:         /'
+	fi
 	echo "csf-ui:   anything else = skip for now (re-run this installer to set it up)"
 	printf 'csf-ui: set up the WebUI now? [a/b/N] '
 	read -r answer
@@ -1153,6 +1535,32 @@ interactive_setup() {
 	if [ "$mode" = "a" ] && [ -z "$front" ]; then
 		echo "csf-ui: Mode A needs a detected web server; none found - using standalone (b) instead."
 		mode=b
+	fi
+
+	# REFUSE, rather than warn-and-configure. The three available answers
+	# were: install the module for the operator, write ui.conf but leave the
+	# unit disabled, or refuse. Installing a distribution package is a side
+	# effect a firewall installer has no business performing unasked, and it
+	# needs a package manager, a network and consent this script cannot
+	# assume. Writing ui.conf and leaving the unit disabled is worse than it
+	# sounds: it leaves a host that LOOKS configured, and the next thing
+	# anyone does with it - `systemctl enable --now csf-ui` - walks straight
+	# into the same 81-restart loop, this time with no installer output
+	# anywhere near it. Refusing is the only one of the three that leaves
+	# the host in a state whose description is true. Nothing is written,
+	# nothing is enabled, and one command plus a re-run fixes it.
+	if [ "$mode" = "b" ] && [ "$mode_b_ok" -eq 0 ]; then
+		echo "csf-ui: Mode B cannot start on this host, so it is not being configured:"
+		printf '%s\n' "$tls_problem" | sed 's/^/csf-ui:   /'
+		echo "csf-ui: Nothing was written to /etc/csf-ui and no service was enabled. A unit"
+		echo "csf-ui: enabled here would start, exit and be restarted every 5 seconds forever"
+		echo "csf-ui: while reporting 'active' to anything that only looked once."
+		echo "csf-ui: Install the module above, then re-run this installer at a terminal."
+		if [ -n "$front" ]; then
+			echo "csf-ui: Or answer 'a': Mode A lets $front terminate TLS and needs no Perl TLS"
+			echo "csf-ui: module at all."
+		fi
+		return 0
 	fi
 
 	allow=$(guess_admin_ip)
@@ -1308,6 +1716,7 @@ verify_install() {
 		"/usr/local/csf-ui/lib:755:root:root:lib directory" \
 		"/usr/local/csf-ui/lib/ConfigServer:755:root:root:lib/ConfigServer directory" \
 		"/usr/local/csf-ui/lib/ConfigServer/UI:755:root:root:lib/ConfigServer/UI directory" \
+		"/usr/local/csf-ui/lib/JSON:755:root:root:lib/JSON directory" \
 		"/usr/local/csf-ui/web:755:root:root:web directory" \
 		"/etc/csf-ui:750:root:csfui:/etc/csf-ui" \
 		"/etc/csf-ui/ssl:750:root:csfui:TLS material directory" \
@@ -1325,6 +1734,37 @@ verify_install() {
 		group=${rest%%:*}; label=${rest#*:}
 		_check_path "$path" "$mode" "$owner" "$group" "$label" \
 			|| problems=$((problems + 1))
+	done
+
+	# THE FILE WHOSE ABSENCE CRASH-LOOPED THE FIRST REAL INSTALL. JSON::Tiny
+	# is the one non-core module the WebUI loads. It used to be reached at
+	# /usr/local/csf/lib/JSON/Tiny.pm through a second "use lib" entry, which
+	# csfui cannot search; install_files() now ships it here instead. Checked
+	# BY MODE AND OWNER like everything else, and then actually read as csfui
+	# - a 0644 file under a directory csfui cannot traverse would pass the
+	# first check and fail the only one that matters.
+	_check_path /usr/local/csf-ui/lib/JSON/Tiny.pm 644 root root "vendored JSON::Tiny" \
+		|| problems=$((problems + 1))
+	if getent passwd csfui >/dev/null 2>&1 && command -v su >/dev/null 2>&1 \
+		&& ! su -s /bin/sh -c 'test -r /usr/local/csf-ui/lib/JSON/Tiny.pm' csfui 2>/dev/null; then
+		echo "csf-ui: *VERIFY FAILED* csfui cannot read /usr/local/csf-ui/lib/JSON/Tiny.pm -"
+		echo "csf-ui:   csf-ui will die in BEGIN with 'Can't locate JSON/Tiny.pm in \@INC'"
+		problems=$((problems + 1))
+	fi
+
+	# The two operator commands must be reachable by NAME. Creating an
+	# account is mandatory and is the first thing anyone does; on the
+	# owner's install `csf-ui-passwd add admin` answered "command not
+	# found". See install_path_symlinks().
+	for cmd in csf-ui-passwd csf-ui-setup; do
+		if [ ! -L "/usr/sbin/$cmd" ]; then
+			echo "csf-ui: *VERIFY FAILED* /usr/sbin/$cmd is not a symlink - $cmd is not on PATH"
+			problems=$((problems + 1))
+		elif [ "$(readlink "/usr/sbin/$cmd" 2>/dev/null)" != "/usr/local/csf-ui/bin/$cmd" ]; then
+			echo "csf-ui: *VERIFY FAILED* /usr/sbin/$cmd points at $(readlink "/usr/sbin/$cmd" 2>/dev/null),"
+			echo "csf-ui:   not at /usr/local/csf-ui/bin/$cmd"
+			problems=$((problems + 1))
+		fi
 	done
 
 	if [ -f /etc/csf-ui/ssl/cert.pem ]; then
@@ -1365,6 +1805,52 @@ verify_install() {
 		problems=$((problems + 1))
 	fi
 
+	# THE SECOND DEFECT FROM THE SAME REAL INSTALL. This function printed
+	# "WebUI install verified OK" while csf-ui.service's restart counter was
+	# past 50, because nothing here ever looked at the units at all - the
+	# only thing that had was _enable_now()'s single instantaneous
+	# `is-active`, which cannot tell a running unit from one that is dying
+	# and being restarted (see that function). A verification that reports
+	# success over a service that has never once stayed up is worse than no
+	# verification: it is the reason the real fault reached the operator as
+	# a mystery rather than as an error message.
+	#
+	# Scoped to units this host actually ENABLED. A non-interactive install
+	# enables neither, and an operator who chose to skip setup has two
+	# inactive units by design - neither is a problem and neither is
+	# reported as one.
+	#
+	# NRestarts is the decisive number: systemd zeroes it when a unit is
+	# started, and this run started these units minutes ago, so any nonzero
+	# value means the unit has already died at least once since. An
+	# `active` unit with NRestarts=52 is not a running service.
+	if command -v systemctl >/dev/null 2>&1; then
+		for unit in csf-ui-helper.service csf-ui.service; do
+			[ "$(systemctl is-enabled "$unit" 2>/dev/null)" = "enabled" ] || continue
+			unit_active=$(systemctl is-active "$unit" 2>/dev/null)
+			unit_restarts=$(_unit_prop "$unit" NRestarts)
+			if [ "$unit_active" != "active" ]; then
+				echo "csf-ui: *VERIFY FAILED* $unit is enabled but not running (active=${unit_active:-unknown})"
+				echo "csf-ui:   'journalctl -u $unit' says why"
+				problems=$((problems + 1))
+			elif [ -n "$unit_restarts" ] && [ "$unit_restarts" != "0" ]; then
+				echo "csf-ui: *VERIFY FAILED* $unit reports active, but systemd has already restarted"
+				echo "csf-ui:   it $unit_restarts time(s) since this install started it. It is crash-looping,"
+				echo "csf-ui:   not running. 'journalctl -u $unit' says why"
+				problems=$((problems + 1))
+			elif [ -z "$unit_restarts" ]; then
+				# Not counted as a problem, but not passed over in silence
+				# either: this systemd is older than 235 and reports no
+				# NRestarts, so the one decisive question cannot be asked
+				# HERE. _enable_now() watched the same unit with a second
+				# property that every version does report, which is why
+				# this is a note about coverage rather than a failure.
+				echo "csf-ui: $unit is active; this systemd reports no NRestarts, so whether it has"
+				echo "csf-ui:   already been restarted was not re-checked here (it was watched at start)"
+			fi
+		done
+	fi
+
 	for d in /etc/csf /var/lib/csf /usr/local/csf; do
 		if [ -d "$d" ] && command -v stat >/dev/null 2>&1; then
 			mode=$(stat -c '%a' "$d" 2>/dev/null)
@@ -1392,8 +1878,17 @@ main() {
 	create_account || return 0
 	setup_directories
 	install_files
+	install_path_symlinks
 	sh "$DIST_DIR/csf-ui-cert.sh"
 	install_units
+
+	# BEFORE anything is offered, written or enabled: prove the tree that
+	# was just installed can actually be compiled by the account that will
+	# run it. See check_installed_perl_deps() for why this is the check
+	# this installer was missing. Return 2 means "could not ask" and is not
+	# an answer - only a real failure (1) stops the run going further.
+	check_installed_perl_deps
+	deps_rc=$?
 
 	noninteractive=0
 	for arg in "$@"; do
@@ -1403,13 +1898,19 @@ main() {
 		noninteractive=1
 	fi
 
-	if [ "$noninteractive" -eq 1 ]; then
+	if [ "$deps_rc" -eq 1 ]; then
+		echo "csf-ui: the WebUI files are in place, but nothing further will be configured or"
+		echo "csf-ui: started on this host until the problem above is fixed. Re-run this"
+		echo "csf-ui: installer at a terminal afterwards to set the WebUI up."
+	elif [ "$noninteractive" -eq 1 ]; then
 		echo "csf-ui: non-interactive install - the WebUI is installed but NOT enabled."
 		echo "csf-ui: re-run this installer at a terminal to set it up: it is the only thing"
 		echo "csf-ui: that asks which mode to use, writes your web server's vhost, writes"
 		echo "csf-ui: /etc/csf-ui/ui.conf and enables the two services."
 		echo "csf-ui: Then create an account:"
-		echo "csf-ui:   /usr/local/csf-ui/bin/csf-ui-passwd add <user> admin"
+		echo "csf-ui:   csf-ui-passwd add <user> admin"
+		echo "csf-ui: (that is /usr/local/csf-ui/bin/csf-ui-passwd; install_path_symlinks() puts"
+		echo "csf-ui: it on PATH as /usr/sbin/csf-ui-passwd, next to csf itself.)"
 	else
 		interactive_setup
 	fi
