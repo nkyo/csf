@@ -407,7 +407,13 @@ sub _can_switch_uid {
 			unless defined($mode_a_start) && $mode_a_end > $mode_a_start;
 		my $mode_a = join('', @lines[$mode_a_start .. $mode_a_end]);
 
-		like($mode_a, qr/^\s*_enable_now csf-ui\.service$/m,
+		# 2026-09-25: the call is now the condition of an `if`, because
+		# _enable_now() returns a meaningful status (it watches the unit
+		# instead of sampling it once) and setup_mode_a() no longer claims
+		# the listener is serving when it is not. Both shapes are accepted
+		# here; what is asserted is unchanged - the call is present, on its
+		# own, naming this unit.
+		like($mode_a, qr/^\s*(?:if )?_enable_now csf-ui\.service(?:; then)?$/m,
 			'C1: setup_mode_a() enables csf-ui.service - the Mode A listener Server.pm now provides');
 		like($mode_a, qr/^\s*_enable_now csf-ui-helper\.service$/m,
 			'C1: ...and the root helper, as it always did');
