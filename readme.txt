@@ -1306,13 +1306,17 @@ configuration, writes /etc/csf-ui/ui.conf and enables the services:
 There is no default account and no default password, so nothing can log in
 until you create one:
 
-  /usr/local/csf-ui/bin/csf-ui-passwd add <user> admin
+  csf-ui-passwd add <user> admin
+
+The installer symlinks csf-ui-passwd and csf-ui-setup into /usr/sbin, where csf
+itself lives, so both are on root's PATH. The files themselves are under
+/usr/local/csf-ui/bin/ and can always be run from there instead.
 
 The role is "admin" or "support". csf-ui is configured in /etc/csf-ui/ui.conf,
 not in /etc/csf/csf.conf, and accounts live in /etc/csf-ui/users as $6$
 password hashes that only root can read.
 
-  /usr/local/csf-ui/bin/csf-ui-setup --web
+  csf-ui-setup --web
 
 is a separate thing, and is optional: a browser wizard for the FIREWALL's own
 settings in /etc/csf/csf.conf (the port lists, IPv6, TESTING), with a snapshot

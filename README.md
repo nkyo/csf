@@ -96,8 +96,12 @@ and [docs/WEBUI-PLAN.md](docs/WEBUI-PLAN.md) for the plan it was built to.
 To set it up, as root:
 
 ```bash
-/usr/local/csf-ui/bin/csf-ui-setup
+csf-ui-setup
 ```
+
+(`csf-ui-setup` and `csf-ui-passwd` are symlinked into `/usr/sbin` by the
+installer, next to `csf` itself; the files are
+`/usr/local/csf-ui/bin/csf-ui-setup` and `/usr/local/csf-ui/bin/csf-ui-passwd`.)
 
 It asks which addresses may reach it, creates the first account and prints the
 address to browse to. It is configured in `/etc/csf-ui/ui.conf`, not in

@@ -37,6 +37,175 @@ line is added below the original notice; the original stays intact.
 
 ### Unreleased
 
+#### First real install — four defects the whole test suite could not see
+
+**2026-09-25** — The WebUI branch was installed and started on a real server for
+the first time. It crash-looped. Four separate defects came out of that one
+install; **5651 passing tests and a green `ci/gates.sh` had reported nothing**,
+and the reason is worth more than any of the four fixes: the suite runs from the
+repository with `prove -I.`, so `@INC` never resembles the installed layout, and
+no line of this code had ever been executed as the unprivileged `csfui` account.
+Every defect below lives in the gap between those two situations.
+
+**1. `csf-ui.service` died in `BEGIN`, 52 restarts and climbing.**
+
+```
+csf-ui[2224]: Can't locate Fcntl.pm:   /usr/local/csf/lib/Fcntl.pm: Permission denied
+              at /usr/local/csf-ui/bin/csf-ui line 115.
+csf-ui[2224]: BEGIN failed--compilation aborted
+systemd[1]: csf-ui.service: Main process exited, code=exited, status=13/n/a
+```
+
+All four binaries carried `use lib '/usr/local/csf-ui/lib', '/usr/local/csf/lib';`.
+`use lib` **prepends**, so csf's own lib sat ahead of the entire standard `@INC`
+and was the first directory searched for every module, core ones included. csf's
+installer creates that directory mode `0600` and then runs `chmod -R 600` over it
+(`install.generic.sh:82`, `:458`), and `lfd` re-applies
+`chmod(0600, "/usr/local/csf")` on every pass of its main loop
+(`lfd.pl:1173`, `1187-1201`). A `0600` **directory** has no search bit for anyone
+(`docs/WEBUI-RPC.md` §13.2), so the unprivileged `csfui` process got `EACCES` on
+the first `@INC` entry it tried and never reached core Perl.
+`csf-ui-helper.service`, which runs as root, was unaffected — and that asymmetry
+is the whole diagnosis.
+
+Ruling R11 moved every UI path to `/usr/local/csf-ui`, `/etc/csf-ui` and
+`/var/lib/csf-ui` precisely so the unprivileged tier would never depend on a
+directory csf keeps clamping shut. This one line was still pointing back at one
+of them. It was there for exactly one module — `JSON::Tiny`, which csf vendors at
+`/usr/local/csf/lib/JSON/Tiny.pm` and which `install-webui.sh` never copied.
+
+- **`ui-src/bin/csf-ui`, `csf-ui-helper`, `csf-ui-passwd`, `csf-ui-setup`**: the
+  `use lib` now reads `use lib '/usr/local/csf-ui/lib';` — one entry, the same
+  line in all four files.
+- **`ui-src/dist/install-webui.sh`**: `setup_directories()` creates
+  `/usr/local/csf-ui/lib/JSON`, and `install_files()` copies the vendored
+  `JSON/Tiny.pm` into it (`cp -f`, so a re-run refreshes it) where the existing
+  `chown -R root:root` / `find … -exec chmod 0644` pass gives it the same
+  `0644 root:root` as every other file under that lib. The file is copied
+  verbatim; its Artistic 2.0 header travels with it and it is not edited.
+  `verify_install()` checks its mode and owner **and** reads it as `csfui`.
+- **The two root binaries drop the entry too, deliberately.** `csf-ui-helper` and
+  `csf-ui-passwd` run as root, so the `EACCES` above is not their failure. But a
+  root process whose `@INC` depends on a directory something else `chmod`s on a
+  timer is fragile for the same reason — and under `csf-ui-helper.service` that
+  root is confined, with `CAP_DAC_OVERRIDE` outside its `CapabilityBoundingSet`.
+  More concretely, prepending csf's lib puts its **vendored** `version.pm`,
+  `HTTP/Tiny.pm`, `Net/IP.pm` and `Crypt/*.pm` ahead of the system's for
+  everything these files pull in, transitively. One line that is correct in all
+  four places beats two variants.
+
+**What else the four binaries resolved from csf's lib: nothing.** Every
+`use`/`require` in the four binaries and in all nine `ui-src/lib/ConfigServer/UI/`
+modules was enumerated. Besides `ConfigServer::UI::*`, the list is `Digest::SHA`,
+`Encode`, `Errno`, `Fcntl`, `IO::Handle`, `MIME::Base64`, `POSIX`, `Socket`,
+`Time::HiRes` — all core — plus `JSON::Tiny` and a runtime `require
+IO::Socket::SSL` inside `Server.pm`. csf's lib ships `ConfigServer/*`, `Crypt/*`,
+`HTTP/Tiny.pm`, `JSON/Tiny.pm`, `Net/*`, `Geo/*` and `version.pm`; `JSON::Tiny`
+is the only name in both sets. `t/93-installed-layout.t` freezes that list, so a
+fourteenth dependency cannot arrive unnoticed.
+
+**2. `verify_install()` printed "WebUI install verified OK" over the crash loop.**
+
+`_enable_now()` took **one instantaneous** `systemctl is-active` sample. A unit
+with `Restart=on-failure` and `RestartSec=5` that fails at startup spends most of
+every five seconds looking `activating`/`active`, so a single sample lands
+wherever it lands. The owner's installer printed
+`csf-ui.service: enabled=enabled active=active` and then
+`WebUI install verified OK.` while the restart counter climbed past 50. **A
+one-shot sample cannot distinguish "running" from "dying and being restarted"** —
+and this is what turned defect 1 from a one-line error message into a mystery.
+
+- **`_enable_now()` now watches the unit** for `_SETTLE_SECONDS` (10, longer than
+  the units' own `RestartSec=5`) in `_SETTLE_STEP` (2s) increments, and reports a
+  failure on any of three signals: `NRestarts` changing (systemd zeroes it when a
+  unit is started, so any increase is a death), `ExecMainStartTimestampMonotonic`
+  changing (the same evidence on systemd older than 235, which has no
+  `NRestarts`), or `is-failed`. On a failure it prints the counter, `Result=`,
+  and the last 20 journal lines — the message the operator otherwise has to go
+  find. It returns non-zero, and `setup_mode_a()` no longer claims the listener
+  is serving when it is not.
+- **`verify_install()` now checks the units it enabled.** `active` is not enough:
+  a unit reporting `active` with `NRestarts` non-zero is crash-looping, and is
+  counted as a problem, so the "verified OK" sentence cannot be reached. Where
+  systemd is too old to report `NRestarts`, it says so rather than passing in
+  silence.
+
+**3. `csf-ui-passwd add admin` → `command not found`.**
+
+There is no account by default and no way into the WebUI until one exists
+(§5.14), so creating one is the first thing an operator does — and
+`/usr/local/csf-ui/bin` is on nobody's `PATH`. An earlier review filed this as
+Minor (M8) and closed it by making the **messages** print the full path, which
+helps only someone copying from the installer's output.
+
+- **`install_path_symlinks()`** links `csf-ui-passwd` and `csf-ui-setup` into
+  `/usr/sbin`, where `csf` itself already lives, so this adds no mechanism the
+  tree does not already use and no `profile.d` fragment (which would not cover
+  `sudo`, `cron` or a non-interactive `ssh`). Both targets stay `0750 root:csfui`,
+  so the link grants nothing. `csf-ui` and `csf-ui-helper` are **not** linked —
+  they are `ExecStart` targets, not commands.
+- **All seven `uninstall.*.sh`** remove both links, matching the existing csf-ui
+  removal block's properties exactly: absolute literal paths, no shell variable
+  in any `rm`, idempotent, no `pkill`. `verify_install()` checks both links.
+
+**4. With `@INC` fixed, mode B refused cleanly — and the installer had never
+asked.** (Restart counter 81 by then.)
+
+```
+IO::Socket::SSL is not installed; install it (Debian/Ubuntu: libio-socket-ssl-perl;
+RHEL/CloudLinux/cPanel: perl-IO-Socket-SSL) so the standalone web UI can serve TLS
+- it never serves plain HTTP instead
+```
+
+`Server.pm`'s refusal is correct and unchanged. The defect is upstream of it: the
+installer offered mode B, wrote `UI_MODE="b"`, created `/etc/csf-ui/ssl`, checked
+that `cert.pem` and `key.pem` existed and were non-empty — and never checked the
+module without which mode B cannot start. **It verified the certificate but not
+the thing that reads the certificate.**
+
+- **`mode_b_tls_problem()`** answers the question before mode B is offered, and
+  gets both the verdict and the wording by shelling out to `Server.pm`'s own
+  `preflight()` and printing the problems that mention `IO::Socket::SSL`.
+  Nothing in the installer restates the distribution package names, so they
+  cannot drift from the ones the service itself prints.
+- **It refuses rather than warns.** Installing a distribution package unasked is
+  not a firewall installer's business; writing `ui.conf` and leaving the unit
+  disabled leaves a host that *looks* configured, where the next obvious command
+  walks into the same loop with no installer output anywhere near it. So nothing
+  is written and nothing is enabled — the one outcome whose description is true —
+  and the menu says mode B is unavailable, with the reason, while the operator is
+  still at the prompt. Mode A is suggested when a front server was detected.
+- **Mode A is not held to this**, confirmed against `Server.pm` rather than
+  assumed: the `IO::Socket::SSL` requirement is inside `if ($mode eq 'b')`, and
+  `mode_a_preflight()` does not mention it. `t/93-installed-layout.t` asserts
+  that by calling `preflight()` with a mode-A `ui.conf`.
+
+**And the check that would have caught all four.** `main()` now runs
+`check_installed_perl_deps()` after the files are in place and **before** anything
+is offered, written or enabled: it checks the §11.7 Perl floor (Perl ≥ 5.14 with
+`Socket` ≥ 1.94 — which §11.7 has always said was checked at install time, and
+which nothing checked) and then runs `perl -c` on each of the four **installed**
+binaries **as the `csfui` account**, with `PERL5LIB` cleared. A tree that cannot
+be loaded by the account that will run it is never offered a mode. This catches
+defect 1 exactly; it does **not** catch defect 4, because `IO::Socket::SSL` is a
+runtime `require`, which is why defect 4 has a check of its own and why
+`_enable_now()` watches the unit after starting it.
+
+**`t/93-installed-layout.t`** is new, and is the first test in this tree that
+works in the installed shape rather than the repository shape. It replays
+`install-webui.sh`'s own `setup_directories()` and `install_files()` into a
+sandbox (path-substituted, with the substitution verified), compiles the four
+binaries against **only** that sandbox lib plus core Perl, and — where a second
+real uid is available — does it as a different user and reproduces the owner's
+exact `Permission denied` failure on demand by restoring the old `@INC` entry
+behind a `0600` directory. It also drives `_enable_now()` against a stub
+`systemctl` that answers `is-active` with `active` every single time and only
+moves the restart counter, and shows that the one-shot sample that shipped
+reports success against that very stub.
+
+**No change to** `HTTP.pm`, `docs/WEBUI-RPC.md`, `JSON/Tiny.pm`, any `ui.conf`
+key, or any file's mode.
+
 #### Task 11 — retiring the Integrated User Interface
 
 **2026-09-24** — The HTML interface `lfd` served itself is **removed**, and so
