@@ -110,7 +110,62 @@ package ConfigServer::UI::App;
 use strict;
 use warnings;
 
-use lib '/usr/local/csf-ui/lib', '/usr/local/csf/lib';
+# WHY ONLY /usr/local/csf-ui/lib, AND WHY ALL FOUR BINARIES CARRY THE
+# IDENTICAL LINE (Ruling R11; docs/WEBUI-RPC.md S2.3, S13).
+#
+# This line used to read
+#
+#     use lib '/usr/local/csf-ui/lib', '/usr/local/csf/lib';
+#
+# and "use lib" PREPENDS: /usr/local/csf/lib sat ahead of the whole of the
+# standard @INC, so it was the FIRST directory searched for every module
+# this file loads, core ones included. csf's own installer creates that
+# directory mode 0600 and then runs "chmod -R 600" over the tree
+# (install.generic.sh:82, :458), and lfd re-applies
+# chmod(0600, "/usr/local/csf") on every pass of its main loop
+# (lfd.pl:1173, 1187-1201), forever. A 0600 DIRECTORY has no search bit for
+# ANYONE (S13.2), so the unprivileged csfui account this process runs as got
+# EACCES on the first @INC entry it tried and died before it could reach
+# core Perl at all. Measured on a real install:
+#
+#     Can't locate Fcntl.pm:   /usr/local/csf/lib/Fcntl.pm: Permission denied
+#         at /usr/local/csf-ui/bin/csf-ui line 115.
+#     csf-ui.service: Main process exited, code=exited, status=13/n/a
+#
+# with csf-ui.service's restart counter at 52 while csf-ui-helper.service -
+# the root half - ran normally. That asymmetry is the whole diagnosis. R11
+# moved every UI path off /etc/csf, /var/lib/csf and /usr/local/csf
+# precisely so the unprivileged tier would never depend on a directory csf
+# keeps clamping shut; this line was the one thing still pointing back at
+# one of them.
+#
+# The one module it was there for is JSON::Tiny, which csf vendors at
+# /usr/local/csf/lib/JSON/Tiny.pm. install-webui.sh's install_files() now
+# ships that file into /usr/local/csf-ui/lib/JSON/Tiny.pm instead, 0644
+# root:root like every other file under that lib, so it is reachable by
+# csfui without reaching into csf's tree at all. Nothing else any of these
+# four binaries - or anything under ui-src/lib/ConfigServer/UI/ - loads is
+# resolved from csf's lib: everything else is core Perl (Encode, Errno,
+# Fcntl, Digest::SHA, IO::Handle, MIME::Base64, POSIX, Socket, Time::HiRes)
+# or is ConfigServer::UI::*, which lives in csf-ui's own lib. IO::Socket::SSL
+# is neither: it is a runtime "require" in ConfigServer::UI::Server, a
+# non-core module that comes from the distribution's own package, and csf
+# does not vendor it.
+#
+# THE TWO ROOT BINARIES CARRY THE SAME LINE DELIBERATELY. csf-ui-helper and
+# csf-ui-passwd run as root, so the EACCES above is not their failure mode
+# and a "root keeps it, csfui drops it" split would have been defensible.
+# It is not taken, for two reasons. A root process whose @INC depends on a
+# directory something else chmods on a timer is fragile for the same reason
+# the unprivileged one is - and under csf-ui-helper.service that root is
+# additionally confined (CapabilityBoundingSet drops CAP_DAC_OVERRIDE), so
+# the bypass is not even unconditional. More concretely, prepending csf's
+# lib puts its VENDORED copies of version.pm, HTTP/Tiny.pm, Net/IP.pm and
+# Crypt/*.pm AHEAD of the system's for every module these files pull in,
+# transitively - silent shadowing that nothing here needs and nothing here
+# would notice. One line that is correct in all four places is worth more
+# than two variants that each have to be reasoned about separately.
+use lib '/usr/local/csf-ui/lib';
 
 use Fcntl qw(:DEFAULT);
 use JSON::Tiny ();

@@ -48,7 +48,19 @@ package ConfigServer::UI::Helper;
 use strict;
 use warnings;
 
-use lib '/usr/local/csf-ui/lib', '/usr/local/csf/lib';
+# ONE ENTRY, NOT TWO. This read
+# "use lib '/usr/local/csf-ui/lib', '/usr/local/csf/lib';" and "use lib"
+# PREPENDS, so csf's own lib - which csf's installer chmods 0600 and lfd
+# re-clamps to 0600 on every pass of its main loop (lfd.pl:1173,
+# 1187-1201) - was searched ahead of core Perl. That killed the
+# unprivileged half outright (52 restarts on a real install; see
+# ui-src/bin/csf-ui's copy of this comment for the measurement and for
+# why the root binaries drop it too), and in a root process it silently
+# shadows the system's version.pm, HTTP::Tiny, Net::IP and Crypt::* with
+# csf's vendored copies. The only module it was ever there for,
+# JSON::Tiny, is now shipped into /usr/local/csf-ui/lib/JSON/Tiny.pm by
+# install-webui.sh's install_files().
+use lib '/usr/local/csf-ui/lib';
 
 use Errno ();
 use Fcntl qw(:DEFAULT :flock);
