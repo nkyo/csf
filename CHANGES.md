@@ -37,6 +37,132 @@ line is added below the original notice; the original stays intact.
 
 ### Unreleased
 
+#### Same install, two more — a healthy service nothing could connect to
+
+**2026-09-25** — With the four defects above fixed, `csf-ui.service` reached
+`active (running)` on the owner's server. Browsing to `https://<ip>:8443` still
+returned nothing. Two causes, both in `install-webui.sh`, both the shape of
+defect 4: **the installer configures standalone mode, reports success, and does
+not do — or mention — either of the two things required to reach it.**
+
+What makes these two worth their own entry is that **every check added above
+passed**, correctly. `_enable_now()` watched the unit start, stay up and never
+restart; all true. `verify_install()` found every mode and owner in order.
+"Starts" and "works" are different claims, and nothing here had ever made the
+second one.
+
+**5. `UI_LISTEN` was never written, so Mode B bound loopback.**
+
+`Server.pm:514` — `my $listen_text = defined $raw{UI_LISTEN} ? $raw{UI_LISTEN} :
+'127.0.0.1';` — an absent key **is** loopback. `write_ui_conf()` wrote three
+keys. The owner's file, verbatim:
+
+```
+UI_MODE="b"
+UI_PORT="8443"
+UI_ALLOW="115.79.213.185"
+```
+
+So the menu offered *"b = standalone (`csf-ui` serves TLS itself)"*, the operator
+named an address that may connect and a port, and the result served the one
+address on which all three answers are inert. `Server.pm:496` already
+distinguishes "a file that **set** `UI_LISTEN="127.0.0.1"`" from "a file that
+never mentioned the key" — the ambiguity was understood at the library layer and
+was not carried into the installer.
+
+- **`write_ui_conf()` takes a fourth argument** and writes `UI_LISTEN` when it is
+  non-empty. `setup_mode_a()` passes `""` **deliberately**: §10 says a mode-A
+  file that mentions `UI_LISTEN` "contradicts itself" and `read_ui_conf()`
+  refuses to start over it, so a mode-A `ui.conf` is byte-for-byte what it always
+  was. In mode B the key is **always** written, even when the value is the same
+  `127.0.0.1` the default would have produced — a file that states its own listen
+  address cannot be misread by the next person to look at it.
+- **`ask_listen_address()` asks**, rather than quietly picking either way. Two
+  things are both true: loopback makes every other answer in the dialogue inert,
+  *and* widening a bind is not the installer's to do silently — `UI_ALLOW` and
+  TLS are real, but "only your address may connect" is not a reason to put an
+  administrative interface on every interface without saying the words, and some
+  operators want loopback plus an SSH tunnel on purpose. A prompt satisfies both:
+  the consequence of each option is written next to it, and the narrow option
+  comes with the `ssh -N -L` command that makes it usable.
+- **The default is all-interfaces**, deliberately rather than lazily: pressing
+  enter should produce the configuration the three previous answers describe, and
+  the opposite default reproduces this very defect for anyone who does not read
+  the prompt — which is the population the prompt exists for.
+- **`setup_mode_b()` states which one was written**, for *both* answers, before
+  the installer exits, with the URL. `verify_install()` treats a mode-B `ui.conf`
+  with no `UI_LISTEN` as a problem in its own right.
+- A typed address is validated with `Socket::inet_pton` — the exact judge
+  `read_ui_conf()` uses — so a hostname is refused at the prompt rather than at
+  startup. The prompt also says `csf-ui` binds **one** socket: `0.0.0.0` is IPv4,
+  `::` is IPv6 (and IPv4 only where the host's `net.ipv6.bindv6only` is 0).
+
+**6. Nothing opens the port in csf's own firewall.**
+
+**Measured across the shipped configurations: only one of seven carries the
+default 8443 in `TCP_IN`.** `csf.conf` (cPanel) does. `csf.generic.conf` —
+the plain server, and what the owner ran — `csf.cwp.conf`,
+`csf.cyberpanel.conf`, `csf.directadmin.conf`, `csf.interworx.conf` and
+`csf.vesta.conf` do not. And on **all seven**, any port the operator chose
+instead is closed.
+
+- **`check_firewall_port()` reads the live `/etc/csf/csf.conf`**, reports whether
+  the configured port is in `TCP_IN` **and** `TCP6_IN` (understanding csf's own
+  `lo:hi` range syntax, so an already-open port inside a range is not reported as
+  closed), and when it is not, prints the **complete replacement line** ready to
+  paste plus `csf -r`. It also flags `TESTING = "1"`, under which lfd does not
+  start and a cron job clears the firewall every `TESTING_INTERVAL` minutes — so
+  what the port list says is only true between a `csf` start and the next clear.
+- **It does not edit `csf.conf`, and that is a decision, not an omission.** The
+  argument is not "an installer may not write another component's config" — csf's
+  own `install.*.sh` writes that file and `auto.*.pl` regenerates it on every
+  upgrade, so that argument would be too strong. The argument is blast radius:
+  `TCP_IN` is the one line in `csf.conf` that can lock an administrator out of
+  their own server, and an automated edit of it from the **optional** half of a
+  firewall installer inverts this script's own first rule, *"a failure to set up
+  the UI must not fail the install"* — getting the UI wrong should cost the UI,
+  never SSH. Applying it also means `csf -r` on a live box, which is not a side
+  effect anyone should discover in the scrollback of a UI setup step. And the
+  correct new value is not always "current list plus this port": `TCP_IN` is
+  managed by configuration management on plenty of servers, is deliberately
+  minimal on others, and is regenerated from the shipped file on upgrade — an
+  edit this script makes can be silently reverted later, which is worse than
+  never making it, because the UI would work until the next upgrade and then stop
+  for no visible reason. One paste costs the operator a few seconds and removes
+  all of that.
+- **A closed port is counted as a problem**, so `"WebUI install verified OK."` is
+  unreachable while the UI cannot be connected to. The message says plainly that
+  the UI is running and unreachable until they open it.
+
+**And the check that closes the gap all six fell through.** `verify_install()`
+now **connects to the thing it just configured**: `probe_listener()` opens a TCP
+connection to the configured `UI_LISTEN`:`UI_PORT` in mode B (reaching a
+`0.0.0.0` bind through `127.0.0.1`, and saying which address it probed), or the
+mode-A unix socket, and reports connected / refused / timed out.
+
+**What it proves and what it does not, stated in the installer's own output**: a
+successful connect proves a process on *this host* is accepting connections on
+that address and port — the half defect 5 fell through, since a listener that is
+not there does not answer and neither does one whose `bind()` failed. It proves
+**nothing** about the operator's browser: the connection never leaves the
+machine, so it does not cross csf's rules, any upstream firewall or security
+group, or routing. `check_firewall_port()` is the other half and is a *read of a
+config file*, not a test of the path. Neither, together or apart, replaces the
+operator opening the URL, and no message claims otherwise. (`UI_ALLOW` is
+enforced **before** TLS in `Server.pm`'s accept loop, so a local probe is
+expected to connect and then be closed without a byte — the TCP-level connect is
+the whole of what is being asked.)
+
+`t/93-installed-layout.t` grows four sections (121 → 176 tests), including a
+`probe_listener()` check driven against a **real** listener the test forks and
+shuts down rather than a stub — a connect check verified with a mock would be
+exactly the shape it exists to replace — and `check_firewall_port()` driven
+against the **shipped** `csf.generic.conf` and `csf.conf`, so the one-of-seven
+measurement is the assertion rather than a claim in this file.
+
+**No change to** `Server.pm`, `HTTP.pm`, `docs/WEBUI-RPC.md`, `JSON/Tiny.pm`, any
+file's mode. `UI_LISTEN` is an existing §10 key; no key was added.
+
 #### First real install — four defects the whole test suite could not see
 
 **2026-09-25** — The WebUI branch was installed and started on a real server for
